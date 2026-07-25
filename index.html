@@ -805,6 +805,31 @@ const seedIncomeCategories = () => Object.keys(BLANK_INCOME).map((k, i) => ({
   protected: k === "payrollEt",
   cpfLinked: k === "payrollEt"
 }));
+const ORIGINAL_EXPENSE_KEYS = EXPENSE_CATS.map(c => c.key);
+const OLD_DEFAULT_EXPENSE_LABELS = {
+  housingUtilities: "Housing & utilities",
+  transportation: "Transportation",
+  fnb: "F&B"
+};
+const reconcileCategories = cats => {
+  if (!cats || !cats.expense) return cats;
+  return {
+    ...cats,
+    expense: cats.expense.map(c => {
+      if (!ORIGINAL_EXPENSE_KEYS.includes(c.key)) return c;
+      const patch = {
+        core: CORE_EXPENSE_KEYS.includes(c.key)
+      };
+      if (OLD_DEFAULT_EXPENSE_LABELS[c.key] && c.label === OLD_DEFAULT_EXPENSE_LABELS[c.key]) {
+        patch.label = EXPENSE_LABEL_OVERRIDES[c.key];
+      }
+      return {
+        ...c,
+        ...patch
+      };
+    })
+  };
+};
 const EXPENSE_GROUPS = [{
   key: "fixedNonFinancial",
   label: "Fixed expenses (non-financial)"
@@ -1881,7 +1906,7 @@ function App() {
           setPolicies(p.policies || []);
           setRecurring(p.recurring || []);
           setFamilyMembers(p.familyMembers || ["ET", "SY"]);
-          if (p.categories) setCategories(p.categories);
+          if (p.categories) setCategories(reconcileCategories(p.categories));
           if (p.accounts) setAccounts(p.accounts);
           if (p.housingLoan) setHousingLoan(p.housingLoan);
           if (p.carLoan) setCarLoan(p.carLoan);
@@ -4513,27 +4538,6 @@ function App() {
           textAlign: "left",
           padding: 16
         },
-        onClick: () => setSettingsView("categories")
-      }, /*#__PURE__*/React.createElement("div", {
-        style: {
-          fontFamily: "var(--sans)",
-          fontWeight: 600,
-          fontSize: 14,
-          color: "var(--ink-1)",
-          marginBottom: 4
-        }
-      }, "Categories"), /*#__PURE__*/React.createElement("div", {
-        style: {
-          fontFamily: "var(--sans)",
-          fontSize: 12,
-          color: "var(--ink-3)"
-        }
-      }, "Income and expense categories, sub-categories, colours and icons.")), /*#__PURE__*/React.createElement("button", {
-        className: "btn-secondary",
-        style: {
-          textAlign: "left",
-          padding: 16
-        },
         onClick: () => setSettingsView("accounts")
       }, /*#__PURE__*/React.createElement("div", {
         style: {
@@ -4549,7 +4553,28 @@ function App() {
           fontSize: 12,
           color: "var(--ink-3)"
         }
-      }, "Liquid cash, investments, and property/loan accounts."))));
+      }, "Liquid cash, investments, and property/loan accounts.")), /*#__PURE__*/React.createElement("button", {
+        className: "btn-secondary",
+        style: {
+          textAlign: "left",
+          padding: 16
+        },
+        onClick: () => setSettingsView("categories")
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontWeight: 600,
+          fontSize: 14,
+          color: "var(--ink-1)",
+          marginBottom: 4
+        }
+      }, "Categories"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 12,
+          color: "var(--ink-3)"
+        }
+      }, "Income and expense categories, sub-categories, colours and icons."))));
     }
     if (settingsView === "categories") {
       return /*#__PURE__*/React.createElement(Section, {
