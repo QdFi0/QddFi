@@ -8,16 +8,15 @@
 <!-- React + ReactDOM -->
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-<!-- Babel so we can write JSX directly in this single file -->
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <!-- Recharts (needs PropTypes) -->
 <script src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
 <script src="https://unpkg.com/recharts@2.12.0/umd/Recharts.js"></script>
 
-<!-- Firebase (classic global-script build — NOT the module/compat build, which breaks
-     with plain <script> tags in some environments) -->
-<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+<!-- Firebase v8 — the classic pure-UMD SDK. Deliberately NOT using v9+ "compat"
+     builds: those ship with ES-module internals that can trip up plain
+     <script> tag loading in some environments. v8 has no such internals. -->
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
 
 <style>
   html, body { margin: 0; padding: 0; background: #F1F1EC; }
@@ -44,7 +43,7 @@
 <div id="root">
   <div style="font-family: sans-serif; padding: 40px; color: #3D4552;">
     Loading ledger…
-    <div style="font-size: 12px; color: #888; margin-top: 8px;">If this doesn't change within ~10 seconds, open this file in a real browser tab (not a preview pane) and check Firestore Database has been created in your Firebase project.</div>
+    <div style="font-size: 12px; color: #888; margin-top: 8px;">If this doesn't change within ~10 seconds, check Firestore Database has been created in your Firebase project.</div>
   </div>
 </div>
 
@@ -71,103 +70,503 @@
   const LEDGER_DOC = db.collection("households").doc("etsy");
 </script>
 
-<script type="text/babel" data-presets="react,stage-3">
-const { useState, useEffect, useMemo } = React;
-const { AreaChart, Area, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } = Recharts;
+<!-- App code — pre-compiled from JSX to plain JavaScript ahead of time,
+     so the browser never has to run an in-browser JSX transformer. -->
+<script>
+const {
+  useState,
+  useEffect,
+  useMemo
+} = React;
+const {
+  AreaChart,
+  Area,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer
+} = Recharts;
 
 /* ───────────────────────── helpers ───────────────────────── */
 
-const fmt = (n, d = 0) => (n < 0 ? "-$" : "$") + Math.abs(n || 0).toLocaleString("en-SG", { minimumFractionDigits: d, maximumFractionDigits: d });
+const fmt = (n, d = 0) => (n < 0 ? "-$" : "$") + Math.abs(n || 0).toLocaleString("en-SG", {
+  minimumFractionDigits: d,
+  maximumFractionDigits: d
+});
 const fmtPct = (n, d = 1) => ((n || 0) * 100).toFixed(d) + "%";
-const fmtRatio = (n) => (n || 0).toFixed(2) + "x";
+const fmtRatio = n => (n || 0).toFixed(2) + "x";
 const uid = () => Math.random().toString(36).slice(2, 10);
-const sum = (obj) => Object.values(obj).reduce((a, b) => a + (Number(b) || 0), 0);
+const sum = obj => Object.values(obj).reduce((a, b) => a + (Number(b) || 0), 0);
 const todayISO = () => new Date().toISOString().slice(0, 10);
-const daysUntil = (iso) => Math.ceil((new Date(iso) - new Date(todayISO())) / 86400000);
+const daysUntil = iso => Math.ceil((new Date(iso) - new Date(todayISO())) / 86400000);
 const DASH = "—";
-
-const MONTH_ORDER = (() => { const a = []; for (let y = 2026; y <= 2029; y++) ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"].forEach((m) => a.push(`${m} ${y}`)); return a; })();
-
-const EXPENSE_CATS = [
-  { key: "housingUtilities", label: "Housing & utilities", sub: "fixedNonFinancial", color: "#0F5D52" },
-  { key: "leisureFamily", label: "Family", sub: "fixedNonFinancial", color: "#7F77DD" },
-  { key: "subscriptions", label: "Subscriptions", sub: "fixedNonFinancial", color: "#5DCAA5" },
-  { key: "vehicle", label: "Vehicle", sub: "fixedNonFinancial", color: "#378ADD" },
-  { key: "helper", label: "Helper", sub: "fixedNonFinancial", color: "#993C1D" },
-  { key: "insurance", label: "Insurance", sub: "fixedFinancial", color: "#D4537E" },
-  { key: "endowment", label: "Endowment", sub: "fixedFinancial", color: "#993556" },
-  { key: "taxes", label: "Taxes", sub: "fixedFinancial", color: "#854F0B" },
-  { key: "fnb", label: "F&B", sub: "variable", color: "#D85A30" },
-  { key: "groceries", label: "Groceries", sub: "variable", color: "#F0997B" },
-  { key: "shopping", label: "Shopping", sub: "variable", color: "#3C3489" },
-  { key: "transportation", label: "Transportation", sub: "variable", color: "#185FA5" },
-  { key: "golf", label: "Golf", sub: "variable", color: "#639922" },
-  { key: "healthQol", label: "Health & QoL", sub: "variable", color: "#27500A" },
-  { key: "holidays", label: "Holidays", sub: "variable", color: "#0C447C" },
-  { key: "misc", label: "Misc", sub: "variable", color: "#5F5E5A" },
-  { key: "bigTicket", label: "Big ticket", sub: "variable", color: "#791F1F" },
-];
+const MONTH_ORDER = (() => {
+  const a = [];
+  for (let y = 2026; y <= 2029; y++) ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].forEach(m => a.push(`${m} ${y}`));
+  return a;
+})();
+const EXPENSE_CATS = [{
+  key: "housingUtilities",
+  label: "Housing & utilities",
+  sub: "fixedNonFinancial",
+  color: "#0F5D52"
+}, {
+  key: "leisureFamily",
+  label: "Family",
+  sub: "fixedNonFinancial",
+  color: "#7F77DD"
+}, {
+  key: "subscriptions",
+  label: "Subscriptions",
+  sub: "fixedNonFinancial",
+  color: "#5DCAA5"
+}, {
+  key: "vehicle",
+  label: "Vehicle",
+  sub: "fixedNonFinancial",
+  color: "#378ADD"
+}, {
+  key: "helper",
+  label: "Helper",
+  sub: "fixedNonFinancial",
+  color: "#993C1D"
+}, {
+  key: "insurance",
+  label: "Insurance",
+  sub: "fixedFinancial",
+  color: "#D4537E"
+}, {
+  key: "endowment",
+  label: "Endowment",
+  sub: "fixedFinancial",
+  color: "#993556"
+}, {
+  key: "taxes",
+  label: "Taxes",
+  sub: "fixedFinancial",
+  color: "#854F0B"
+}, {
+  key: "fnb",
+  label: "F&B",
+  sub: "variable",
+  color: "#D85A30"
+}, {
+  key: "groceries",
+  label: "Groceries",
+  sub: "variable",
+  color: "#F0997B"
+}, {
+  key: "shopping",
+  label: "Shopping",
+  sub: "variable",
+  color: "#3C3489"
+}, {
+  key: "transportation",
+  label: "Transportation",
+  sub: "variable",
+  color: "#185FA5"
+}, {
+  key: "golf",
+  label: "Golf",
+  sub: "variable",
+  color: "#639922"
+}, {
+  key: "healthQol",
+  label: "Health & QoL",
+  sub: "variable",
+  color: "#27500A"
+}, {
+  key: "holidays",
+  label: "Holidays",
+  sub: "variable",
+  color: "#0C447C"
+}, {
+  key: "misc",
+  label: "Misc",
+  sub: "variable",
+  color: "#5F5E5A"
+}, {
+  key: "bigTicket",
+  label: "Big ticket",
+  sub: "variable",
+  color: "#791F1F"
+}];
 const catVal = (record, cat) => (record.expenses[cat.sub] || {})[cat.key] || 0;
-
 const BLANK_BALANCES = {
-  liquidCash: { uob: 0, dbsEtsy: 0, dbsEt: 0, syReserve: 0, cash: 0 },
-  investments: { endowusEt: 0, endowusSy: 0, moomooEt: 0, moomooSy: 0, cdp: 0, other: 0 },
-  cpfEt: { oa: 0, sa: 0, ma: 0 },
-  cpfSy: { oa: 0, sa: 0, ma: 0 },
-  property: { hdbValue: 501200, hdbLoan: 0, carLoan: 0, creditCard: 0 },
+  liquidCash: {
+    uob: 0,
+    dbsEtsy: 0,
+    dbsEt: 0,
+    syReserve: 0,
+    cash: 0
+  },
+  investments: {
+    endowusEt: 0,
+    endowusSy: 0,
+    moomooEt: 0,
+    moomooSy: 0,
+    cdp: 0,
+    other: 0
+  },
+  cpfEt: {
+    oa: 0,
+    sa: 0,
+    ma: 0
+  },
+  cpfSy: {
+    oa: 0,
+    sa: 0,
+    ma: 0
+  },
+  property: {
+    hdbValue: 501200,
+    hdbLoan: 0,
+    carLoan: 0,
+    creditCard: 0
+  }
 };
-const BLANK_INCOME = { payrollEt: 0, piano: 0, interestDividends: 0, others: 0 };
+const BLANK_INCOME = {
+  payrollEt: 0,
+  piano: 0,
+  interestDividends: 0,
+  others: 0
+};
 const BLANK_EXPENSES = {
-  fixedNonFinancial: { housingUtilities: 0, leisureFamily: 0, subscriptions: 0, vehicle: 0, helper: 0 },
-  fixedFinancial: { insurance: 0, endowment: 0, taxes: 0 },
-  variable: { fnb: 0, groceries: 0, shopping: 0, transportation: 0, golf: 0, healthQol: 0, holidays: 0, misc: 0, bigTicket: 0 },
+  fixedNonFinancial: {
+    housingUtilities: 0,
+    leisureFamily: 0,
+    subscriptions: 0,
+    vehicle: 0,
+    helper: 0
+  },
+  fixedFinancial: {
+    insurance: 0,
+    endowment: 0,
+    taxes: 0
+  },
+  variable: {
+    fnb: 0,
+    groceries: 0,
+    shopping: 0,
+    transportation: 0,
+    golf: 0,
+    healthQol: 0,
+    holidays: 0,
+    misc: 0,
+    bigTicket: 0
+  }
 };
-
 const DEFAULT_ASSUMPTIONS = {
-  emergencyBufferTarget: 74225, bufferMonths: 6, monthlyGrossIncome: 14137, carLoanRepayment: 1499,
-  annualInsurancePremiums: 30745.55, annualInsurancePremiumsExclEndowments: 18238.12,
-  etLegacyCover: 2370000, savingsRateTarget: 0.28,
+  emergencyBufferTarget: 74225,
+  bufferMonths: 6,
+  monthlyGrossIncome: 14137,
+  carLoanRepayment: 1499,
+  annualInsurancePremiums: 30745.55,
+  annualInsurancePremiumsExclEndowments: 18238.12,
+  etLegacyCover: 2370000,
+  savingsRateTarget: 0.28
 };
-
-const INITIAL_RECORDS = [
-  { month: "Jan 2026", income: { payrollEt: 11397, piano: 2370, interestDividends: 79.81, others: 14.23 },
-    expenses: { fixedNonFinancial: { housingUtilities: 157.01, leisureFamily: 600, subscriptions: 138.93, vehicle: 1785.14, helper: 862.11 },
-      fixedFinancial: { insurance: 2765.22, endowment: 463.24, taxes: 1179.31 },
-      variable: { fnb: 912.5, groceries: 824.22, shopping: 1885.96, transportation: 58.8, golf: 344.9, healthQol: -31.24, holidays: 246.95, misc: 10.53, bigTicket: -3188.04 } } },
-  { month: "Feb 2026", income: { payrollEt: 11397, piano: 1445, interestDividends: 6.25, others: -212.88 },
-    expenses: { fixedNonFinancial: { housingUtilities: 178.86, leisureFamily: 624.25, subscriptions: 233.83, vehicle: 1715.62, helper: 547 },
-      fixedFinancial: { insurance: 35.78, endowment: 463.24, taxes: 950.83 },
-      variable: { fnb: 780.81, groceries: 587.58, shopping: 2492.61, transportation: 50.67, golf: 409.38, healthQol: 134, holidays: 100, misc: 189.58, bigTicket: 2557.95 } } },
-  { month: "Mar 2026", income: { payrollEt: 11397, piano: 1430, interestDividends: 110.98, others: 1587.57 },
-    expenses: { fixedNonFinancial: { housingUtilities: 197.79, leisureFamily: 600, subscriptions: 106.27, vehicle: 1755.54, helper: 902 },
-      fixedFinancial: { insurance: 35.78, endowment: 463.24, taxes: 950.83 },
-      variable: { fnb: 1113.71, groceries: 573.52, shopping: 1305.8, transportation: 85.97, golf: 250.7, healthQol: 14, holidays: 0, misc: 501.11, bigTicket: 201.65 } } },
-  { month: "Apr 2026", income: { payrollEt: 11397, piano: 375, interestDividends: 26.18, others: 36.14 },
-    expenses: { fixedNonFinancial: { housingUtilities: 270.48, leisureFamily: 600, subscriptions: 134.85, vehicle: 1897.88, helper: 874 },
-      fixedFinancial: { insurance: 2010.68, endowment: 463.24, taxes: 0 },
-      variable: { fnb: 740.93, groceries: 1405.81, shopping: 781.87, transportation: 4.48, golf: 250.7, healthQol: 76, holidays: 0, misc: 293.27, bigTicket: 13523.23 } },
-    balances: { liquidCash: { uob: 31423, dbsEtsy: 2483, dbsEt: 1237, syReserve: 1724, cash: 217 },
-      investments: { endowusEt: 11896, endowusSy: 7979, moomooEt: 3106, moomooSy: 8866, cdp: 6863, other: 521 },
-      cpfEt: { oa: 28962, sa: 57582, ma: 61516 }, cpfSy: { oa: 21818, sa: 39119, ma: 42700 },
-      property: { hdbValue: 501200, hdbLoan: 262745, carLoan: 79427, creditCard: 10508 } } },
-  { month: "May 2026", income: { payrollEt: 11397, piano: 0, interestDividends: 89.6, others: 3.6 },
-    expenses: { fixedNonFinancial: { housingUtilities: 306.34, leisureFamily: 600, subscriptions: 139.85, vehicle: 1760.42, helper: 919.82 },
-      fixedFinancial: { insurance: 3715.39, endowment: 463.24, taxes: 1082.43 },
-      variable: { fnb: 1064.19, groceries: 1452.57, shopping: 1167.12, transportation: 25.4, golf: 342.01, healthQol: 577.5, holidays: 0, misc: 4473, bigTicket: 2194.88 } },
-    balances: { liquidCash: { uob: 17052.5, dbsEtsy: 654.48, dbsEt: 1512.92, syReserve: 1724.46, cash: 267.7 },
-      investments: { endowusEt: 12820.33, endowusSy: 8867.17, moomooEt: 3167.01, moomooSy: 9026.23, cdp: 6835.9, other: 463.68 },
-      cpfEt: { oa: 30802.03, sa: 58061.65, ma: 57736.28 }, cpfSy: { oa: 22185.85, sa: 39215.28, ma: 42828.17 },
-      property: { hdbValue: 501200, hdbLoan: 261481.77, carLoan: 77928, creditCard: 3423.34 } } },
-  { month: "Jun 2026", income: { payrollEt: 12534, piano: 330, interestDividends: 28.63, others: 48958 },
-    expenses: { fixedNonFinancial: { housingUtilities: 496.3, leisureFamily: 1018.4, subscriptions: 109.87, vehicle: 1735.45, helper: 898 },
-      fixedFinancial: { insurance: 1202.12, endowment: 463.24, taxes: 1110.43 },
-      variable: { fnb: 1149.31, groceries: 611.41, shopping: 494.06, transportation: 80.36, golf: 250.7, healthQol: 183.07, holidays: 0, misc: 1523.54, bigTicket: 965.4 } },
-    balances: { liquidCash: { uob: 58261.96, dbsEtsy: 4823.49, dbsEt: 1935.61, syReserve: 9194.52, cash: 1441.5 },
-      investments: { endowusEt: 13191.17, endowusSy: 9141.43, moomooEt: 3079.36, moomooSy: 9217, cdp: 6814.32, other: 378.55 },
-      cpfEt: { oa: 31379.27, sa: 58541.46, ma: 57269.35 }, cpfSy: { oa: 22553.9, sa: 39311.24, ma: 42956.16 },
-      property: { hdbValue: 501200, hdbLoan: 260218.77, carLoan: 76429, creditCard: 4338.42 } } },
-];
-
+const INITIAL_RECORDS = [{
+  month: "Jan 2026",
+  income: {
+    payrollEt: 11397,
+    piano: 2370,
+    interestDividends: 79.81,
+    others: 14.23
+  },
+  expenses: {
+    fixedNonFinancial: {
+      housingUtilities: 157.01,
+      leisureFamily: 600,
+      subscriptions: 138.93,
+      vehicle: 1785.14,
+      helper: 862.11
+    },
+    fixedFinancial: {
+      insurance: 2765.22,
+      endowment: 463.24,
+      taxes: 1179.31
+    },
+    variable: {
+      fnb: 912.5,
+      groceries: 824.22,
+      shopping: 1885.96,
+      transportation: 58.8,
+      golf: 344.9,
+      healthQol: -31.24,
+      holidays: 246.95,
+      misc: 10.53,
+      bigTicket: -3188.04
+    }
+  }
+}, {
+  month: "Feb 2026",
+  income: {
+    payrollEt: 11397,
+    piano: 1445,
+    interestDividends: 6.25,
+    others: -212.88
+  },
+  expenses: {
+    fixedNonFinancial: {
+      housingUtilities: 178.86,
+      leisureFamily: 624.25,
+      subscriptions: 233.83,
+      vehicle: 1715.62,
+      helper: 547
+    },
+    fixedFinancial: {
+      insurance: 35.78,
+      endowment: 463.24,
+      taxes: 950.83
+    },
+    variable: {
+      fnb: 780.81,
+      groceries: 587.58,
+      shopping: 2492.61,
+      transportation: 50.67,
+      golf: 409.38,
+      healthQol: 134,
+      holidays: 100,
+      misc: 189.58,
+      bigTicket: 2557.95
+    }
+  }
+}, {
+  month: "Mar 2026",
+  income: {
+    payrollEt: 11397,
+    piano: 1430,
+    interestDividends: 110.98,
+    others: 1587.57
+  },
+  expenses: {
+    fixedNonFinancial: {
+      housingUtilities: 197.79,
+      leisureFamily: 600,
+      subscriptions: 106.27,
+      vehicle: 1755.54,
+      helper: 902
+    },
+    fixedFinancial: {
+      insurance: 35.78,
+      endowment: 463.24,
+      taxes: 950.83
+    },
+    variable: {
+      fnb: 1113.71,
+      groceries: 573.52,
+      shopping: 1305.8,
+      transportation: 85.97,
+      golf: 250.7,
+      healthQol: 14,
+      holidays: 0,
+      misc: 501.11,
+      bigTicket: 201.65
+    }
+  }
+}, {
+  month: "Apr 2026",
+  income: {
+    payrollEt: 11397,
+    piano: 375,
+    interestDividends: 26.18,
+    others: 36.14
+  },
+  expenses: {
+    fixedNonFinancial: {
+      housingUtilities: 270.48,
+      leisureFamily: 600,
+      subscriptions: 134.85,
+      vehicle: 1897.88,
+      helper: 874
+    },
+    fixedFinancial: {
+      insurance: 2010.68,
+      endowment: 463.24,
+      taxes: 0
+    },
+    variable: {
+      fnb: 740.93,
+      groceries: 1405.81,
+      shopping: 781.87,
+      transportation: 4.48,
+      golf: 250.7,
+      healthQol: 76,
+      holidays: 0,
+      misc: 293.27,
+      bigTicket: 13523.23
+    }
+  },
+  balances: {
+    liquidCash: {
+      uob: 31423,
+      dbsEtsy: 2483,
+      dbsEt: 1237,
+      syReserve: 1724,
+      cash: 217
+    },
+    investments: {
+      endowusEt: 11896,
+      endowusSy: 7979,
+      moomooEt: 3106,
+      moomooSy: 8866,
+      cdp: 6863,
+      other: 521
+    },
+    cpfEt: {
+      oa: 28962,
+      sa: 57582,
+      ma: 61516
+    },
+    cpfSy: {
+      oa: 21818,
+      sa: 39119,
+      ma: 42700
+    },
+    property: {
+      hdbValue: 501200,
+      hdbLoan: 262745,
+      carLoan: 79427,
+      creditCard: 10508
+    }
+  }
+}, {
+  month: "May 2026",
+  income: {
+    payrollEt: 11397,
+    piano: 0,
+    interestDividends: 89.6,
+    others: 3.6
+  },
+  expenses: {
+    fixedNonFinancial: {
+      housingUtilities: 306.34,
+      leisureFamily: 600,
+      subscriptions: 139.85,
+      vehicle: 1760.42,
+      helper: 919.82
+    },
+    fixedFinancial: {
+      insurance: 3715.39,
+      endowment: 463.24,
+      taxes: 1082.43
+    },
+    variable: {
+      fnb: 1064.19,
+      groceries: 1452.57,
+      shopping: 1167.12,
+      transportation: 25.4,
+      golf: 342.01,
+      healthQol: 577.5,
+      holidays: 0,
+      misc: 4473,
+      bigTicket: 2194.88
+    }
+  },
+  balances: {
+    liquidCash: {
+      uob: 17052.5,
+      dbsEtsy: 654.48,
+      dbsEt: 1512.92,
+      syReserve: 1724.46,
+      cash: 267.7
+    },
+    investments: {
+      endowusEt: 12820.33,
+      endowusSy: 8867.17,
+      moomooEt: 3167.01,
+      moomooSy: 9026.23,
+      cdp: 6835.9,
+      other: 463.68
+    },
+    cpfEt: {
+      oa: 30802.03,
+      sa: 58061.65,
+      ma: 57736.28
+    },
+    cpfSy: {
+      oa: 22185.85,
+      sa: 39215.28,
+      ma: 42828.17
+    },
+    property: {
+      hdbValue: 501200,
+      hdbLoan: 261481.77,
+      carLoan: 77928,
+      creditCard: 3423.34
+    }
+  }
+}, {
+  month: "Jun 2026",
+  income: {
+    payrollEt: 12534,
+    piano: 330,
+    interestDividends: 28.63,
+    others: 48958
+  },
+  expenses: {
+    fixedNonFinancial: {
+      housingUtilities: 496.3,
+      leisureFamily: 1018.4,
+      subscriptions: 109.87,
+      vehicle: 1735.45,
+      helper: 898
+    },
+    fixedFinancial: {
+      insurance: 1202.12,
+      endowment: 463.24,
+      taxes: 1110.43
+    },
+    variable: {
+      fnb: 1149.31,
+      groceries: 611.41,
+      shopping: 494.06,
+      transportation: 80.36,
+      golf: 250.7,
+      healthQol: 183.07,
+      holidays: 0,
+      misc: 1523.54,
+      bigTicket: 965.4
+    }
+  },
+  balances: {
+    liquidCash: {
+      uob: 58261.96,
+      dbsEtsy: 4823.49,
+      dbsEt: 1935.61,
+      syReserve: 9194.52,
+      cash: 1441.5
+    },
+    investments: {
+      endowusEt: 13191.17,
+      endowusSy: 9141.43,
+      moomooEt: 3079.36,
+      moomooSy: 9217,
+      cdp: 6814.32,
+      other: 378.55
+    },
+    cpfEt: {
+      oa: 31379.27,
+      sa: 58541.46,
+      ma: 57269.35
+    },
+    cpfSy: {
+      oa: 22553.9,
+      sa: 39311.24,
+      ma: 42956.16
+    },
+    property: {
+      hdbValue: 501200,
+      hdbLoan: 260218.77,
+      carLoan: 76429,
+      creditCard: 4338.42
+    }
+  }
+}];
 function computeDerived(record, assumptions) {
   const totalIncome = sum(record.income);
   const totalFixedNonFinancial = sum(record.expenses.fixedNonFinancial);
@@ -179,7 +578,19 @@ function computeDerived(record, assumptions) {
   const monthlyTakeHome = record.income.payrollEt;
   const monthlySavings = monthlyTakeHome - totalExpenses;
   const annualTakeHome = monthlyTakeHome * 12;
-  const base = { totalIncome, totalFixedNonFinancial, totalFixedFinancial, totalVariableGross, totalVariableExclBigTicket, totalExpenses, netCashflow, monthlyTakeHome, monthlySavings, annualTakeHome, hasBalances: !!record.balances };
+  const base = {
+    totalIncome,
+    totalFixedNonFinancial,
+    totalFixedFinancial,
+    totalVariableGross,
+    totalVariableExclBigTicket,
+    totalExpenses,
+    netCashflow,
+    monthlyTakeHome,
+    monthlySavings,
+    annualTakeHome,
+    hasBalances: !!record.balances
+  };
   if (!record.balances) return base;
   const b = record.balances;
   const totalLiquidCash = sum(b.liquidCash);
@@ -195,40 +606,136 @@ function computeDerived(record, assumptions) {
   const bufferProgress = currentLiquidCashNetCC / assumptions.emergencyBufferTarget;
   const bufferGap = Math.max(assumptions.emergencyBufferTarget - currentLiquidCashNetCC, 0);
   const ratios = {
-    basicLiquidity: totalLiquidCash / totalExpenses, netLiquidity: currentLiquidCashNetCC / totalExpenses,
-    liquidToNetWorth: totalLiquidCash / netWorth, savingsRatio: monthlySavings / assumptions.monthlyGrossIncome,
-    debtToAsset: totalLiabilities / totalAssets, debtServicing: assumptions.carLoanRepayment / monthlyTakeHome,
-    insPremiumLoad: assumptions.annualInsurancePremiums / annualTakeHome, insPremiumLoadExclEnd: assumptions.annualInsurancePremiumsExclEndowments / annualTakeHome,
-    netInvestToNetWorth: totalInvestments / netWorth, coverageToIncome: assumptions.etLegacyCover / annualTakeHome,
+    basicLiquidity: totalLiquidCash / totalExpenses,
+    netLiquidity: currentLiquidCashNetCC / totalExpenses,
+    liquidToNetWorth: totalLiquidCash / netWorth,
+    savingsRatio: monthlySavings / assumptions.monthlyGrossIncome,
+    debtToAsset: totalLiabilities / totalAssets,
+    debtServicing: assumptions.carLoanRepayment / monthlyTakeHome,
+    insPremiumLoad: assumptions.annualInsurancePremiums / annualTakeHome,
+    insPremiumLoadExclEnd: assumptions.annualInsurancePremiumsExclEndowments / annualTakeHome,
+    netInvestToNetWorth: totalInvestments / netWorth,
+    coverageToIncome: assumptions.etLegacyCover / annualTakeHome
   };
-  return { ...base, totalLiquidCash, totalInvestments, etCpfTotal, syCpfTotal, combinedCpf, totalLiabilities, propertyEquity, netWorth, totalAssets, currentLiquidCashNetCC, bufferProgress, bufferGap, ratios };
+  return {
+    ...base,
+    totalLiquidCash,
+    totalInvestments,
+    etCpfTotal,
+    syCpfTotal,
+    combinedCpf,
+    totalLiabilities,
+    propertyEquity,
+    netWorth,
+    totalAssets,
+    currentLiquidCashNetCC,
+    bufferProgress,
+    bufferGap,
+    ratios
+  };
 }
-
-const RATIO_META = [
-  { key: "basicLiquidity", label: "Basic liquidity ratio", fmt: fmtRatio, bench: "≥ 6.0x is good", what: "How many months of expenses your liquid cash alone could cover." },
-  { key: "netLiquidity", label: "Net liquidity ratio", fmt: fmtRatio, bench: "≥ 3.0x is adequate", what: "Same as above, after subtracting what's owed on the credit card." },
-  { key: "liquidToNetWorth", label: "Liquid assets / net worth", fmt: (v) => fmtPct(v), bench: "10–20% healthy", what: "How much of your total wealth is sitting in easily-accessible cash." },
-  { key: "savingsRatio", label: "Savings ratio", fmt: (v) => fmtPct(v), bench: "2026 target 28%", what: "The share of your gross income you're actually keeping each month." },
-  { key: "debtToAsset", label: "Debt to asset ratio", fmt: (v) => fmtPct(v), bench: "< 40% healthy", what: "How much of everything you own is financed by debt." },
-  { key: "debtServicing", label: "Debt servicing ratio (car)", fmt: (v) => fmtPct(v), bench: "MAS TDSR guideline < 60%", what: "How much of your take-home pay goes to the car loan alone." },
-  { key: "insPremiumLoad", label: "Insurance premium load", fmt: (v) => fmtPct(v), bench: "benchmark 3–5%", what: "The share of your income spent on insurance premiums, endowments included." },
-  { key: "insPremiumLoadExclEnd", label: "Ins. load excl. endowments", fmt: (v) => fmtPct(v), bench: "benchmark 2–3%", what: "Same, stripping out endowment/investment-linked premiums to isolate pure protection cost." },
-  { key: "netInvestToNetWorth", label: "Investments / net worth", fmt: (v) => fmtPct(v), bench: "grow over time", what: "How much of your wealth is actively invested versus sitting in cash, property or CPF." },
-  { key: "coverageToIncome", label: "Coverage to income (ET)", fmt: fmtRatio, bench: "benchmark ≥ 10x", what: "How many years of ET's income the death/TPD payout would replace." },
-];
-
+const RATIO_META = [{
+  key: "basicLiquidity",
+  label: "Basic liquidity ratio",
+  fmt: fmtRatio,
+  bench: "≥ 6.0x is good",
+  what: "How many months of expenses your liquid cash alone could cover."
+}, {
+  key: "netLiquidity",
+  label: "Net liquidity ratio",
+  fmt: fmtRatio,
+  bench: "≥ 3.0x is adequate",
+  what: "Same as above, after subtracting what's owed on the credit card."
+}, {
+  key: "liquidToNetWorth",
+  label: "Liquid assets / net worth",
+  fmt: v => fmtPct(v),
+  bench: "10–20% healthy",
+  what: "How much of your total wealth is sitting in easily-accessible cash."
+}, {
+  key: "savingsRatio",
+  label: "Savings ratio",
+  fmt: v => fmtPct(v),
+  bench: "2026 target 28%",
+  what: "The share of your gross income you're actually keeping each month."
+}, {
+  key: "debtToAsset",
+  label: "Debt to asset ratio",
+  fmt: v => fmtPct(v),
+  bench: "< 40% healthy",
+  what: "How much of everything you own is financed by debt."
+}, {
+  key: "debtServicing",
+  label: "Debt servicing ratio (car)",
+  fmt: v => fmtPct(v),
+  bench: "MAS TDSR guideline < 60%",
+  what: "How much of your take-home pay goes to the car loan alone."
+}, {
+  key: "insPremiumLoad",
+  label: "Insurance premium load",
+  fmt: v => fmtPct(v),
+  bench: "benchmark 3–5%",
+  what: "The share of your income spent on insurance premiums, endowments included."
+}, {
+  key: "insPremiumLoadExclEnd",
+  label: "Ins. load excl. endowments",
+  fmt: v => fmtPct(v),
+  bench: "benchmark 2–3%",
+  what: "Same, stripping out endowment/investment-linked premiums to isolate pure protection cost."
+}, {
+  key: "netInvestToNetWorth",
+  label: "Investments / net worth",
+  fmt: v => fmtPct(v),
+  bench: "grow over time",
+  what: "How much of your wealth is actively invested versus sitting in cash, property or CPF."
+}, {
+  key: "coverageToIncome",
+  label: "Coverage to income (ET)",
+  fmt: fmtRatio,
+  bench: "benchmark ≥ 10x",
+  what: "How many years of ET's income the death/TPD payout would replace."
+}];
 const LABELS = {
-  uob: "UOB One ETSY", dbsEtsy: "DBS ETSY", dbsEt: "DBS ET", syReserve: "SY reserve", cash: "Cash",
-  endowusEt: "Endowus — ET", endowusSy: "Endowus — SY", moomooEt: "MooMoo ET", moomooSy: "MooMoo SY", cdp: "CDP", other: "Other",
-  oa: "OA", sa: "SA", ma: "MA",
-  hdbValue: "HDB estimated value", hdbLoan: "HDB loan outstanding", carLoan: "Car loan outstanding", creditCard: "Credit card balance",
-  payrollEt: "Payroll — ET (take-home)", piano: "Piano", interestDividends: "Interest / dividends", others: "Others",
-  housingUtilities: "Housing utilities / maint.", leisureFamily: "Leisure — family", subscriptions: "Subscriptions", vehicle: "Vehicle", helper: "Helper",
-  insurance: "Insurance", endowment: "Endowment", taxes: "Taxes",
-  fnb: "F&B", groceries: "F&B — groceries", shopping: "Shopping", transportation: "Transportation",
-  golf: "Leisure — golf", healthQol: "Leisure — health & QoL", holidays: "Holidays", misc: "Misc", bigTicket: "Big ticket / one-off",
+  uob: "UOB One ETSY",
+  dbsEtsy: "DBS ETSY",
+  dbsEt: "DBS ET",
+  syReserve: "SY reserve",
+  cash: "Cash",
+  endowusEt: "Endowus — ET",
+  endowusSy: "Endowus — SY",
+  moomooEt: "MooMoo ET",
+  moomooSy: "MooMoo SY",
+  cdp: "CDP",
+  other: "Other",
+  oa: "OA",
+  sa: "SA",
+  ma: "MA",
+  hdbValue: "HDB estimated value",
+  hdbLoan: "HDB loan outstanding",
+  carLoan: "Car loan outstanding",
+  creditCard: "Credit card balance",
+  payrollEt: "Payroll — ET (take-home)",
+  piano: "Piano",
+  interestDividends: "Interest / dividends",
+  others: "Others",
+  housingUtilities: "Housing utilities / maint.",
+  leisureFamily: "Leisure — family",
+  subscriptions: "Subscriptions",
+  vehicle: "Vehicle",
+  helper: "Helper",
+  insurance: "Insurance",
+  endowment: "Endowment",
+  taxes: "Taxes",
+  fnb: "F&B",
+  groceries: "F&B — groceries",
+  shopping: "Shopping",
+  transportation: "Transportation",
+  golf: "Leisure — golf",
+  healthQol: "Leisure — health & QoL",
+  holidays: "Holidays",
+  misc: "Misc",
+  bigTicket: "Big ticket / one-off"
 };
-
 const CONTRACT_CATEGORIES = ["Telco / Mobile", "Broadband", "Utilities", "Insurance", "Subscriptions", "Other"];
 const INSURANCE_TYPES = ["Death/TPD", "CI/ECI", "Personal Accident", "Hospitalisation", "Endowment"];
 const FREQUENCIES = ["Monthly", "Quarterly", "Semi-Annual", "Annual"];
@@ -237,25 +744,82 @@ const PAYMENT_METHODS = ["GIRO", "Credit card", "PayNow", "Cheque", "Other"];
 /* CPF Board rates effective 1 Jan 2026 (cpf.gov.sg). OW ceiling $8,000/mth, annual OW+AW ceiling $102,000. */
 const CPF_OW_CEILING = 8000;
 const CPF_ANNUAL_CEILING = 102000;
-const CPF_CONTRIB_BANDS = [
-  { maxAge: 55, total: 0.37, employer: 0.17, employee: 0.20 },
-  { maxAge: 60, total: 0.34, employer: 0.16, employee: 0.18 },
-  { maxAge: 65, total: 0.25, employer: 0.125, employee: 0.125 },
-  { maxAge: 70, total: 0.165, employer: 0.085, employee: 0.08 },
-  { maxAge: Infinity, total: 0.125, employer: 0.075, employee: 0.05 },
-];
-const CPF_ALLOC_BANDS = [
-  { maxAge: 35, oa: 0.6217, sa: 0.1621, ma: 0.2162, saLabel: "SA" },
-  { maxAge: 45, oa: 0.5677, sa: 0.1891, ma: 0.2432, saLabel: "SA" },
-  { maxAge: 50, oa: 0.5136, sa: 0.2162, ma: 0.2702, saLabel: "SA" },
-  { maxAge: 55, oa: 0.4055, sa: 0.3108, ma: 0.2837, saLabel: "SA" },
-  { maxAge: 60, oa: 0.353, sa: 0.3382, ma: 0.3088, saLabel: "RA" },
-  { maxAge: 65, oa: 0.14, sa: 0.44, ma: 0.42, saLabel: "RA" },
-  { maxAge: 70, oa: 0.0607, sa: 0.303, ma: 0.6363, saLabel: "RA" },
-  { maxAge: Infinity, oa: 0.08, sa: 0.08, ma: 0.84, saLabel: "RA" },
-];
-const bandFor = (age, table) => table.find((b) => age <= b.maxAge) || table[table.length - 1];
-
+const CPF_CONTRIB_BANDS = [{
+  maxAge: 55,
+  total: 0.37,
+  employer: 0.17,
+  employee: 0.20
+}, {
+  maxAge: 60,
+  total: 0.34,
+  employer: 0.16,
+  employee: 0.18
+}, {
+  maxAge: 65,
+  total: 0.25,
+  employer: 0.125,
+  employee: 0.125
+}, {
+  maxAge: 70,
+  total: 0.165,
+  employer: 0.085,
+  employee: 0.08
+}, {
+  maxAge: Infinity,
+  total: 0.125,
+  employer: 0.075,
+  employee: 0.05
+}];
+const CPF_ALLOC_BANDS = [{
+  maxAge: 35,
+  oa: 0.6217,
+  sa: 0.1621,
+  ma: 0.2162,
+  saLabel: "SA"
+}, {
+  maxAge: 45,
+  oa: 0.5677,
+  sa: 0.1891,
+  ma: 0.2432,
+  saLabel: "SA"
+}, {
+  maxAge: 50,
+  oa: 0.5136,
+  sa: 0.2162,
+  ma: 0.2702,
+  saLabel: "SA"
+}, {
+  maxAge: 55,
+  oa: 0.4055,
+  sa: 0.3108,
+  ma: 0.2837,
+  saLabel: "SA"
+}, {
+  maxAge: 60,
+  oa: 0.353,
+  sa: 0.3382,
+  ma: 0.3088,
+  saLabel: "RA"
+}, {
+  maxAge: 65,
+  oa: 0.14,
+  sa: 0.44,
+  ma: 0.42,
+  saLabel: "RA"
+}, {
+  maxAge: 70,
+  oa: 0.0607,
+  sa: 0.303,
+  ma: 0.6363,
+  saLabel: "RA"
+}, {
+  maxAge: Infinity,
+  oa: 0.08,
+  sa: 0.08,
+  ma: 0.84,
+  saLabel: "RA"
+}];
+const bandFor = (age, table) => table.find(b => age <= b.maxAge) || table[table.length - 1];
 function computeCpfContribution(age, ow, aw, annualOwToDateExclThisMonth) {
   const contribBand = bandFor(age, CPF_CONTRIB_BANDS);
   const allocBand = bandFor(age, CPF_ALLOC_BANDS);
@@ -274,17 +838,71 @@ function computeCpfContribution(age, ow, aw, annualOwToDateExclThisMonth) {
   const maAmt = Math.round(totalContribution * allocBand.ma);
   const saAmt = Math.round(totalContribution * allocBand.sa);
   const oaAmt = totalContribution - maAmt - saAmt;
-  return { contribBand, allocBand, owSubject, owTotal, owEmployee, owEmployer, awCeiling, awSubject, awTotal, awEmployee, awEmployer, totalContribution, totalEmployee, totalEmployer, oaAmt, saAmt, maAmt };
+  return {
+    contribBand,
+    allocBand,
+    owSubject,
+    owTotal,
+    owEmployee,
+    owEmployer,
+    awCeiling,
+    awSubject,
+    awTotal,
+    awEmployee,
+    awEmployer,
+    totalContribution,
+    totalEmployee,
+    totalEmployer,
+    oaAmt,
+    saAmt,
+    maAmt
+  };
 }
 
 /* IRAS resident tax brackets, YA2024 onwards (iras.gov.sg) */
-const TAX_BRACKETS = [
-  { upTo: 20000, rate: 0 }, { upTo: 30000, rate: 0.02 }, { upTo: 40000, rate: 0.035 }, { upTo: 80000, rate: 0.07 },
-  { upTo: 120000, rate: 0.115 }, { upTo: 160000, rate: 0.15 }, { upTo: 200000, rate: 0.18 }, { upTo: 240000, rate: 0.19 },
-  { upTo: 280000, rate: 0.195 }, { upTo: 320000, rate: 0.20 }, { upTo: 500000, rate: 0.22 }, { upTo: 1000000, rate: 0.23 }, { upTo: Infinity, rate: 0.24 },
-];
+const TAX_BRACKETS = [{
+  upTo: 20000,
+  rate: 0
+}, {
+  upTo: 30000,
+  rate: 0.02
+}, {
+  upTo: 40000,
+  rate: 0.035
+}, {
+  upTo: 80000,
+  rate: 0.07
+}, {
+  upTo: 120000,
+  rate: 0.115
+}, {
+  upTo: 160000,
+  rate: 0.15
+}, {
+  upTo: 200000,
+  rate: 0.18
+}, {
+  upTo: 240000,
+  rate: 0.19
+}, {
+  upTo: 280000,
+  rate: 0.195
+}, {
+  upTo: 320000,
+  rate: 0.20
+}, {
+  upTo: 500000,
+  rate: 0.22
+}, {
+  upTo: 1000000,
+  rate: 0.23
+}, {
+  upTo: Infinity,
+  rate: 0.24
+}];
 function computeTax(chargeableIncome) {
-  let tax = 0, lower = 0;
+  let tax = 0,
+    lower = 0;
   for (const b of TAX_BRACKETS) {
     if (chargeableIncome <= lower) break;
     const upper = Math.min(chargeableIncome, b.upTo);
@@ -293,15 +911,17 @@ function computeTax(chargeableIncome) {
   }
   return Math.round(tax * 100) / 100;
 }
-const earnedIncomeRelief = (age) => age >= 60 ? 8000 : age >= 55 ? 6000 : 1000;
-
+const earnedIncomeRelief = age => age >= 60 ? 8000 : age >= 55 ? 6000 : 1000;
 function amortize(principal, ratePct, tenureYears) {
   const r = ratePct / 100 / 12;
   const n = Math.round(tenureYears * 12);
-  const payment = r === 0 ? principal / n : (principal * r) / (1 - Math.pow(1 + r, -n));
+  const payment = r === 0 ? principal / n : principal * r / (1 - Math.pow(1 + r, -n));
   let balance = principal;
   const yearly = [];
-  let yr = { principal: 0, interest: 0 };
+  let yr = {
+    principal: 0,
+    interest: 0
+  };
   let totalInterest = 0;
   for (let m = 1; m <= n; m++) {
     const interestPortion = balance * r;
@@ -311,115 +931,398 @@ function amortize(principal, ratePct, tenureYears) {
     totalInterest += interestPortion;
     yr.principal += principalPortion;
     yr.interest += interestPortion;
-    if (m % 12 === 0 || m === n) { yr.balance = balance; yearly.push(yr); yr = { principal: 0, interest: 0 }; }
+    if (m % 12 === 0 || m === n) {
+      yr.balance = balance;
+      yearly.push(yr);
+      yr = {
+        principal: 0,
+        interest: 0
+      };
+    }
   }
-  return { payment, n, totalInterest, totalRepayment: principal + totalInterest, yearly };
+  return {
+    payment,
+    n,
+    totalInterest,
+    totalRepayment: principal + totalInterest,
+    yearly
+  };
 }
 
 /* ───────────────────────── atoms ───────────────────────── */
 
-function KpiCard({ label, value, sub }) {
-  return (
-    <div style={{ background: "#fff", border: "1px solid var(--hair)", borderRadius: 10, padding: "16px 18px", flex: "1 1 160px", minWidth: 150 }}>
-      <div style={{ fontSize: 11, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--ink-3)", fontFamily: "var(--sans)" }}>{label}</div>
-      <div style={{ fontSize: 24, fontFamily: "var(--mono)", fontWeight: 600, color: "var(--ink-1)", marginTop: 4 }}>{value}</div>
-      {sub && <div style={{ fontSize: 12, color: "var(--ink-3)", marginTop: 2, fontFamily: "var(--sans)" }}>{sub}</div>}
-    </div>
-  );
+function KpiCard({
+  label,
+  value,
+  sub
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#fff",
+      border: "1px solid var(--hair)",
+      borderRadius: 10,
+      padding: "16px 18px",
+      flex: "1 1 160px",
+      minWidth: 150
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      letterSpacing: "0.06em",
+      textTransform: "uppercase",
+      color: "var(--ink-3)",
+      fontFamily: "var(--sans)"
+    }
+  }, label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 24,
+      fontFamily: "var(--mono)",
+      fontWeight: 600,
+      color: "var(--ink-1)",
+      marginTop: 4
+    }
+  }, value), sub && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: "var(--ink-3)",
+      marginTop: 2,
+      fontFamily: "var(--sans)"
+    }
+  }, sub));
 }
-function Section({ title, eyebrow, children, right }) {
-  return (
-    <div style={{ marginTop: 30 }}>
-      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", borderBottom: "1px solid var(--hair)", paddingBottom: 8, marginBottom: 16, flexWrap: "wrap", gap: 8 }}>
-        <div>
-          {eyebrow && <div style={{ fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--accent)", fontFamily: "var(--sans)", fontWeight: 600 }}>{eyebrow}</div>}
-          <div style={{ fontFamily: "var(--serif)", fontSize: 19, color: "var(--ink-1)" }}>{title}</div>
-        </div>
-        {right}
-      </div>
-      {children}
-    </div>
-  );
+function Section({
+  title,
+  eyebrow,
+  children,
+  right
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 30
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "baseline",
+      justifyContent: "space-between",
+      borderBottom: "1px solid var(--hair)",
+      paddingBottom: 8,
+      marginBottom: 16,
+      flexWrap: "wrap",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("div", null, eyebrow && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      letterSpacing: "0.08em",
+      textTransform: "uppercase",
+      color: "var(--accent)",
+      fontFamily: "var(--sans)",
+      fontWeight: 600
+    }
+  }, eyebrow), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--serif)",
+      fontSize: 19,
+      color: "var(--ink-1)"
+    }
+  }, title)), right), children);
 }
-function Stamp({ pct }) {
+function Stamp({
+  pct
+}) {
   const deg = Math.min(pct, 1) * 360;
   const color = pct >= 0.6 ? "#0F5D52" : "#A6402B";
-  return (
-    <div style={{ position: "relative", width: 108, height: 108, transform: "rotate(-4deg)", flexShrink: 0 }}>
-      <div style={{ width: "100%", height: "100%", borderRadius: "50%", background: `conic-gradient(${color} ${deg}deg, #E4E1D6 0deg)`, display: "flex", alignItems: "center", justifyContent: "center" }}>
-        <div style={{ width: 84, height: 84, borderRadius: "50%", background: "#F7F6F1", border: `2px dashed ${color}`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color }}>
-          <div style={{ fontFamily: "var(--mono)", fontSize: 19, fontWeight: 700 }}>{Math.round(pct * 100)}%</div>
-          <div style={{ fontFamily: "var(--sans)", fontSize: 8, letterSpacing: "0.06em", textTransform: "uppercase" }}>buffer</div>
-        </div>
-      </div>
-    </div>
-  );
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "relative",
+      width: 108,
+      height: 108,
+      transform: "rotate(-4deg)",
+      flexShrink: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: "100%",
+      height: "100%",
+      borderRadius: "50%",
+      background: `conic-gradient(${color} ${deg}deg, #E4E1D6 0deg)`,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 84,
+      height: 84,
+      borderRadius: "50%",
+      background: "#F7F6F1",
+      border: `2px dashed ${color}`,
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      justifyContent: "center",
+      color
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--mono)",
+      fontSize: 19,
+      fontWeight: 700
+    }
+  }, Math.round(pct * 100), "%"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 8,
+      letterSpacing: "0.06em",
+      textTransform: "uppercase"
+    }
+  }, "buffer"))));
 }
-function NumberField({ label, value, onChange, hint }) {
-  return (
-    <label style={{ display: "flex", flexDirection: "column", gap: 4, fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)" }}>
-      {label}
-      <input type="number" step="0.01" value={value} onChange={(e) => onChange(e.target.value === "" ? 0 : parseFloat(e.target.value))}
-        style={{ fontFamily: "var(--mono)", fontSize: 13.5, padding: "7px 9px", borderRadius: 6, border: "1px solid var(--hair-strong)", background: "#fff", color: "var(--ink-1)" }} />
-      {hint && <span style={{ fontSize: 11, color: "var(--ink-3)" }}>{hint}</span>}
-    </label>
-  );
+function NumberField({
+  label,
+  value,
+  onChange,
+  hint
+}) {
+  return /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 4,
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)"
+    }
+  }, label, /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    step: "0.01",
+    value: value,
+    onChange: e => onChange(e.target.value === "" ? 0 : parseFloat(e.target.value)),
+    style: {
+      fontFamily: "var(--mono)",
+      fontSize: 13.5,
+      padding: "7px 9px",
+      borderRadius: 6,
+      border: "1px solid var(--hair-strong)",
+      background: "#fff",
+      color: "var(--ink-1)"
+    }
+  }), hint && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: "var(--ink-3)"
+    }
+  }, hint));
 }
-function TextField({ label, value, onChange }) {
-  return (
-    <label style={{ display: "flex", flexDirection: "column", gap: 4, fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)" }}>
-      {label}
-      <input type="text" value={value} onChange={(e) => onChange(e.target.value)}
-        style={{ fontFamily: "var(--sans)", fontSize: 13.5, padding: "7px 9px", borderRadius: 6, border: "1px solid var(--hair-strong)", background: "#fff", color: "var(--ink-1)" }} />
-    </label>
-  );
+function TextField({
+  label,
+  value,
+  onChange
+}) {
+  return /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 4,
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)"
+    }
+  }, label, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    value: value,
+    onChange: e => onChange(e.target.value),
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 13.5,
+      padding: "7px 9px",
+      borderRadius: 6,
+      border: "1px solid var(--hair-strong)",
+      background: "#fff",
+      color: "var(--ink-1)"
+    }
+  }));
 }
-function DateField({ label, value, onChange }) {
-  return (
-    <label style={{ display: "flex", flexDirection: "column", gap: 4, fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)" }}>
-      {label}
-      <input type="date" value={value} onChange={(e) => onChange(e.target.value)}
-        style={{ fontFamily: "var(--mono)", fontSize: 13, padding: "7px 9px", borderRadius: 6, border: "1px solid var(--hair-strong)", background: "#fff", color: "var(--ink-1)" }} />
-    </label>
-  );
+function DateField({
+  label,
+  value,
+  onChange
+}) {
+  return /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 4,
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)"
+    }
+  }, label, /*#__PURE__*/React.createElement("input", {
+    type: "date",
+    value: value,
+    onChange: e => onChange(e.target.value),
+    style: {
+      fontFamily: "var(--mono)",
+      fontSize: 13,
+      padding: "7px 9px",
+      borderRadius: 6,
+      border: "1px solid var(--hair-strong)",
+      background: "#fff",
+      color: "var(--ink-1)"
+    }
+  }));
 }
-function SelectField({ label, value, onChange, options }) {
-  return (
-    <label style={{ display: "flex", flexDirection: "column", gap: 4, fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)" }}>
-      {label}
-      <select value={value} onChange={(e) => onChange(e.target.value)} style={{ padding: "7px 9px" }}>
-        {options.map((o) => <option key={o} value={o}>{o}</option>)}
-      </select>
-    </label>
-  );
+function SelectField({
+  label,
+  value,
+  onChange,
+  options
+}) {
+  return /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 4,
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)"
+    }
+  }, label, /*#__PURE__*/React.createElement("select", {
+    value: value,
+    onChange: e => onChange(e.target.value),
+    style: {
+      padding: "7px 9px"
+    }
+  }, options.map(o => /*#__PURE__*/React.createElement("option", {
+    key: o,
+    value: o
+  }, o))));
 }
-function CheckField({ label, checked, onChange }) {
-  return (
-    <label style={{ display: "flex", alignItems: "center", gap: 7, fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)" }}>
-      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} /> {label}
-    </label>
-  );
+function CheckField({
+  label,
+  checked,
+  onChange
+}) {
+  return /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 7,
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)"
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: checked,
+    onChange: e => onChange(e.target.checked)
+  }), " ", label);
 }
-function FieldGrid({ title, obj, onChange, cols = 3 }) {
-  return (
-    <div style={{ marginBottom: 18 }}>
-      <div style={{ fontSize: 12, fontFamily: "var(--sans)", fontWeight: 600, color: "var(--ink-2)", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.04em" }}>{title}</div>
-      <div style={{ display: "grid", gridTemplateColumns: `repeat(${cols}, minmax(0,1fr))`, gap: 10 }}>
-        {Object.entries(obj).map(([k, v]) => <NumberField key={k} label={LABELS[k] || k} value={v} onChange={(val) => onChange(k, val)} />)}
-      </div>
-    </div>
-  );
+function FieldGrid({
+  title,
+  obj,
+  onChange,
+  cols = 3
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      fontFamily: "var(--sans)",
+      fontWeight: 600,
+      color: "var(--ink-2)",
+      marginBottom: 8,
+      textTransform: "uppercase",
+      letterSpacing: "0.04em"
+    }
+  }, title), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: `repeat(${cols}, minmax(0,1fr))`,
+      gap: 10
+    }
+  }, Object.entries(obj).map(([k, v]) => /*#__PURE__*/React.createElement(NumberField, {
+    key: k,
+    label: LABELS[k] || k,
+    value: v,
+    onChange: val => onChange(k, val)
+  }))));
 }
-function Card({ children, style }) { return <div style={{ background: "#fff", border: "1px solid var(--hair)", borderRadius: 10, padding: 16, ...style }}>{children}</div>; }
-function IconBtn({ onClick, children }) { return <button className="btn-secondary" onClick={onClick} style={{ padding: "5px 10px", fontSize: 12 }}>{children}</button>; }
-function Bar({ pct, color }) { return <div style={{ height: 7, borderRadius: 4, background: "var(--hair)", overflow: "hidden" }}><div style={{ height: "100%", width: `${Math.min(Math.max(pct, 0) * 100, 100)}%`, background: color }} /></div>; }
-function Row({ label, value, strong, color }) {
-  return (
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "6px 0", fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", borderTop: "1px solid var(--hair)" }}>
-      <span>{label}</span>
-      <span style={{ fontFamily: "var(--mono)", fontSize: 13, fontWeight: strong ? 600 : 400, color: color || "var(--ink-1)" }}>{value}</span>
-    </div>
-  );
+function Card({
+  children,
+  style
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#fff",
+      border: "1px solid var(--hair)",
+      borderRadius: 10,
+      padding: 16,
+      ...style
+    }
+  }, children);
+}
+function IconBtn({
+  onClick,
+  children
+}) {
+  return /*#__PURE__*/React.createElement("button", {
+    className: "btn-secondary",
+    onClick: onClick,
+    style: {
+      padding: "5px 10px",
+      fontSize: 12
+    }
+  }, children);
+}
+function Bar({
+  pct,
+  color
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: 7,
+      borderRadius: 4,
+      background: "var(--hair)",
+      overflow: "hidden"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: "100%",
+      width: `${Math.min(Math.max(pct, 0) * 100, 100)}%`,
+      background: color
+    }
+  }));
+}
+function Row({
+  label,
+  value,
+  strong,
+  color
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "baseline",
+      padding: "6px 0",
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)",
+      borderTop: "1px solid var(--hair)"
+    }
+  }, /*#__PURE__*/React.createElement("span", null, label), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: "var(--mono)",
+      fontSize: 13,
+      fontWeight: strong ? 600 : 400,
+      color: color || "var(--ink-1)"
+    }
+  }, value));
 }
 
 /* ───────────────────────── main app ───────────────────────── */
@@ -432,12 +1335,39 @@ function App() {
   const [policies, setPolicies] = useState([]);
   const [recurring, setRecurring] = useState([]);
   const [familyMembers, setFamilyMembers] = useState(["ET", "SY"]);
-  const [housingLoan, setHousingLoan] = useState({ principal: 277810, ratePct: 2.6, tenureYears: 25, startMonth: "May 2024" });
-  const [carLoan, setCarLoan] = useState({ principal: 80000, ratePct: 2.48, tenureYears: 5, startMonth: "Oct 2025" });
-  const [cpfSettings, setCpfSettings] = useState({ etAge: 36, monthlyOW: 14137, bonusThisMonth: 0, annualOwToDate: 0, manualOverride: false, manualOA: 0, manualSA: 0, manualMA: 0, syIncome: 0 });
-  const [taxSettings, setTaxSettings] = useState({ annualEmploymentIncome: 169644, includeCpfRelief: true, nsmanRelief: 1500, numChildren: 2, childReliefPerChild: 4000, age: 36, adhoc: [] });
+  const [housingLoan, setHousingLoan] = useState({
+    principal: 277810,
+    ratePct: 2.6,
+    tenureYears: 25,
+    startMonth: "May 2024"
+  });
+  const [carLoan, setCarLoan] = useState({
+    principal: 80000,
+    ratePct: 2.48,
+    tenureYears: 5,
+    startMonth: "Oct 2025"
+  });
+  const [cpfSettings, setCpfSettings] = useState({
+    etAge: 36,
+    monthlyOW: 14137,
+    bonusThisMonth: 0,
+    annualOwToDate: 0,
+    manualOverride: false,
+    manualOA: 0,
+    manualSA: 0,
+    manualMA: 0,
+    syIncome: 0
+  });
+  const [taxSettings, setTaxSettings] = useState({
+    annualEmploymentIncome: 169644,
+    includeCpfRelief: true,
+    nsmanRelief: 1500,
+    numChildren: 2,
+    childReliefPerChild: 4000,
+    age: 36,
+    adhoc: []
+  });
   const [pendingCpfBump, setPendingCpfBump] = useState(null);
-
   const [tab, setTab] = useState("dashboard");
   const [loanSub, setLoanSub] = useState("housing");
   const [expenseView, setExpenseView] = useState("month");
@@ -454,12 +1384,14 @@ function App() {
   useEffect(() => {
     (async () => {
       try {
-        const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timed out connecting to Firestore after 10s")), 10000));
-        const snap = await Promise.race([LEDGER_DOC.get(), timeout]);
+        const snap = await LEDGER_DOC.get();
         if (snap.exists) {
           const p = snap.data();
           setRecords(p.records || INITIAL_RECORDS);
-          setAssumptions({ ...DEFAULT_ASSUMPTIONS, ...(p.assumptions || {}) });
+          setAssumptions({
+            ...DEFAULT_ASSUMPTIONS,
+            ...(p.assumptions || {})
+          });
           setBudgets(p.budgets || {});
           setContracts(p.contracts || []);
           setPolicies(p.policies || []);
@@ -472,11 +1404,19 @@ function App() {
           setSelectedMonth((p.records || INITIAL_RECORDS)[(p.records || INITIAL_RECORDS).length - 1].month);
         } else {
           setRecords(INITIAL_RECORDS);
-          await LEDGER_DOC.set({ records: INITIAL_RECORDS, assumptions: DEFAULT_ASSUMPTIONS, budgets: {}, contracts: [], policies: [], recurring: [], familyMembers: ["ET", "SY"] });
+          await LEDGER_DOC.set({
+            records: INITIAL_RECORDS,
+            assumptions: DEFAULT_ASSUMPTIONS,
+            budgets: {},
+            contracts: [],
+            policies: [],
+            recurring: [],
+            familyMembers: ["ET", "SY"]
+          });
         }
       } catch (err) {
         console.error(err);
-        setSyncError("Could not connect to shared storage (" + (err && err.message ? err.message : "unknown error") + "). Likely causes: Firestore Database hasn't been created yet in the Firebase console, or security rules are blocking access. Showing local data only for now — changes won't be saved or shared until this is fixed.");
+        setSyncError("Could not connect to shared storage — check your Firestore security rules. Showing local data only for now.");
         setRecords(INITIAL_RECORDS);
       }
       setLoading(false);
@@ -484,12 +1424,19 @@ function App() {
   }, []);
 
   /* ─── Firestore save (replaces window.storage.set) ─── */
-  const persistAll = async (patch) => {
+  const persistAll = async patch => {
     const next = {
-      records: patch.records ?? records, assumptions: patch.assumptions ?? assumptions, budgets: patch.budgets ?? budgets,
-      contracts: patch.contracts ?? contracts, policies: patch.policies ?? policies, recurring: patch.recurring ?? recurring,
-      familyMembers: patch.familyMembers ?? familyMembers, housingLoan: patch.housingLoan ?? housingLoan, carLoan: patch.carLoan ?? carLoan,
-      cpfSettings: patch.cpfSettings ?? cpfSettings, taxSettings: patch.taxSettings ?? taxSettings,
+      records: patch.records ?? records,
+      assumptions: patch.assumptions ?? assumptions,
+      budgets: patch.budgets ?? budgets,
+      contracts: patch.contracts ?? contracts,
+      policies: patch.policies ?? policies,
+      recurring: patch.recurring ?? recurring,
+      familyMembers: patch.familyMembers ?? familyMembers,
+      housingLoan: patch.housingLoan ?? housingLoan,
+      carLoan: patch.carLoan ?? carLoan,
+      cpfSettings: patch.cpfSettings ?? cpfSettings,
+      taxSettings: patch.taxSettings ?? taxSettings
     };
     if (patch.records) setRecords(patch.records);
     if (patch.assumptions) setAssumptions(patch.assumptions);
@@ -510,100 +1457,255 @@ function App() {
       setSyncError("Could not save to shared storage — check your Firestore security rules.");
     }
   };
-
   const derivedByMonth = useMemo(() => {
     if (!records) return {};
     const map = {};
-    records.forEach((r) => { map[r.month] = computeDerived(r, assumptions); });
+    records.forEach(r => {
+      map[r.month] = computeDerived(r, assumptions);
+    });
     return map;
   }, [records, assumptions]);
-
   const trendData = useMemo(() => {
     if (!records) return [];
-    return records.map((r) => {
+    return records.map(r => {
       const d = derivedByMonth[r.month];
-      return { month: r.month.split(" ")[0], income: Math.round(d.totalIncome), expenses: Math.round(d.totalExpenses), netWorth: d.hasBalances ? Math.round(d.netWorth) : null };
+      return {
+        month: r.month.split(" ")[0],
+        income: Math.round(d.totalIncome),
+        expenses: Math.round(d.totalExpenses),
+        netWorth: d.hasBalances ? Math.round(d.netWorth) : null
+      };
     });
   }, [records, derivedByMonth]);
-
   const nextMonthName = useMemo(() => {
     if (!records) return "Jul 2026";
     const idx = MONTH_ORDER.indexOf(records[records.length - 1].month);
     return MONTH_ORDER[idx + 1] || "New month";
   }, [records]);
-
   const startDraft = () => {
     const last = records[records.length - 1];
     const balances = JSON.parse(JSON.stringify(last.balances || BLANK_BALANCES));
     if (pendingCpfBump) {
-      balances.cpfEt.oa += pendingCpfBump.oaAmt; balances.cpfEt.sa += pendingCpfBump.saAmt; balances.cpfEt.ma += pendingCpfBump.maAmt;
+      balances.cpfEt.oa += pendingCpfBump.oaAmt;
+      balances.cpfEt.sa += pendingCpfBump.saAmt;
+      balances.cpfEt.ma += pendingCpfBump.maAmt;
     }
-    setDraft({ month: nextMonthName, income: { ...BLANK_INCOME },
-      expenses: { fixedNonFinancial: { ...BLANK_EXPENSES.fixedNonFinancial }, fixedFinancial: { ...BLANK_EXPENSES.fixedFinancial }, variable: { ...BLANK_EXPENSES.variable } },
-      balances });
+    setDraft({
+      month: nextMonthName,
+      income: {
+        ...BLANK_INCOME
+      },
+      expenses: {
+        fixedNonFinancial: {
+          ...BLANK_EXPENSES.fixedNonFinancial
+        },
+        fixedFinancial: {
+          ...BLANK_EXPENSES.fixedFinancial
+        },
+        variable: {
+          ...BLANK_EXPENSES.variable
+        }
+      },
+      balances
+    });
     setPendingCpfBump(null);
     setTab("add");
   };
-
   const updateDraftField = (section, sub, key, value) => {
-    setDraft((prev) => { const next = JSON.parse(JSON.stringify(prev)); if (sub) next[section][sub][key] = value; else next[section][key] = value; return next; });
+    setDraft(prev => {
+      const next = JSON.parse(JSON.stringify(prev));
+      if (sub) next[section][sub][key] = value;else next[section][key] = value;
+      return next;
+    });
   };
-
   const saveDraft = async () => {
     if (!draft) return;
-    await persistAll({ records: [...records, draft] });
+    await persistAll({
+      records: [...records, draft]
+    });
     setSelectedMonth(draft.month);
     setDraft(null);
     setTab("dashboard");
     setSaveMsg(`${draft.month} saved`);
     setTimeout(() => setSaveMsg(""), 3000);
   };
-
-  const addContract = () => setContracts([...contracts, { id: uid(), name: "", provider: "", category: CONTRACT_CATEGORIES[0], monthlyAmount: 0, renewalDate: todayISO(), notes: "" }]);
-  const updateContract = (id, patch) => { const next = contracts.map((c) => c.id === id ? { ...c, ...patch } : c); setContracts(next); persistAll({ contracts: next }); };
-  const removeContract = (id) => { const next = contracts.filter((c) => c.id !== id); setContracts(next); persistAll({ contracts: next }); };
-
-  const addPolicy = () => setPolicies([...policies, { id: uid(), person: familyMembers[0] || "ET", type: INSURANCE_TYPES[0], insurer: "", product: "", coverage: 0, annualPremium: 0, paymentFrequency: "Annual", nextPaymentDate: todayISO(), paymentMethod: "GIRO", paymentAccount: "" }]);
-  const updatePolicy = (id, patch) => { const next = policies.map((p) => p.id === id ? { ...p, ...patch } : p); setPolicies(next); persistAll({ policies: next }); };
-  const removePolicy = (id) => { const next = policies.filter((p) => p.id !== id); setPolicies(next); persistAll({ policies: next }); };
-
-  const addRecurring = () => setRecurring([...recurring, { id: uid(), name: "", direction: "expense", amount: 0, frequency: "Monthly", dueMonth: 1, notes: "" }]);
-  const updateRecurring = (id, patch) => { const next = recurring.map((r) => r.id === id ? { ...r, ...patch } : r); setRecurring(next); persistAll({ recurring: next }); };
-  const removeRecurring = (id) => { const next = recurring.filter((r) => r.id !== id); setRecurring(next); persistAll({ recurring: next }); };
-
-  const addFamilyMember = () => { const name = prompt("Family member name (e.g. Child 1, Mum):"); if (name && !familyMembers.includes(name)) { const next = [...familyMembers, name]; setFamilyMembers(next); persistAll({ familyMembers: next }); } };
-  const removeFamilyMember = (name) => { if (name === "ET" || name === "SY") return; const next = familyMembers.filter((f) => f !== name); setFamilyMembers(next); persistAll({ familyMembers: next }); };
-
-  const updateBudget = (key, val) => { const next = { ...budgets, [key]: val }; setBudgets(next); persistAll({ budgets: next }); };
-
-  const addTaxAdhoc = () => persistAll({ taxSettings: { ...taxSettings, adhoc: [...taxSettings.adhoc, { id: uid(), name: "", type: "relief", amount: 0 }] } });
-  const updateTaxAdhoc = (id, patch) => persistAll({ taxSettings: { ...taxSettings, adhoc: taxSettings.adhoc.map((a) => a.id === id ? { ...a, ...patch } : a) } });
-  const removeTaxAdhoc = (id) => persistAll({ taxSettings: { ...taxSettings, adhoc: taxSettings.adhoc.filter((a) => a.id !== id) } });
-
+  const addContract = () => setContracts([...contracts, {
+    id: uid(),
+    name: "",
+    provider: "",
+    category: CONTRACT_CATEGORIES[0],
+    monthlyAmount: 0,
+    renewalDate: todayISO(),
+    notes: ""
+  }]);
+  const updateContract = (id, patch) => {
+    const next = contracts.map(c => c.id === id ? {
+      ...c,
+      ...patch
+    } : c);
+    setContracts(next);
+    persistAll({
+      contracts: next
+    });
+  };
+  const removeContract = id => {
+    const next = contracts.filter(c => c.id !== id);
+    setContracts(next);
+    persistAll({
+      contracts: next
+    });
+  };
+  const addPolicy = () => setPolicies([...policies, {
+    id: uid(),
+    person: familyMembers[0] || "ET",
+    type: INSURANCE_TYPES[0],
+    insurer: "",
+    product: "",
+    coverage: 0,
+    annualPremium: 0,
+    paymentFrequency: "Annual",
+    nextPaymentDate: todayISO(),
+    paymentMethod: "GIRO",
+    paymentAccount: ""
+  }]);
+  const updatePolicy = (id, patch) => {
+    const next = policies.map(p => p.id === id ? {
+      ...p,
+      ...patch
+    } : p);
+    setPolicies(next);
+    persistAll({
+      policies: next
+    });
+  };
+  const removePolicy = id => {
+    const next = policies.filter(p => p.id !== id);
+    setPolicies(next);
+    persistAll({
+      policies: next
+    });
+  };
+  const addRecurring = () => setRecurring([...recurring, {
+    id: uid(),
+    name: "",
+    direction: "expense",
+    amount: 0,
+    frequency: "Monthly",
+    dueMonth: 1,
+    notes: ""
+  }]);
+  const updateRecurring = (id, patch) => {
+    const next = recurring.map(r => r.id === id ? {
+      ...r,
+      ...patch
+    } : r);
+    setRecurring(next);
+    persistAll({
+      recurring: next
+    });
+  };
+  const removeRecurring = id => {
+    const next = recurring.filter(r => r.id !== id);
+    setRecurring(next);
+    persistAll({
+      recurring: next
+    });
+  };
+  const addFamilyMember = () => {
+    const name = prompt("Family member name (e.g. Child 1, Mum):");
+    if (name && !familyMembers.includes(name)) {
+      const next = [...familyMembers, name];
+      setFamilyMembers(next);
+      persistAll({
+        familyMembers: next
+      });
+    }
+  };
+  const removeFamilyMember = name => {
+    if (name === "ET" || name === "SY") return;
+    const next = familyMembers.filter(f => f !== name);
+    setFamilyMembers(next);
+    persistAll({
+      familyMembers: next
+    });
+  };
+  const updateBudget = (key, val) => {
+    const next = {
+      ...budgets,
+      [key]: val
+    };
+    setBudgets(next);
+    persistAll({
+      budgets: next
+    });
+  };
+  const addTaxAdhoc = () => persistAll({
+    taxSettings: {
+      ...taxSettings,
+      adhoc: [...taxSettings.adhoc, {
+        id: uid(),
+        name: "",
+        type: "relief",
+        amount: 0
+      }]
+    }
+  });
+  const updateTaxAdhoc = (id, patch) => persistAll({
+    taxSettings: {
+      ...taxSettings,
+      adhoc: taxSettings.adhoc.map(a => a.id === id ? {
+        ...a,
+        ...patch
+      } : a)
+    }
+  });
+  const removeTaxAdhoc = id => persistAll({
+    taxSettings: {
+      ...taxSettings,
+      adhoc: taxSettings.adhoc.filter(a => a.id !== id)
+    }
+  });
   const cpfResult = useMemo(() => computeCpfContribution(cpfSettings.etAge, cpfSettings.monthlyOW, cpfSettings.bonusThisMonth, cpfSettings.annualOwToDate), [cpfSettings]);
-  const cpfFinal = cpfSettings.manualOverride ? { oaAmt: cpfSettings.manualOA, saAmt: cpfSettings.manualSA, maAmt: cpfSettings.manualMA } : { oaAmt: cpfResult.oaAmt, saAmt: cpfResult.saAmt, maAmt: cpfResult.maAmt };
+  const cpfFinal = cpfSettings.manualOverride ? {
+    oaAmt: cpfSettings.manualOA,
+    saAmt: cpfSettings.manualSA,
+    maAmt: cpfSettings.manualMA
+  } : {
+    oaAmt: cpfResult.oaAmt,
+    saAmt: cpfResult.saAmt,
+    maAmt: cpfResult.maAmt
+  };
   const syMedisaveEstimate = Math.round((cpfSettings.syIncome || 0) * 0.25);
-
   const taxResult = useMemo(() => {
     const cpfReliefAmt = taxSettings.includeCpfRelief ? Math.min(0.20 * Math.min(cpfSettings.monthlyOW, CPF_OW_CEILING) * 12, 37740) : 0;
     const childRelief = taxSettings.numChildren * taxSettings.childReliefPerChild;
     const eir = earnedIncomeRelief(taxSettings.age);
-    const adhocReliefs = taxSettings.adhoc.filter((a) => a.type === "relief").reduce((a, r) => a + (Number(r.amount) || 0), 0);
-    const adhocRebates = taxSettings.adhoc.filter((a) => a.type === "rebate").reduce((a, r) => a + (Number(r.amount) || 0), 0);
+    const adhocReliefs = taxSettings.adhoc.filter(a => a.type === "relief").reduce((a, r) => a + (Number(r.amount) || 0), 0);
+    const adhocRebates = taxSettings.adhoc.filter(a => a.type === "rebate").reduce((a, r) => a + (Number(r.amount) || 0), 0);
     const totalReliefsUncapped = cpfReliefAmt + childRelief + eir + taxSettings.nsmanRelief + adhocReliefs;
     const totalReliefs = Math.min(totalReliefsUncapped, 80000);
     const chargeableIncome = Math.max(taxSettings.annualEmploymentIncome - totalReliefs, 0);
     const taxBeforeRebate = computeTax(chargeableIncome);
     const netTax = Math.max(taxBeforeRebate - adhocRebates, 0);
-    return { cpfReliefAmt, childRelief, eir, adhocReliefs, totalReliefsUncapped, totalReliefs, chargeableIncome, taxBeforeRebate, adhocRebates, netTax, effectiveRate: taxSettings.annualEmploymentIncome ? netTax / taxSettings.annualEmploymentIncome : 0 };
+    return {
+      cpfReliefAmt,
+      childRelief,
+      eir,
+      adhocReliefs,
+      totalReliefsUncapped,
+      totalReliefs,
+      chargeableIncome,
+      taxBeforeRebate,
+      adhocRebates,
+      netTax,
+      effectiveRate: taxSettings.annualEmploymentIncome ? netTax / taxSettings.annualEmploymentIncome : 0
+    };
   }, [taxSettings, cpfSettings]);
-
   const housingAmort = useMemo(() => amortize(housingLoan.principal, housingLoan.ratePct, housingLoan.tenureYears), [housingLoan]);
   const carAmort = useMemo(() => amortize(carLoan.principal, carLoan.ratePct, carLoan.tenureYears), [carLoan]);
   const activeLoan = loanSub === "housing" ? housingLoan : carLoan;
   const activeAmort = loanSub === "housing" ? housingAmort : carAmort;
   const activeLoanKey = loanSub === "housing" ? "housingLoan" : "carLoan";
-
   const forecast = useMemo(() => {
     if (!records || records.length === 0) return [];
     const last3 = records.slice(-3);
@@ -617,679 +1719,1978 @@ function App() {
     for (let i = 0; i < 12; i++) {
       const monthName = MONTH_ORDER[startIdx + i] || `Month +${i + 1}`;
       const calendarMonth = new Date(`${monthName.split(" ")[0]} 1, 2026`).getMonth() + 1;
-      let recurExpense = 0, recurIncome = 0;
-      recurring.forEach((item) => {
+      let recurExpense = 0,
+        recurIncome = 0;
+      recurring.forEach(item => {
         const amt = Number(item.amount) || 0;
-        const isDue = item.frequency === "Monthly" ? true
-          : item.frequency === "Quarterly" ? (calendarMonth - item.dueMonth) % 3 === 0
-          : item.frequency === "Semi-Annual" ? (calendarMonth - item.dueMonth) % 6 === 0
-          : calendarMonth === Number(item.dueMonth);
+        const isDue = item.frequency === "Monthly" ? true : item.frequency === "Quarterly" ? (calendarMonth - item.dueMonth) % 3 === 0 : item.frequency === "Semi-Annual" ? (calendarMonth - item.dueMonth) % 6 === 0 : calendarMonth === Number(item.dueMonth);
         if (!isDue) return;
-        if (item.direction === "expense") recurExpense += amt; else recurIncome += amt;
+        if (item.direction === "expense") recurExpense += amt;else recurIncome += amt;
       });
-      policies.forEach((p) => {
+      policies.forEach(p => {
         const premium = Number(p.annualPremium) || 0;
         if (!premium) return;
         const anchorMonth = p.nextPaymentDate ? new Date(p.nextPaymentDate).getMonth() + 1 : 1;
         const freq = p.paymentFrequency || "Annual";
         const perPayment = freq === "Monthly" ? premium / 12 : freq === "Quarterly" ? premium / 4 : freq === "Semi-Annual" ? premium / 2 : premium;
-        const isDue = freq === "Monthly" ? true
-          : freq === "Quarterly" ? (calendarMonth - anchorMonth) % 3 === 0
-          : freq === "Semi-Annual" ? (calendarMonth - anchorMonth) % 6 === 0
-          : calendarMonth === anchorMonth;
+        const isDue = freq === "Monthly" ? true : freq === "Quarterly" ? (calendarMonth - anchorMonth) % 3 === 0 : freq === "Semi-Annual" ? (calendarMonth - anchorMonth) % 6 === 0 : calendarMonth === anchorMonth;
         if (isDue) recurExpense += perPayment;
       });
       const income = avgIncome + recurIncome;
       const expenses = avgExpense + recurExpense;
       const net = income - expenses;
       cumNetWorth += net;
-      rows.push({ month: monthName, monthShort: monthName.split(" ")[0], income: Math.round(income), expenses: Math.round(expenses), net: Math.round(net), netWorth: Math.round(cumNetWorth) });
+      rows.push({
+        month: monthName,
+        monthShort: monthName.split(" ")[0],
+        income: Math.round(income),
+        expenses: Math.round(expenses),
+        net: Math.round(net),
+        netWorth: Math.round(cumNetWorth)
+      });
     }
     return rows;
   }, [records, assumptions, recurring, policies, derivedByMonth]);
-
-  if (loading || !records) return <div style={{ fontFamily: "IBM Plex Sans, sans-serif", color: "#3D4552", padding: 40 }}>Loading ledger…</div>;
-
+  if (loading || !records) return /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "IBM Plex Sans, sans-serif",
+      color: "#3D4552",
+      padding: 40
+    }
+  }, "Loading ledger\u2026");
   const current = derivedByMonth[selectedMonth];
-  const currentRecord = records.find((r) => r.month === selectedMonth);
-  const ytdRecords = records.slice(0, records.findIndex((r) => r.month === selectedMonth) + 1);
-
+  const currentRecord = records.find(r => r.month === selectedMonth);
+  const ytdRecords = records.slice(0, records.findIndex(r => r.month === selectedMonth) + 1);
   const expenseRows = (() => {
-    const source = expenseView === "ytd" ? ytdRecords : (currentRecord ? [currentRecord] : []);
-    return EXPENSE_CATS.map((c) => ({ ...c, value: source.reduce((a, r) => a + catVal(r, c), 0) })).filter((c) => c.value > 0).sort((a, b) => b.value - a.value);
+    const source = expenseView === "ytd" ? ytdRecords : currentRecord ? [currentRecord] : [];
+    return EXPENSE_CATS.map(c => ({
+      ...c,
+      value: source.reduce((a, r) => a + catVal(r, c), 0)
+    })).filter(c => c.value > 0).sort((a, b) => b.value - a.value);
   })();
   const expenseTotal = expenseRows.reduce((a, c) => a + c.value, 0);
-
   const avgMonthlyExpenses = records.length ? records.reduce((a, r) => a + computeDerived(r, assumptions).totalExpenses, 0) / records.length : 0;
-
-  return (
-    <div style={{
-      "--serif": "'Spectral', Georgia, serif", "--sans": "'IBM Plex Sans', sans-serif", "--mono": "'IBM Plex Mono', monospace",
-      "--ink-1": "#1B2430", "--ink-2": "#3D4552", "--ink-3": "#767C86",
-      "--accent": "#0F5D52", "--accent-2": "#35577A", "--warn": "#A6402B", "--amber": "#B8860B",
-      "--paper": "#F1F1EC", "--hair": "#DEDFD6", "--hair-strong": "#C7C9BD",
-      background: "var(--paper)", padding: "28px 24px 48px", borderRadius: 12, maxWidth: 1000, margin: "0 auto",
-    }}>
-      <style>{`
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      "--serif": "'Spectral', Georgia, serif",
+      "--sans": "'IBM Plex Sans', sans-serif",
+      "--mono": "'IBM Plex Mono', monospace",
+      "--ink-1": "#1B2430",
+      "--ink-2": "#3D4552",
+      "--ink-3": "#767C86",
+      "--accent": "#0F5D52",
+      "--accent-2": "#35577A",
+      "--warn": "#A6402B",
+      "--amber": "#B8860B",
+      "--paper": "#F1F1EC",
+      "--hair": "#DEDFD6",
+      "--hair-strong": "#C7C9BD",
+      background: "var(--paper)",
+      padding: "28px 24px 48px",
+      borderRadius: 12,
+      maxWidth: 1000,
+      margin: "0 auto"
+    }
+  }, /*#__PURE__*/React.createElement("style", null, `
         @import url('https://fonts.googleapis.com/css2?family=Spectral:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
         .tab-btn { font-family: var(--sans); font-size: 12.5px; font-weight: 500; padding: 7px 12px; border-radius: 7px; border: 1px solid transparent; cursor: pointer; background: none; color: var(--ink-2); white-space: nowrap; }
         .tab-btn.active { background: #fff; border-color: var(--hair-strong); color: var(--ink-1); }
         .btn-primary { font-family: var(--sans); font-size: 13px; font-weight: 600; padding: 9px 16px; border-radius: 7px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
         .btn-secondary { font-family: var(--sans); font-size: 13px; font-weight: 500; padding: 9px 16px; border-radius: 7px; border: 1px solid var(--hair-strong); background: #fff; color: var(--ink-2); cursor: pointer; }
         select, input[type=date] { font-family: var(--sans); font-size: 13px; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--hair-strong); background: #fff; color: var(--ink-1); }
-      `}</style>
-
-      {syncError && (
-        <div style={{ marginBottom: 16, fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--warn)", background: "#FBEAF0", border: "1px solid #F0997B", borderRadius: 8, padding: "10px 14px" }}>
-          {syncError}
-        </div>
-      )}
-
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 16 }}>
-        <div>
-          <div style={{ fontFamily: "var(--sans)", fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--accent)", fontWeight: 600 }}>Household ledger · ET &amp; SY</div>
-          <div style={{ fontFamily: "var(--serif)", fontSize: 34, color: "var(--ink-1)", marginTop: 4 }}>{current && current.hasBalances ? fmt(current.netWorth) : DASH}</div>
-          <div style={{ fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)" }}>Net worth · {selectedMonth}</div>
-        </div>
-        {current && current.hasBalances && (
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
-            <Stamp pct={current.bufferProgress} />
-            <button className="btn-secondary" style={{ padding: "4px 10px", fontSize: 11.5 }} onClick={() => setShowBufferDetail((s) => !s)}>{showBufferDetail ? "Hide" : "How is this calculated?"}</button>
-          </div>
-        )}
-      </div>
-
-      <div style={{ display: "flex", gap: 4, marginTop: 24, borderBottom: "1px solid var(--hair)", paddingBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
-        {[["dashboard","Dashboard"],["add","Add month"],["budgets","Budgets"],["contracts","Contracts"],["insurance","Insurance"],["recurring","Recurring"],["loans","Loans"],["cpf","CPF"],["tax","Tax"],["forecast","Forecast"],["history","History"]].map(([id, label]) => (
-          <button key={id} className={`tab-btn ${tab === id ? "active" : ""}`} onClick={() => { if (id === "add" && !draft) startDraft(); else setTab(id); }}>{label}</button>
-        ))}
-        <div style={{ flex: 1 }} />
-        {tab === "dashboard" && (
-          <select value={selectedMonth} onChange={(e) => setSelectedMonth(e.target.value)}>
-            {records.map((r) => <option key={r.month} value={r.month}>{r.month}</option>)}
-          </select>
-        )}
-        {saveMsg && <span style={{ fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--accent)" }}>{saveMsg}</span>}
-      </div>
-
-      {/* ── DASHBOARD ── */}
-      {tab === "dashboard" && current && (
-        <>
-          {showBufferDetail && current.hasBalances && (
-            <Card style={{ marginTop: 18 }}>
-              <div style={{ fontFamily: "var(--serif)", fontSize: 17, color: "var(--ink-1)", marginBottom: 4 }}>Emergency buffer</div>
-              <div style={{ fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 12 }}>
-                Progress = (liquid cash − credit card balance) ÷ target. Credit card is subtracted because that money is already committed.
-              </div>
-              <div style={{ borderTop: "1px solid var(--hair-strong)" }}>
-                <Row label="Total liquid cash" value={fmt(current.totalLiquidCash, 2)} />
-                <Row label="Less: credit card balance" value={"−" + fmt(currentRecord.balances.property.creditCard, 2).replace("$", "$")} color="var(--warn)" />
-                <Row label="Cash available for buffer" value={fmt(current.currentLiquidCashNetCC, 2)} strong />
-                <Row label="Target" value={fmt(assumptions.emergencyBufferTarget, 2)} />
-                <Row label="Gap to target" value={fmt(current.bufferGap, 2)} color={current.bufferGap > 0 ? "var(--warn)" : "var(--accent)"} />
-                <Row label="Progress" value={fmtPct(current.bufferProgress, 2)} strong color="var(--accent)" />
-              </div>
-              <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid var(--hair)" }}>
-                <div style={{ fontFamily: "var(--sans)", fontSize: 12.5, fontWeight: 600, color: "var(--ink-2)", marginBottom: 8 }}>Change the target</div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 10, alignItems: "end" }}>
-                  <NumberField label="Target ($)" value={assumptions.emergencyBufferTarget} onChange={(v) => persistAll({ assumptions: { ...assumptions, emergencyBufferTarget: v } })} />
-                  <NumberField label="Months of cover" value={assumptions.bufferMonths} onChange={(v) => persistAll({ assumptions: { ...assumptions, bufferMonths: v } })} />
-                  <button className="btn-secondary" onClick={() => persistAll({ assumptions: { ...assumptions, emergencyBufferTarget: Math.round(avgMonthlyExpenses * assumptions.bufferMonths) } })}>
-                    Recalculate from actuals
-                  </button>
-                </div>
-                <div style={{ fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)", marginTop: 8 }}>
-                  Your current target of {fmt(assumptions.emergencyBufferTarget)} came from your Targets sheet ({assumptions.bufferMonths} months of expenses). Average monthly expenses across the {records.length} months tracked so far are {fmt(avgMonthlyExpenses)}, which at {assumptions.bufferMonths} months implies {fmt(avgMonthlyExpenses * assumptions.bufferMonths)}. That average is inflated by the April and May confinement spending, so recalculating now would overshoot — worth revisiting once you have a few clean months.
-                </div>
-              </div>
-            </Card>
-          )}
-
-          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 20 }}>
-            <KpiCard label="Liquid cash" value={current.hasBalances ? fmt(current.totalLiquidCash) : DASH} />
-            <KpiCard label="Investments" value={current.hasBalances ? fmt(current.totalInvestments) : DASH} />
-            <KpiCard label="CPF combined" value={current.hasBalances ? fmt(current.combinedCpf) : DASH} />
-            <KpiCard label="Property equity" value={current.hasBalances ? fmt(current.propertyEquity) : DASH} />
-            <KpiCard label="Net cashflow (month)" value={fmt(current.netCashflow)} sub={`Income ${fmt(current.totalIncome)} less expenses ${fmt(current.totalExpenses)}`} />
-          </div>
-
-          {!current.hasBalances && (
-            <div style={{ marginTop: 16, fontFamily: "var(--sans)", fontSize: 13, color: "var(--warn)", background: "#FBEAF0", border: "1px solid #F0997B", borderRadius: 8, padding: "10px 14px" }}>
-              Balance sheet wasn&rsquo;t tracked for {selectedMonth} — showing income and expenses only.
-            </div>
-          )}
-
-          <Section title="Expense breakdown" eyebrow={expenseView === "ytd" ? `Year to date · Jan–${selectedMonth.split(" ")[0]}` : selectedMonth} right={
-            <div style={{ display: "flex", gap: 4 }}>
-              <button className={`tab-btn ${expenseView === "month" ? "active" : ""}`} onClick={() => setExpenseView("month")}>This month</button>
-              <button className={`tab-btn ${expenseView === "ytd" ? "active" : ""}`} onClick={() => setExpenseView("ytd")}>Year to date</button>
-            </div>
-          }>
-            {expenseRows.length === 0 ? (
-              <div style={{ fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-3)" }}>No expenses logged yet.</div>
-            ) : (
-              <>
-                <div style={{ background: "#fff", border: "1px solid var(--hair)", borderRadius: 10, overflow: "hidden" }}>
-                  {expenseRows.map((c, i) => {
-                    const pct = c.value / expenseTotal;
-                    return (
-                      <div key={c.key} style={{ padding: "10px 16px", borderTop: i === 0 ? "none" : "1px solid var(--hair)" }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                            <span style={{ width: 9, height: 9, borderRadius: "50%", background: c.color, display: "inline-block" }} />
-                            <span style={{ fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-1)" }}>{c.label}</span>
-                          </div>
-                          <div style={{ display: "flex", gap: 12, alignItems: "baseline" }}>
-                            {expenseView === "ytd" && <span style={{ fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)" }}>{fmt(c.value / ytdRecords.length)}/mo avg</span>}
-                            <span style={{ fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)" }}>{fmtPct(pct)}</span>
-                            <span style={{ fontFamily: "var(--mono)", fontSize: 13, fontWeight: 600, color: "var(--ink-1)" }}>{fmt(c.value)}</span>
-                          </div>
-                        </div>
-                        <Bar pct={pct} color={c.color} />
-                      </div>
-                    );
-                  })}
-                </div>
-                <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)" }}>
-                  <span>Total {expenseView === "ytd" ? `across ${ytdRecords.length} months` : "this month"}</span>
-                  <span style={{ fontFamily: "var(--mono)", fontWeight: 600, color: "var(--ink-1)" }}>{fmt(expenseTotal)}</span>
-                </div>
-              </>
-            )}
-          </Section>
-
-          <Section title="Income vs. expenses" eyebrow="Monthly trend">
-            <ResponsiveContainer width="100%" height={220}>
-              <AreaChart data={trendData} margin={{ left: -10, right: 10 }}>
-                <CartesianGrid stroke="var(--hair)" vertical={false} />
-                <XAxis dataKey="month" tick={{ fontFamily: "IBM Plex Sans", fontSize: 11, fill: "#767C86" }} axisLine={{ stroke: "var(--hair-strong)" }} tickLine={false} />
-                <YAxis tick={{ fontFamily: "IBM Plex Mono", fontSize: 10, fill: "#767C86" }} axisLine={false} tickLine={false} width={60} tickFormatter={(v) => `$${(v / 1000).toFixed(0)}k`} />
-                <Tooltip formatter={(v) => fmt(v)} contentStyle={{ fontFamily: "IBM Plex Sans", fontSize: 12, borderRadius: 8, border: "1px solid #DEDFD6" }} />
-                <Area type="monotone" dataKey="income" stroke="#0F5D52" fill="#0F5D52" fillOpacity={0.12} strokeWidth={2} name="Income" />
-                <Area type="monotone" dataKey="expenses" stroke="#A6402B" fill="#A6402B" fillOpacity={0.1} strokeWidth={2} name="Expenses" />
-              </AreaChart>
-            </ResponsiveContainer>
-          </Section>
-
-          <Section title="Net worth" eyebrow="Since Apr 2026 (first tracked balance sheet)">
-            <ResponsiveContainer width="100%" height={200}>
-              <LineChart data={trendData.filter((d) => d.netWorth !== null)} margin={{ left: -10, right: 10 }}>
-                <CartesianGrid stroke="var(--hair)" vertical={false} />
-                <XAxis dataKey="month" tick={{ fontFamily: "IBM Plex Sans", fontSize: 11, fill: "#767C86" }} axisLine={{ stroke: "var(--hair-strong)" }} tickLine={false} />
-                <YAxis tick={{ fontFamily: "IBM Plex Mono", fontSize: 10, fill: "#767C86" }} axisLine={false} tickLine={false} width={65} tickFormatter={(v) => `$${(v / 1000).toFixed(0)}k`} domain={["dataMin - 5000", "dataMax + 5000"]} />
-                <Tooltip formatter={(v) => fmt(v)} contentStyle={{ fontFamily: "IBM Plex Sans", fontSize: 12, borderRadius: 8, border: "1px solid #DEDFD6" }} />
-                <Line type="monotone" dataKey="netWorth" stroke="#35577A" strokeWidth={2.5} dot={{ r: 3 }} name="Net worth" />
-              </LineChart>
-            </ResponsiveContainer>
-          </Section>
-
-          {current.hasBalances && (
-            <Section title="Financial health ratios" eyebrow={selectedMonth}>
-              <div style={{ background: "#fff", border: "1px solid var(--hair)", borderRadius: 10, overflow: "hidden" }}>
-                {RATIO_META.map((m, i) => (
-                  <div key={m.key} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 16px", borderTop: i === 0 ? "none" : "1px solid var(--hair)", gap: 12 }}>
-                    <div>
-                      <div style={{ fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-1)" }}>{m.label}</div>
-                      <div style={{ fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)", marginTop: 2 }}>{m.what}</div>
-                      <div style={{ fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", marginTop: 1 }}>{m.bench}</div>
-                    </div>
-                    <div style={{ fontFamily: "var(--mono)", fontSize: 14, fontWeight: 600, color: "var(--ink-1)", whiteSpace: "nowrap" }}>{m.fmt(current.ratios[m.key])}</div>
-                  </div>
-                ))}
-              </div>
-            </Section>
-          )}
-        </>
-      )}
-
-      {/* ── ADD MONTH ── */}
-      {tab === "add" && draft && (
-        <div style={{ marginTop: 20 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-            <div style={{ fontFamily: "var(--serif)", fontSize: 20, color: "var(--ink-1)" }}>New entry — {draft.month}</div>
-            <button className="btn-secondary" onClick={() => setShowAssumptions((s) => !s)}>{showAssumptions ? "Hide" : "Edit"} assumptions</button>
-          </div>
-          {showAssumptions && (
-            <Card style={{ marginBottom: 20 }}>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 10 }}>
-                <NumberField label="Emergency buffer target" value={assumptions.emergencyBufferTarget} onChange={(v) => persistAll({ assumptions: { ...assumptions, emergencyBufferTarget: v } })} />
-                <NumberField label="Monthly gross income (OW)" value={assumptions.monthlyGrossIncome} onChange={(v) => persistAll({ assumptions: { ...assumptions, monthlyGrossIncome: v } })} />
-                <NumberField label="Car loan repayment / mth" value={assumptions.carLoanRepayment} onChange={(v) => persistAll({ assumptions: { ...assumptions, carLoanRepayment: v } })} />
-                <NumberField label="Annual insurance premiums" value={assumptions.annualInsurancePremiums} onChange={(v) => persistAll({ assumptions: { ...assumptions, annualInsurancePremiums: v } })} />
-                <NumberField label="Annual ins. excl. endowments" value={assumptions.annualInsurancePremiumsExclEndowments} onChange={(v) => persistAll({ assumptions: { ...assumptions, annualInsurancePremiumsExclEndowments: v } })} />
-                <NumberField label="ET legacy / life cover" value={assumptions.etLegacyCover} onChange={(v) => persistAll({ assumptions: { ...assumptions, etLegacyCover: v } })} />
-              </div>
-            </Card>
-          )}
-          <Card>
-            <div style={{ fontFamily: "var(--sans)", fontWeight: 600, fontSize: 14, color: "var(--ink-1)", marginBottom: 10 }}>Balances</div>
-            <FieldGrid title="Liquid cash" obj={draft.balances.liquidCash} onChange={(k, v) => updateDraftField("balances", "liquidCash", k, v)} />
-            <FieldGrid title="Investments" obj={draft.balances.investments} onChange={(k, v) => updateDraftField("balances", "investments", k, v)} />
-            <FieldGrid title="CPF — ET" obj={draft.balances.cpfEt} onChange={(k, v) => updateDraftField("balances", "cpfEt", k, v)} />
-            <FieldGrid title="CPF — SY" obj={draft.balances.cpfSy} onChange={(k, v) => updateDraftField("balances", "cpfSy", k, v)} />
-            <FieldGrid title="Property and loans" obj={draft.balances.property} onChange={(k, v) => updateDraftField("balances", "property", k, v)} />
-          </Card>
-          <Card style={{ marginTop: 14 }}>
-            <div style={{ fontFamily: "var(--sans)", fontWeight: 600, fontSize: 14, color: "var(--ink-1)", marginBottom: 10 }}>Income and expenses</div>
-            <FieldGrid title="Income" obj={draft.income} onChange={(k, v) => updateDraftField("income", null, k, v)} />
-            <FieldGrid title="Fixed expenses (non-financial)" obj={draft.expenses.fixedNonFinancial} onChange={(k, v) => updateDraftField("expenses", "fixedNonFinancial", k, v)} />
-            <FieldGrid title="Fixed expenses (financial)" obj={draft.expenses.fixedFinancial} onChange={(k, v) => updateDraftField("expenses", "fixedFinancial", k, v)} />
-            <FieldGrid title="Variable expenses" obj={draft.expenses.variable} onChange={(k, v) => updateDraftField("expenses", "variable", k, v)} />
-          </Card>
-          {(() => {
-            const preview = computeDerived(draft, assumptions);
-            return (
-              <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 14 }}>
-                <KpiCard label="Total income" value={fmt(preview.totalIncome)} />
-                <KpiCard label="Total expenses" value={fmt(preview.totalExpenses)} />
-                <KpiCard label="Net cashflow" value={fmt(preview.netCashflow)} />
-                <KpiCard label="Net worth" value={fmt(preview.netWorth)} />
-                <KpiCard label="Emergency buffer" value={fmtPct(preview.bufferProgress)} sub={`Gap ${fmt(preview.bufferGap)}`} />
-              </div>
-            );
-          })()}
-          <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
-            <button className="btn-primary" onClick={saveDraft}>Save {draft.month}</button>
-            <button className="btn-secondary" onClick={() => { setDraft(null); setTab("dashboard"); }}>Cancel</button>
-          </div>
-        </div>
-      )}
-
-      {/* ── BUDGETS ── */}
-      {tab === "budgets" && (
-        <Section title="Budgets and goals" eyebrow={selectedMonth}>
-          <div style={{ fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 14 }}>
-            Set a monthly budget per category. Bars turn amber near the limit and red once you&rsquo;re over, based on {selectedMonth} actuals.
-          </div>
-          <div style={{ background: "#fff", border: "1px solid var(--hair)", borderRadius: 10, overflow: "hidden" }}>
-            {EXPENSE_CATS.map((c, i) => {
-              const actual = currentRecord ? catVal(currentRecord, c) : 0;
-              const budget = Number(budgets[c.key]) || 0;
-              const pct = budget > 0 ? actual / budget : 0;
-              const barColor = pct >= 1 ? "var(--warn)" : pct >= 0.8 ? "var(--amber)" : "var(--accent)";
-              return (
-                <div key={c.key} style={{ padding: "12px 16px", borderTop: i === 0 ? "none" : "1px solid var(--hair)" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, gap: 10, flexWrap: "wrap" }}>
-                    <div style={{ fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-1)" }}>{c.label}</div>
-                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                      <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, color: "var(--ink-2)" }}>{fmt(actual)} /</span>
-                      <input type="number" value={budgets[c.key] ?? ""} placeholder="set budget" onChange={(e) => updateBudget(c.key, e.target.value === "" ? 0 : parseFloat(e.target.value))}
-                        style={{ width: 90, fontFamily: "var(--mono)", fontSize: 12.5, padding: "4px 7px", borderRadius: 6, border: "1px solid var(--hair-strong)" }} />
-                    </div>
-                  </div>
-                  {budget > 0 && <Bar pct={pct} color={barColor} />}
-                </div>
-              );
-            })}
-          </div>
-        </Section>
-      )}
-
-      {/* ── CONTRACTS ── */}
-      {tab === "contracts" && (
-        <Section title="Utility and contract renewals" eyebrow="Contracts" right={<button className="btn-primary" onClick={addContract}>Add contract</button>}>
-          {contracts.length === 0 && <div style={{ fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-3)" }}>No contracts yet. Add telco, broadband, or insurance renewal dates to get flagged before they lapse.</div>}
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {[...contracts].sort((a, b) => daysUntil(a.renewalDate) - daysUntil(b.renewalDate)).map((c) => {
-              const days = daysUntil(c.renewalDate);
-              const flag = days <= 30 ? "var(--warn)" : days <= 60 ? "var(--amber)" : "var(--accent)";
-              return (
-                <Card key={c.id}>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 10, marginBottom: 10 }}>
-                    <TextField label="Name" value={c.name} onChange={(v) => updateContract(c.id, { name: v })} />
-                    <TextField label="Provider" value={c.provider} onChange={(v) => updateContract(c.id, { provider: v })} />
-                    <SelectField label="Category" value={c.category} onChange={(v) => updateContract(c.id, { category: v })} options={CONTRACT_CATEGORIES} />
-                    <NumberField label="Monthly amount" value={c.monthlyAmount} onChange={(v) => updateContract(c.id, { monthlyAmount: v })} />
-                    <DateField label="Renewal date" value={c.renewalDate} onChange={(v) => updateContract(c.id, { renewalDate: v })} />
-                    <TextField label="Notes" value={c.notes} onChange={(v) => updateContract(c.id, { notes: v })} />
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <span style={{ fontFamily: "var(--sans)", fontSize: 12.5, fontWeight: 600, color: flag }}>{days < 0 ? `Renewed ${Math.abs(days)} days ago` : `${days} days to renewal`}</span>
-                    <IconBtn onClick={() => removeContract(c.id)}>Remove</IconBtn>
-                  </div>
-                </Card>
-              );
-            })}
-          </div>
-        </Section>
-      )}
-
-      {/* ── INSURANCE ── */}
-      {tab === "insurance" && (
-        <Section title="Family coverage" eyebrow="Insurance" right={<button className="btn-primary" onClick={addPolicy}>Add policy</button>}>
-          <Card style={{ marginBottom: 16 }}>
-            <div style={{ fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13, color: "var(--ink-1)", marginBottom: 8 }}>Family members</div>
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-              {familyMembers.map((f) => (
-                <span key={f} style={{ display: "flex", alignItems: "center", gap: 6, background: "var(--paper)", border: "1px solid var(--hair-strong)", borderRadius: 20, padding: "4px 10px 4px 12px", fontFamily: "var(--sans)", fontSize: 12.5 }}>
-                  {f}{f !== "ET" && f !== "SY" && <button onClick={() => removeFamilyMember(f)} style={{ border: "none", background: "none", cursor: "pointer", color: "var(--ink-3)", fontSize: 13, padding: 0 }}>×</button>}
-                </span>
-              ))}
-              <button className="btn-secondary" style={{ padding: "5px 10px", fontSize: 12 }} onClick={addFamilyMember}>Add member</button>
-            </div>
-          </Card>
-          <div style={{ overflowX: "auto", marginBottom: 20 }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "var(--mono)", fontSize: 12.5, background: "#fff", border: "1px solid var(--hair)", borderRadius: 10 }}>
-              <thead>
-                <tr>
-                  <th style={{ textAlign: "left", padding: "9px 14px", fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", textTransform: "uppercase", borderBottom: "1px solid var(--hair-strong)" }}>Type</th>
-                  {familyMembers.map((p) => <th key={p} style={{ textAlign: "right", padding: "9px 14px", fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", borderBottom: "1px solid var(--hair-strong)" }}>{p}</th>)}
-                  <th style={{ textAlign: "right", padding: "9px 14px", fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", borderBottom: "1px solid var(--hair-strong)" }}>Total</th>
-                </tr>
-              </thead>
-              <tbody>
-                {INSURANCE_TYPES.map((type) => {
-                  const rowTotal = policies.filter((p) => p.type === type).reduce((a, p) => a + (Number(p.coverage) || 0), 0);
-                  return (
-                    <tr key={type}>
-                      <td style={{ padding: "8px 14px", fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", borderBottom: "1px solid var(--hair)" }}>{type}</td>
-                      {familyMembers.map((p) => {
-                        const v = policies.filter((pl) => pl.type === type && pl.person === p).reduce((a, pl) => a + (Number(pl.coverage) || 0), 0);
-                        return <td key={p} style={{ padding: "8px 14px", textAlign: "right", borderBottom: "1px solid var(--hair)", color: "var(--ink-1)" }}>{v ? fmt(v) : DASH}</td>;
-                      })}
-                      <td style={{ padding: "8px 14px", textAlign: "right", borderBottom: "1px solid var(--hair)", color: "var(--ink-1)", fontWeight: 600 }}>{rowTotal ? fmt(rowTotal) : DASH}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-          <div style={{ fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 10 }}>
-            Each policy premium feeds the Forecast tab automatically, spread by its payment frequency. No need to duplicate it in Recurring.
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {policies.map((p) => (
-              <Card key={p.id}>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 10, marginBottom: 10 }}>
-                  <SelectField label="Person" value={p.person} onChange={(v) => updatePolicy(p.id, { person: v })} options={familyMembers} />
-                  <SelectField label="Type" value={p.type} onChange={(v) => updatePolicy(p.id, { type: v })} options={INSURANCE_TYPES} />
-                  <TextField label="Insurer" value={p.insurer} onChange={(v) => updatePolicy(p.id, { insurer: v })} />
-                  <TextField label="Product" value={p.product} onChange={(v) => updatePolicy(p.id, { product: v })} />
-                  <NumberField label="Coverage / sum assured" value={p.coverage} onChange={(v) => updatePolicy(p.id, { coverage: v })} />
-                  <NumberField label="Annual premium" value={p.annualPremium} onChange={(v) => updatePolicy(p.id, { annualPremium: v })} />
-                  <SelectField label="Payment frequency" value={p.paymentFrequency} onChange={(v) => updatePolicy(p.id, { paymentFrequency: v })} options={FREQUENCIES} />
-                  <DateField label="Next payment date" value={p.nextPaymentDate} onChange={(v) => updatePolicy(p.id, { nextPaymentDate: v })} />
-                  <SelectField label="Payment method" value={p.paymentMethod} onChange={(v) => updatePolicy(p.id, { paymentMethod: v })} options={PAYMENT_METHODS} />
-                  <TextField label="Paid from (account or card)" value={p.paymentAccount} onChange={(v) => updatePolicy(p.id, { paymentAccount: v })} />
-                </div>
-                <div style={{ textAlign: "right" }}><IconBtn onClick={() => removePolicy(p.id)}>Remove</IconBtn></div>
-              </Card>
-            ))}
-          </div>
-        </Section>
-      )}
-
-      {/* ── RECURRING ── */}
-      {tab === "recurring" && (
-        <Section title="Recurring payments" eyebrow="Planning register" right={<button className="btn-primary" onClick={addRecurring}>Add recurring item</button>}>
-          <div style={{ fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 14 }}>
-            Use this for lumpy or annual items that don&rsquo;t average out well in the trailing 3-month forecast baseline, like school fees or road tax. Insurance premiums are handled automatically from the Insurance tab.
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {recurring.map((r) => (
-              <Card key={r.id}>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 10, marginBottom: 10 }}>
-                  <TextField label="Name" value={r.name} onChange={(v) => updateRecurring(r.id, { name: v })} />
-                  <SelectField label="Direction" value={r.direction} onChange={(v) => updateRecurring(r.id, { direction: v })} options={["expense", "income"]} />
-                  <NumberField label="Amount" value={r.amount} onChange={(v) => updateRecurring(r.id, { amount: v })} />
-                  <SelectField label="Frequency" value={r.frequency} onChange={(v) => updateRecurring(r.id, { frequency: v })} options={FREQUENCIES} />
-                  <NumberField label="Due month (1 to 12)" value={r.dueMonth} onChange={(v) => updateRecurring(r.id, { dueMonth: v })} />
-                  <TextField label="Notes" value={r.notes} onChange={(v) => updateRecurring(r.id, { notes: v })} />
-                </div>
-                <div style={{ textAlign: "right" }}><IconBtn onClick={() => removeRecurring(r.id)}>Remove</IconBtn></div>
-              </Card>
-            ))}
-            {recurring.length === 0 && <div style={{ fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-3)" }}>No recurring items yet.</div>}
-          </div>
-        </Section>
-      )}
-
-      {/* ── LOANS ── */}
-      {tab === "loans" && (
-        <Section title="Loan amortisation" eyebrow="Housing and car" right={
-          <div style={{ display: "flex", gap: 6 }}>
-            <button className={`tab-btn ${loanSub === "housing" ? "active" : ""}`} onClick={() => setLoanSub("housing")}>Housing</button>
-            <button className={`tab-btn ${loanSub === "car" ? "active" : ""}`} onClick={() => setLoanSub("car")}>Car</button>
-          </div>
-        }>
-          <Card style={{ marginBottom: 16 }}>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: 10 }}>
-              <NumberField label="Principal ($)" value={activeLoan.principal} onChange={(v) => persistAll({ [activeLoanKey]: { ...activeLoan, principal: v } })} />
-              <NumberField label="Interest rate (% p.a.)" value={activeLoan.ratePct} onChange={(v) => persistAll({ [activeLoanKey]: { ...activeLoan, ratePct: v } })} />
-              <NumberField label="Tenure (years)" value={activeLoan.tenureYears} onChange={(v) => persistAll({ [activeLoanKey]: { ...activeLoan, tenureYears: v } })} />
-              <TextField label="Start month" value={activeLoan.startMonth} onChange={(v) => persistAll({ [activeLoanKey]: { ...activeLoan, startMonth: v } })} />
-            </div>
-          </Card>
-          <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-            <KpiCard label="Monthly payment" value={fmt(activeAmort.payment, 2)} />
-            <KpiCard label="Total interest" value={fmt(activeAmort.totalInterest)} />
-            <KpiCard label="Total repayment" value={fmt(activeAmort.totalRepayment)} />
-            <KpiCard label="Number of payments" value={activeAmort.n} />
-          </div>
-          <div style={{ marginTop: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <div style={{ fontFamily: "var(--sans)", fontSize: 13, fontWeight: 600, color: "var(--ink-1)" }}>Yearly schedule</div>
-            <button className="btn-secondary" onClick={() => setShowMonthlySchedule((s) => !s)}>{showMonthlySchedule ? "Collapse" : "Scrollable view"}</button>
-          </div>
-          <div style={{ overflowX: "auto", marginTop: 10, maxHeight: showMonthlySchedule ? 420 : "none", overflowY: showMonthlySchedule ? "auto" : "visible" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "var(--mono)", fontSize: 12.5, background: "#fff", border: "1px solid var(--hair)", borderRadius: 10 }}>
-              <thead>
-                <tr>
-                  {["Year", "Principal paid", "Interest paid", "Remaining balance"].map((h) => (
-                    <th key={h} style={{ textAlign: h === "Year" ? "left" : "right", padding: "8px 12px", fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", textTransform: "uppercase", borderBottom: "1px solid var(--hair-strong)" }}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {activeAmort.yearly.map((y, i) => (
-                  <tr key={i}>
-                    <td style={{ padding: "7px 12px", fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", borderBottom: "1px solid var(--hair)" }}>Year {i + 1}</td>
-                    <td style={{ padding: "7px 12px", textAlign: "right", borderBottom: "1px solid var(--hair)" }}>{fmt(y.principal)}</td>
-                    <td style={{ padding: "7px 12px", textAlign: "right", borderBottom: "1px solid var(--hair)" }}>{fmt(y.interest)}</td>
-                    <td style={{ padding: "7px 12px", textAlign: "right", borderBottom: "1px solid var(--hair)", fontWeight: 600 }}>{fmt(y.balance)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Section>
-      )}
-
-      {/* ── CPF ── */}
-      {tab === "cpf" && (
-        <Section title="CPF contributions" eyebrow="CPF Board rates effective 1 Jan 2026">
-          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 20 }}>
-            <KpiCard label="To Ordinary Account" value={fmt(cpfFinal.oaAmt)} />
-            <KpiCard label={`To ${cpfResult.allocBand.saLabel}`} value={fmt(cpfFinal.saAmt)} />
-            <KpiCard label="To MediSave" value={fmt(cpfFinal.maAmt)} />
-            <KpiCard label="Total this month" value={fmt(cpfFinal.oaAmt + cpfFinal.saAmt + cpfFinal.maAmt)} sub={cpfSettings.manualOverride ? "Manual override active" : `Auto-calculated at ${fmtPct(cpfResult.contribBand.total, 0)} of wages`} />
-          </div>
-
-          <Card style={{ marginBottom: 14 }}>
-            <div style={{ fontFamily: "var(--serif)", fontSize: 17, color: "var(--ink-1)", marginBottom: 3 }}>ET</div>
-            <div style={{ fontFamily: "var(--sans)", fontSize: 12, color: "var(--ink-3)", marginBottom: 14 }}>Employed. Contributions split between employee and employer, then allocated across OA, {cpfResult.allocBand.saLabel} and MediSave by age band.</div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0,1fr))", gap: 12, marginBottom: 16 }}>
-              <NumberField label="Age" value={cpfSettings.etAge} onChange={(v) => persistAll({ cpfSettings: { ...cpfSettings, etAge: v } })} hint={`Age band: ${cpfResult.contribBand.maxAge === 55 ? "55 and below" : `up to ${cpfResult.contribBand.maxAge}`}`} />
-              <NumberField label="Monthly salary" value={cpfSettings.monthlyOW} onChange={(v) => persistAll({ cpfSettings: { ...cpfSettings, monthlyOW: v } })} hint={`CPF applies to first ${fmt(CPF_OW_CEILING)} only`} />
-              <NumberField label="Bonus paid this month" value={cpfSettings.bonusThisMonth} onChange={(v) => persistAll({ cpfSettings: { ...cpfSettings, bonusThisMonth: v } })} hint="Leave at 0 in non-bonus months" />
-              <NumberField label="Salary already CPF-charged this year" value={cpfSettings.annualOwToDate} onChange={(v) => persistAll({ cpfSettings: { ...cpfSettings, annualOwToDate: v } })} hint="January to last month. Sets how much bonus is still CPF-liable." />
-            </div>
-
-            <div style={{ borderTop: "1px solid var(--hair-strong)", paddingTop: 4 }}>
-              <Row label="Salary subject to CPF" value={fmt(cpfResult.owSubject)} />
-              <Row label="Employee share" value={fmt(cpfResult.owEmployee)} />
-              <Row label="Employer share" value={fmt(cpfResult.owEmployer)} />
-              {cpfSettings.bonusThisMonth > 0 && (
-                <>
-                  <Row label="Bonus ceiling remaining this year" value={fmt(cpfResult.awCeiling)} />
-                  <Row label="Bonus subject to CPF" value={fmt(cpfResult.awSubject)} />
-                  <Row label="Bonus CPF (employee + employer)" value={fmt(cpfResult.awTotal)} />
-                </>
-              )}
-              <Row label="Total contribution" value={fmt(cpfResult.totalContribution)} strong />
-            </div>
-
-            <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid var(--hair)" }}>
-              <CheckField label="Enter the OA / SA / MA split manually instead" checked={cpfSettings.manualOverride} onChange={(v) => persistAll({ cpfSettings: { ...cpfSettings, manualOverride: v } })} />
-              {cpfSettings.manualOverride && (
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 10, marginTop: 10 }}>
-                  <NumberField label="Ordinary Account" value={cpfSettings.manualOA} onChange={(v) => persistAll({ cpfSettings: { ...cpfSettings, manualOA: v } })} />
-                  <NumberField label={cpfResult.allocBand.saLabel === "SA" ? "Special Account" : "Retirement Account"} value={cpfSettings.manualSA} onChange={(v) => persistAll({ cpfSettings: { ...cpfSettings, manualSA: v } })} />
-                  <NumberField label="MediSave" value={cpfSettings.manualMA} onChange={(v) => persistAll({ cpfSettings: { ...cpfSettings, manualMA: v } })} />
-                </div>
-              )}
-            </div>
-
-            <div style={{ marginTop: 16 }}>
-              <button className="btn-primary" onClick={() => { setPendingCpfBump(cpfFinal); setSaveMsg(`Queued for ${nextMonthName}`); setTimeout(() => setSaveMsg(""), 4000); }}>
-                Apply to {nextMonthName} balances
-              </button>
-              <div style={{ fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)", marginTop: 6 }}>
-                Adds these amounts to ET&rsquo;s CPF balances when you next open Add month.
-              </div>
-            </div>
-          </Card>
-
-          <Card>
-            <div style={{ fontFamily: "var(--serif)", fontSize: 17, color: "var(--ink-1)", marginBottom: 3 }}>SY</div>
-            <div style={{ fontFamily: "var(--sans)", fontSize: 12, color: "var(--ink-3)", marginBottom: 14 }}>Self-employed. Only MediSave is compulsory, estimated here at 25% of net trade income per your existing convention.</div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0,1fr))", gap: 12 }}>
-              <NumberField label="Net trade income this period" value={cpfSettings.syIncome} onChange={(v) => persistAll({ cpfSettings: { ...cpfSettings, syIncome: v } })} />
-              <div style={{ display: "flex", alignItems: "flex-end" }}>
-                <div style={{ width: "100%" }}>
-                  <div style={{ fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", marginBottom: 4 }}>Estimated MediSave</div>
-                  <div style={{ fontFamily: "var(--mono)", fontSize: 20, fontWeight: 600, color: "var(--ink-1)" }}>{fmt(syMedisaveEstimate)}</div>
-                  <div style={{ fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", marginTop: 2 }}>Capped by the Basic Healthcare Sum, {fmt(75500)} in 2026.</div>
-                </div>
-              </div>
-            </div>
-          </Card>
-        </Section>
-      )}
-
-      {/* ── TAX ── */}
-      {tab === "tax" && (
-        <Section title="Income tax estimate" eyebrow="IRAS resident rates, YA2024 onwards">
-          <div style={{ fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 14 }}>
-            Covers CPF relief, NSman, qualifying child and earned income relief, plus an ad-hoc box for anything else such as donations, course fees, SRS or Parenthood Tax Rebate. Total reliefs are capped at {fmt(80000)} per IRAS rules. This is an estimate, not a filing.
-          </div>
-          <Card style={{ marginBottom: 16 }}>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 10, marginBottom: 10 }}>
-              <NumberField label="Annual employment income" value={taxSettings.annualEmploymentIncome} onChange={(v) => persistAll({ taxSettings: { ...taxSettings, annualEmploymentIncome: v } })} />
-              <NumberField label="Age" value={taxSettings.age} onChange={(v) => persistAll({ taxSettings: { ...taxSettings, age: v } })} hint="Sets earned income relief" />
-              <NumberField label="Qualifying children" value={taxSettings.numChildren} onChange={(v) => persistAll({ taxSettings: { ...taxSettings, numChildren: v } })} />
-              <NumberField label="Child relief per child" value={taxSettings.childReliefPerChild} onChange={(v) => persistAll({ taxSettings: { ...taxSettings, childReliefPerChild: v } })} />
-              <NumberField label="NSman relief" value={taxSettings.nsmanRelief} onChange={(v) => persistAll({ taxSettings: { ...taxSettings, nsmanRelief: v } })} />
-            </div>
-            <CheckField label="Include CPF relief, using the monthly salary from the CPF tab" checked={taxSettings.includeCpfRelief} onChange={(v) => persistAll({ taxSettings: { ...taxSettings, includeCpfRelief: v } })} />
-          </Card>
-          <Card style={{ marginBottom: 16 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-              <div style={{ fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13 }}>Ad-hoc reliefs and rebates</div>
-              <button className="btn-secondary" onClick={addTaxAdhoc} style={{ padding: "5px 10px", fontSize: 12 }}>Add item</button>
-            </div>
-            {taxSettings.adhoc.length === 0 && <div style={{ fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)" }}>For example an IPC donation at 250% deduction, course fees, SRS contribution, or Parenthood Tax Rebate.</div>}
-            {taxSettings.adhoc.map((a) => (
-              <div key={a.id} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr auto", gap: 10, alignItems: "end", marginBottom: 8 }}>
-                <TextField label="Name" value={a.name} onChange={(v) => updateTaxAdhoc(a.id, { name: v })} />
-                <SelectField label="Type" value={a.type} onChange={(v) => updateTaxAdhoc(a.id, { type: v })} options={["relief", "rebate"]} />
-                <NumberField label="Amount" value={a.amount} onChange={(v) => updateTaxAdhoc(a.id, { amount: v })} />
-                <IconBtn onClick={() => removeTaxAdhoc(a.id)}>Remove</IconBtn>
-              </div>
-            ))}
-          </Card>
-          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
-            <KpiCard label="Total reliefs" value={fmt(taxResult.totalReliefs)} sub={taxResult.totalReliefsUncapped > 80000 ? `Capped from ${fmt(taxResult.totalReliefsUncapped)}` : undefined} />
-            <KpiCard label="Chargeable income" value={fmt(taxResult.chargeableIncome)} />
-            <KpiCard label="Tax before rebates" value={fmt(taxResult.taxBeforeRebate, 2)} />
-            <KpiCard label="Net tax payable" value={fmt(taxResult.netTax, 2)} sub={`Effective rate ${fmtPct(taxResult.effectiveRate, 2)}`} />
-          </div>
-          <Card>
-            <div style={{ fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13, marginBottom: 4 }}>Relief breakdown</div>
-            <Row label="CPF relief" value={fmt(taxResult.cpfReliefAmt)} />
-            <Row label="Qualifying child relief" value={fmt(taxResult.childRelief)} />
-            <Row label="Earned income relief" value={fmt(taxResult.eir)} />
-            <Row label="NSman relief" value={fmt(taxSettings.nsmanRelief)} />
-            <Row label="Ad-hoc reliefs" value={fmt(taxResult.adhocReliefs)} />
-            <Row label="Total" value={fmt(taxResult.totalReliefs)} strong />
-          </Card>
-        </Section>
-      )}
-
-      {/* ── FORECAST ── */}
-      {tab === "forecast" && (
-        <Section title="12-month forecast" eyebrow="Projection">
-          <div style={{ fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 14 }}>
-            Baseline income and expenses are the trailing 3-month average excluding big-ticket one-offs, layered with items from Recurring and insurance premiums from the Insurance tab. Simplified: no investment growth, no CPF movement beyond cash, no big-ticket surprises.
-          </div>
-          <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={forecast} margin={{ left: -10, right: 10 }}>
-              <CartesianGrid stroke="var(--hair)" vertical={false} />
-              <XAxis dataKey="monthShort" tick={{ fontFamily: "IBM Plex Sans", fontSize: 11, fill: "#767C86" }} axisLine={{ stroke: "var(--hair-strong)" }} tickLine={false} />
-              <YAxis tick={{ fontFamily: "IBM Plex Mono", fontSize: 10, fill: "#767C86" }} axisLine={false} tickLine={false} width={65} tickFormatter={(v) => `$${(v / 1000).toFixed(0)}k`} />
-              <Tooltip formatter={(v) => fmt(v)} contentStyle={{ fontFamily: "IBM Plex Sans", fontSize: 12, borderRadius: 8, border: "1px solid #DEDFD6" }} />
-              <Line type="monotone" dataKey="netWorth" stroke="#35577A" strokeWidth={2.5} dot={{ r: 3 }} name="Projected net worth" />
-            </LineChart>
-          </ResponsiveContainer>
-          <div style={{ overflowX: "auto", marginTop: 16 }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "var(--mono)", fontSize: 12.5, background: "#fff", border: "1px solid var(--hair)", borderRadius: 10 }}>
-              <thead>
-                <tr>{["Month", "Income", "Expenses", "Net cashflow", "Cumulative net worth"].map((h) => (
-                  <th key={h} style={{ textAlign: h === "Month" ? "left" : "right", padding: "8px 12px", fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", textTransform: "uppercase", borderBottom: "1px solid var(--hair-strong)" }}>{h}</th>
-                ))}</tr>
-              </thead>
-              <tbody>
-                {forecast.map((f) => (
-                  <tr key={f.month}>
-                    <td style={{ padding: "7px 12px", fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", borderBottom: "1px solid var(--hair)" }}>{f.month}</td>
-                    <td style={{ padding: "7px 12px", textAlign: "right", borderBottom: "1px solid var(--hair)" }}>{fmt(f.income)}</td>
-                    <td style={{ padding: "7px 12px", textAlign: "right", borderBottom: "1px solid var(--hair)" }}>{fmt(f.expenses)}</td>
-                    <td style={{ padding: "7px 12px", textAlign: "right", borderBottom: "1px solid var(--hair)", color: f.net >= 0 ? "var(--accent)" : "var(--warn)" }}>{fmt(f.net)}</td>
-                    <td style={{ padding: "7px 12px", textAlign: "right", borderBottom: "1px solid var(--hair)", fontWeight: 600 }}>{fmt(f.netWorth)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Section>
-      )}
-
-      {/* ── HISTORY ── */}
-      {tab === "history" && (
-        <Section title="All months" eyebrow="Ledger">
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "var(--mono)", fontSize: 12.5 }}>
-              <thead>
-                <tr>
-                  <th style={{ textAlign: "left", padding: "8px 10px", fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", textTransform: "uppercase", borderBottom: "1px solid var(--hair-strong)" }}>Metric</th>
-                  {records.map((r) => <th key={r.month} style={{ textAlign: "right", padding: "8px 10px", fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", borderBottom: "1px solid var(--hair-strong)" }}>{r.month}</th>)}
-                </tr>
-              </thead>
-              <tbody>
-                {[
-                  ["Total income", (d) => fmt(d.totalIncome)], ["Total expenses", (d) => fmt(d.totalExpenses)], ["Net cashflow", (d) => fmt(d.netCashflow)],
-                  ["Liquid cash", (d) => d.hasBalances ? fmt(d.totalLiquidCash) : DASH], ["Investments", (d) => d.hasBalances ? fmt(d.totalInvestments) : DASH],
-                  ["CPF combined", (d) => d.hasBalances ? fmt(d.combinedCpf) : DASH], ["Net worth", (d) => d.hasBalances ? fmt(d.netWorth) : DASH],
-                  ["Emergency buffer %", (d) => d.hasBalances ? fmtPct(d.bufferProgress) : DASH],
-                ].map(([label, get]) => (
-                  <tr key={label}>
-                    <td style={{ padding: "7px 10px", fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", borderBottom: "1px solid var(--hair)" }}>{label}</td>
-                    {records.map((r) => <td key={r.month} style={{ padding: "7px 10px", textAlign: "right", borderBottom: "1px solid var(--hair)", color: "var(--ink-1)" }}>{get(derivedByMonth[r.month])}</td>)}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Section>
-      )}
-
-      <div style={{ marginTop: 34, fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", textAlign: "center" }}>
-        Data is stored in your shared Firestore project, not shared with anyone outside it. Seeded from ET_SY_Balances_Tracker_Jun_2026.xlsx.
-      </div>
-    </div>
-  );
+      `), syncError && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 16,
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--warn)",
+      background: "#FBEAF0",
+      border: "1px solid #F0997B",
+      borderRadius: 8,
+      padding: "10px 14px"
+    }
+  }, syncError), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "flex-start",
+      flexWrap: "wrap",
+      gap: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      letterSpacing: "0.1em",
+      textTransform: "uppercase",
+      color: "var(--accent)",
+      fontWeight: 600
+    }
+  }, "Household ledger \xB7 ET & SY"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--serif)",
+      fontSize: 34,
+      color: "var(--ink-1)",
+      marginTop: 4
+    }
+  }, current && current.hasBalances ? fmt(current.netWorth) : DASH), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-3)"
+    }
+  }, "Net worth \xB7 ", selectedMonth)), current && current.hasBalances && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement(Stamp, {
+    pct: current.bufferProgress
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      padding: "4px 10px",
+      fontSize: 11.5
+    },
+    onClick: () => setShowBufferDetail(s => !s)
+  }, showBufferDetail ? "Hide" : "How is this calculated?"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 4,
+      marginTop: 24,
+      borderBottom: "1px solid var(--hair)",
+      paddingBottom: 12,
+      flexWrap: "wrap",
+      alignItems: "center"
+    }
+  }, [["dashboard", "Dashboard"], ["add", "Add month"], ["budgets", "Budgets"], ["contracts", "Contracts"], ["insurance", "Insurance"], ["recurring", "Recurring"], ["loans", "Loans"], ["cpf", "CPF"], ["tax", "Tax"], ["forecast", "Forecast"], ["history", "History"]].map(([id, label]) => /*#__PURE__*/React.createElement("button", {
+    key: id,
+    className: `tab-btn ${tab === id ? "active" : ""}`,
+    onClick: () => {
+      if (id === "add" && !draft) startDraft();else setTab(id);
+    }
+  }, label)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1
+    }
+  }), tab === "dashboard" && /*#__PURE__*/React.createElement("select", {
+    value: selectedMonth,
+    onChange: e => setSelectedMonth(e.target.value)
+  }, records.map(r => /*#__PURE__*/React.createElement("option", {
+    key: r.month,
+    value: r.month
+  }, r.month))), saveMsg && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--accent)"
+    }
+  }, saveMsg)), tab === "dashboard" && current && /*#__PURE__*/React.createElement(React.Fragment, null, showBufferDetail && current.hasBalances && /*#__PURE__*/React.createElement(Card, {
+    style: {
+      marginTop: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--serif)",
+      fontSize: 17,
+      color: "var(--ink-1)",
+      marginBottom: 4
+    }
+  }, "Emergency buffer"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-3)",
+      marginBottom: 12
+    }
+  }, "Progress = (liquid cash \u2212 credit card balance) \xF7 target. Credit card is subtracted because that money is already committed."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderTop: "1px solid var(--hair-strong)"
+    }
+  }, /*#__PURE__*/React.createElement(Row, {
+    label: "Total liquid cash",
+    value: fmt(current.totalLiquidCash, 2)
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Less: credit card balance",
+    value: "−" + fmt(currentRecord.balances.property.creditCard, 2).replace("$", "$"),
+    color: "var(--warn)"
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Cash available for buffer",
+    value: fmt(current.currentLiquidCashNetCC, 2),
+    strong: true
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Target",
+    value: fmt(assumptions.emergencyBufferTarget, 2)
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Gap to target",
+    value: fmt(current.bufferGap, 2),
+    color: current.bufferGap > 0 ? "var(--warn)" : "var(--accent)"
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Progress",
+    value: fmtPct(current.bufferProgress, 2),
+    strong: true,
+    color: "var(--accent)"
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 16,
+      paddingTop: 14,
+      borderTop: "1px solid var(--hair)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      fontWeight: 600,
+      color: "var(--ink-2)",
+      marginBottom: 8
+    }
+  }, "Change the target"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(3, minmax(0,1fr))",
+      gap: 10,
+      alignItems: "end"
+    }
+  }, /*#__PURE__*/React.createElement(NumberField, {
+    label: "Target ($)",
+    value: assumptions.emergencyBufferTarget,
+    onChange: v => persistAll({
+      assumptions: {
+        ...assumptions,
+        emergencyBufferTarget: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Months of cover",
+    value: assumptions.bufferMonths,
+    onChange: v => persistAll({
+      assumptions: {
+        ...assumptions,
+        bufferMonths: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => persistAll({
+      assumptions: {
+        ...assumptions,
+        emergencyBufferTarget: Math.round(avgMonthlyExpenses * assumptions.bufferMonths)
+      }
+    })
+  }, "Recalculate from actuals")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11.5,
+      color: "var(--ink-3)",
+      marginTop: 8
+    }
+  }, "Your current target of ", fmt(assumptions.emergencyBufferTarget), " came from your Targets sheet (", assumptions.bufferMonths, " months of expenses). Average monthly expenses across the ", records.length, " months tracked so far are ", fmt(avgMonthlyExpenses), ", which at ", assumptions.bufferMonths, " months implies ", fmt(avgMonthlyExpenses * assumptions.bufferMonths), ". That average is inflated by the April and May confinement spending, so recalculating now would overshoot \u2014 worth revisiting once you have a few clean months."))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 12,
+      flexWrap: "wrap",
+      marginTop: 20
+    }
+  }, /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Liquid cash",
+    value: current.hasBalances ? fmt(current.totalLiquidCash) : DASH
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Investments",
+    value: current.hasBalances ? fmt(current.totalInvestments) : DASH
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "CPF combined",
+    value: current.hasBalances ? fmt(current.combinedCpf) : DASH
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Property equity",
+    value: current.hasBalances ? fmt(current.propertyEquity) : DASH
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Net cashflow (month)",
+    value: fmt(current.netCashflow),
+    sub: `Income ${fmt(current.totalIncome)} less expenses ${fmt(current.totalExpenses)}`
+  })), !current.hasBalances && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 16,
+      fontFamily: "var(--sans)",
+      fontSize: 13,
+      color: "var(--warn)",
+      background: "#FBEAF0",
+      border: "1px solid #F0997B",
+      borderRadius: 8,
+      padding: "10px 14px"
+    }
+  }, "Balance sheet wasn\u2019t tracked for ", selectedMonth, " \u2014 showing income and expenses only."), /*#__PURE__*/React.createElement(Section, {
+    title: "Expense breakdown",
+    eyebrow: expenseView === "ytd" ? `Year to date · Jan–${selectedMonth.split(" ")[0]}` : selectedMonth,
+    right: /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 4
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      className: `tab-btn ${expenseView === "month" ? "active" : ""}`,
+      onClick: () => setExpenseView("month")
+    }, "This month"), /*#__PURE__*/React.createElement("button", {
+      className: `tab-btn ${expenseView === "ytd" ? "active" : ""}`,
+      onClick: () => setExpenseView("ytd")
+    }, "Year to date"))
+  }, expenseRows.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 13,
+      color: "var(--ink-3)"
+    }
+  }, "No expenses logged yet.") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#fff",
+      border: "1px solid var(--hair)",
+      borderRadius: 10,
+      overflow: "hidden"
+    }
+  }, expenseRows.map((c, i) => {
+    const pct = c.value / expenseTotal;
+    return /*#__PURE__*/React.createElement("div", {
+      key: c.key,
+      style: {
+        padding: "10px 16px",
+        borderTop: i === 0 ? "none" : "1px solid var(--hair)"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        marginBottom: 6
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 8
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        width: 9,
+        height: 9,
+        borderRadius: "50%",
+        background: c.color,
+        display: "inline-block"
+      }
+    }), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 13,
+        color: "var(--ink-1)"
+      }
+    }, c.label)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 12,
+        alignItems: "baseline"
+      }
+    }, expenseView === "ytd" && /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 11.5,
+        color: "var(--ink-3)"
+      }
+    }, fmt(c.value / ytdRecords.length), "/mo avg"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 11.5,
+        color: "var(--ink-3)"
+      }
+    }, fmtPct(pct)), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: "var(--mono)",
+        fontSize: 13,
+        fontWeight: 600,
+        color: "var(--ink-1)"
+      }
+    }, fmt(c.value)))), /*#__PURE__*/React.createElement(Bar, {
+      pct: pct,
+      color: c.color
+    }));
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      marginTop: 10,
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)"
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "Total ", expenseView === "ytd" ? `across ${ytdRecords.length} months` : "this month"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: "var(--mono)",
+      fontWeight: 600,
+      color: "var(--ink-1)"
+    }
+  }, fmt(expenseTotal))))), /*#__PURE__*/React.createElement(Section, {
+    title: "Income vs. expenses",
+    eyebrow: "Monthly trend"
+  }, /*#__PURE__*/React.createElement(ResponsiveContainer, {
+    width: "100%",
+    height: 220
+  }, /*#__PURE__*/React.createElement(AreaChart, {
+    data: trendData,
+    margin: {
+      left: -10,
+      right: 10
+    }
+  }, /*#__PURE__*/React.createElement(CartesianGrid, {
+    stroke: "var(--hair)",
+    vertical: false
+  }), /*#__PURE__*/React.createElement(XAxis, {
+    dataKey: "month",
+    tick: {
+      fontFamily: "IBM Plex Sans",
+      fontSize: 11,
+      fill: "#767C86"
+    },
+    axisLine: {
+      stroke: "var(--hair-strong)"
+    },
+    tickLine: false
+  }), /*#__PURE__*/React.createElement(YAxis, {
+    tick: {
+      fontFamily: "IBM Plex Mono",
+      fontSize: 10,
+      fill: "#767C86"
+    },
+    axisLine: false,
+    tickLine: false,
+    width: 60,
+    tickFormatter: v => `$${(v / 1000).toFixed(0)}k`
+  }), /*#__PURE__*/React.createElement(Tooltip, {
+    formatter: v => fmt(v),
+    contentStyle: {
+      fontFamily: "IBM Plex Sans",
+      fontSize: 12,
+      borderRadius: 8,
+      border: "1px solid #DEDFD6"
+    }
+  }), /*#__PURE__*/React.createElement(Area, {
+    type: "monotone",
+    dataKey: "income",
+    stroke: "#0F5D52",
+    fill: "#0F5D52",
+    fillOpacity: 0.12,
+    strokeWidth: 2,
+    name: "Income"
+  }), /*#__PURE__*/React.createElement(Area, {
+    type: "monotone",
+    dataKey: "expenses",
+    stroke: "#A6402B",
+    fill: "#A6402B",
+    fillOpacity: 0.1,
+    strokeWidth: 2,
+    name: "Expenses"
+  })))), /*#__PURE__*/React.createElement(Section, {
+    title: "Net worth",
+    eyebrow: "Since Apr 2026 (first tracked balance sheet)"
+  }, /*#__PURE__*/React.createElement(ResponsiveContainer, {
+    width: "100%",
+    height: 200
+  }, /*#__PURE__*/React.createElement(LineChart, {
+    data: trendData.filter(d => d.netWorth !== null),
+    margin: {
+      left: -10,
+      right: 10
+    }
+  }, /*#__PURE__*/React.createElement(CartesianGrid, {
+    stroke: "var(--hair)",
+    vertical: false
+  }), /*#__PURE__*/React.createElement(XAxis, {
+    dataKey: "month",
+    tick: {
+      fontFamily: "IBM Plex Sans",
+      fontSize: 11,
+      fill: "#767C86"
+    },
+    axisLine: {
+      stroke: "var(--hair-strong)"
+    },
+    tickLine: false
+  }), /*#__PURE__*/React.createElement(YAxis, {
+    tick: {
+      fontFamily: "IBM Plex Mono",
+      fontSize: 10,
+      fill: "#767C86"
+    },
+    axisLine: false,
+    tickLine: false,
+    width: 65,
+    tickFormatter: v => `$${(v / 1000).toFixed(0)}k`,
+    domain: ["dataMin - 5000", "dataMax + 5000"]
+  }), /*#__PURE__*/React.createElement(Tooltip, {
+    formatter: v => fmt(v),
+    contentStyle: {
+      fontFamily: "IBM Plex Sans",
+      fontSize: 12,
+      borderRadius: 8,
+      border: "1px solid #DEDFD6"
+    }
+  }), /*#__PURE__*/React.createElement(Line, {
+    type: "monotone",
+    dataKey: "netWorth",
+    stroke: "#35577A",
+    strokeWidth: 2.5,
+    dot: {
+      r: 3
+    },
+    name: "Net worth"
+  })))), current.hasBalances && /*#__PURE__*/React.createElement(Section, {
+    title: "Financial health ratios",
+    eyebrow: selectedMonth
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#fff",
+      border: "1px solid var(--hair)",
+      borderRadius: 10,
+      overflow: "hidden"
+    }
+  }, RATIO_META.map((m, i) => /*#__PURE__*/React.createElement("div", {
+    key: m.key,
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      padding: "10px 16px",
+      borderTop: i === 0 ? "none" : "1px solid var(--hair)",
+      gap: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 13,
+      color: "var(--ink-1)"
+    }
+  }, m.label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11.5,
+      color: "var(--ink-3)",
+      marginTop: 2
+    }
+  }, m.what), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)",
+      marginTop: 1
+    }
+  }, m.bench)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--mono)",
+      fontSize: 14,
+      fontWeight: 600,
+      color: "var(--ink-1)",
+      whiteSpace: "nowrap"
+    }
+  }, m.fmt(current.ratios[m.key]))))))), tab === "add" && draft && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 20
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--serif)",
+      fontSize: 20,
+      color: "var(--ink-1)"
+    }
+  }, "New entry \u2014 ", draft.month), /*#__PURE__*/React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => setShowAssumptions(s => !s)
+  }, showAssumptions ? "Hide" : "Edit", " assumptions")), showAssumptions && /*#__PURE__*/React.createElement(Card, {
+    style: {
+      marginBottom: 20
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(3, minmax(0,1fr))",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement(NumberField, {
+    label: "Emergency buffer target",
+    value: assumptions.emergencyBufferTarget,
+    onChange: v => persistAll({
+      assumptions: {
+        ...assumptions,
+        emergencyBufferTarget: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Monthly gross income (OW)",
+    value: assumptions.monthlyGrossIncome,
+    onChange: v => persistAll({
+      assumptions: {
+        ...assumptions,
+        monthlyGrossIncome: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Car loan repayment / mth",
+    value: assumptions.carLoanRepayment,
+    onChange: v => persistAll({
+      assumptions: {
+        ...assumptions,
+        carLoanRepayment: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Annual insurance premiums",
+    value: assumptions.annualInsurancePremiums,
+    onChange: v => persistAll({
+      assumptions: {
+        ...assumptions,
+        annualInsurancePremiums: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Annual ins. excl. endowments",
+    value: assumptions.annualInsurancePremiumsExclEndowments,
+    onChange: v => persistAll({
+      assumptions: {
+        ...assumptions,
+        annualInsurancePremiumsExclEndowments: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "ET legacy / life cover",
+    value: assumptions.etLegacyCover,
+    onChange: v => persistAll({
+      assumptions: {
+        ...assumptions,
+        etLegacyCover: v
+      }
+    })
+  }))), /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontWeight: 600,
+      fontSize: 14,
+      color: "var(--ink-1)",
+      marginBottom: 10
+    }
+  }, "Balances"), /*#__PURE__*/React.createElement(FieldGrid, {
+    title: "Liquid cash",
+    obj: draft.balances.liquidCash,
+    onChange: (k, v) => updateDraftField("balances", "liquidCash", k, v)
+  }), /*#__PURE__*/React.createElement(FieldGrid, {
+    title: "Investments",
+    obj: draft.balances.investments,
+    onChange: (k, v) => updateDraftField("balances", "investments", k, v)
+  }), /*#__PURE__*/React.createElement(FieldGrid, {
+    title: "CPF \u2014 ET",
+    obj: draft.balances.cpfEt,
+    onChange: (k, v) => updateDraftField("balances", "cpfEt", k, v)
+  }), /*#__PURE__*/React.createElement(FieldGrid, {
+    title: "CPF \u2014 SY",
+    obj: draft.balances.cpfSy,
+    onChange: (k, v) => updateDraftField("balances", "cpfSy", k, v)
+  }), /*#__PURE__*/React.createElement(FieldGrid, {
+    title: "Property and loans",
+    obj: draft.balances.property,
+    onChange: (k, v) => updateDraftField("balances", "property", k, v)
+  })), /*#__PURE__*/React.createElement(Card, {
+    style: {
+      marginTop: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontWeight: 600,
+      fontSize: 14,
+      color: "var(--ink-1)",
+      marginBottom: 10
+    }
+  }, "Income and expenses"), /*#__PURE__*/React.createElement(FieldGrid, {
+    title: "Income",
+    obj: draft.income,
+    onChange: (k, v) => updateDraftField("income", null, k, v)
+  }), /*#__PURE__*/React.createElement(FieldGrid, {
+    title: "Fixed expenses (non-financial)",
+    obj: draft.expenses.fixedNonFinancial,
+    onChange: (k, v) => updateDraftField("expenses", "fixedNonFinancial", k, v)
+  }), /*#__PURE__*/React.createElement(FieldGrid, {
+    title: "Fixed expenses (financial)",
+    obj: draft.expenses.fixedFinancial,
+    onChange: (k, v) => updateDraftField("expenses", "fixedFinancial", k, v)
+  }), /*#__PURE__*/React.createElement(FieldGrid, {
+    title: "Variable expenses",
+    obj: draft.expenses.variable,
+    onChange: (k, v) => updateDraftField("expenses", "variable", k, v)
+  })), (() => {
+    const preview = computeDerived(draft, assumptions);
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 12,
+        flexWrap: "wrap",
+        marginTop: 14
+      }
+    }, /*#__PURE__*/React.createElement(KpiCard, {
+      label: "Total income",
+      value: fmt(preview.totalIncome)
+    }), /*#__PURE__*/React.createElement(KpiCard, {
+      label: "Total expenses",
+      value: fmt(preview.totalExpenses)
+    }), /*#__PURE__*/React.createElement(KpiCard, {
+      label: "Net cashflow",
+      value: fmt(preview.netCashflow)
+    }), /*#__PURE__*/React.createElement(KpiCard, {
+      label: "Net worth",
+      value: fmt(preview.netWorth)
+    }), /*#__PURE__*/React.createElement(KpiCard, {
+      label: "Emergency buffer",
+      value: fmtPct(preview.bufferProgress),
+      sub: `Gap ${fmt(preview.bufferGap)}`
+    }));
+  })(), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      marginTop: 18
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn-primary",
+    onClick: saveDraft
+  }, "Save ", draft.month), /*#__PURE__*/React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => {
+      setDraft(null);
+      setTab("dashboard");
+    }
+  }, "Cancel"))), tab === "budgets" && /*#__PURE__*/React.createElement(Section, {
+    title: "Budgets and goals",
+    eyebrow: selectedMonth
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-3)",
+      marginBottom: 14
+    }
+  }, "Set a monthly budget per category. Bars turn amber near the limit and red once you\u2019re over, based on ", selectedMonth, " actuals."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#fff",
+      border: "1px solid var(--hair)",
+      borderRadius: 10,
+      overflow: "hidden"
+    }
+  }, EXPENSE_CATS.map((c, i) => {
+    const actual = currentRecord ? catVal(currentRecord, c) : 0;
+    const budget = Number(budgets[c.key]) || 0;
+    const pct = budget > 0 ? actual / budget : 0;
+    const barColor = pct >= 1 ? "var(--warn)" : pct >= 0.8 ? "var(--amber)" : "var(--accent)";
+    return /*#__PURE__*/React.createElement("div", {
+      key: c.key,
+      style: {
+        padding: "12px 16px",
+        borderTop: i === 0 ? "none" : "1px solid var(--hair)"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        marginBottom: 6,
+        gap: 10,
+        flexWrap: "wrap"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 13,
+        color: "var(--ink-1)"
+      }
+    }, c.label), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 8,
+        alignItems: "center"
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: "var(--mono)",
+        fontSize: 12.5,
+        color: "var(--ink-2)"
+      }
+    }, fmt(actual), " /"), /*#__PURE__*/React.createElement("input", {
+      type: "number",
+      value: budgets[c.key] ?? "",
+      placeholder: "set budget",
+      onChange: e => updateBudget(c.key, e.target.value === "" ? 0 : parseFloat(e.target.value)),
+      style: {
+        width: 90,
+        fontFamily: "var(--mono)",
+        fontSize: 12.5,
+        padding: "4px 7px",
+        borderRadius: 6,
+        border: "1px solid var(--hair-strong)"
+      }
+    }))), budget > 0 && /*#__PURE__*/React.createElement(Bar, {
+      pct: pct,
+      color: barColor
+    }));
+  }))), tab === "contracts" && /*#__PURE__*/React.createElement(Section, {
+    title: "Utility and contract renewals",
+    eyebrow: "Contracts",
+    right: /*#__PURE__*/React.createElement("button", {
+      className: "btn-primary",
+      onClick: addContract
+    }, "Add contract")
+  }, contracts.length === 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 13,
+      color: "var(--ink-3)"
+    }
+  }, "No contracts yet. Add telco, broadband, or insurance renewal dates to get flagged before they lapse."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 10
+    }
+  }, [...contracts].sort((a, b) => daysUntil(a.renewalDate) - daysUntil(b.renewalDate)).map(c => {
+    const days = daysUntil(c.renewalDate);
+    const flag = days <= 30 ? "var(--warn)" : days <= 60 ? "var(--amber)" : "var(--accent)";
+    return /*#__PURE__*/React.createElement(Card, {
+      key: c.id
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gridTemplateColumns: "repeat(3, minmax(0,1fr))",
+        gap: 10,
+        marginBottom: 10
+      }
+    }, /*#__PURE__*/React.createElement(TextField, {
+      label: "Name",
+      value: c.name,
+      onChange: v => updateContract(c.id, {
+        name: v
+      })
+    }), /*#__PURE__*/React.createElement(TextField, {
+      label: "Provider",
+      value: c.provider,
+      onChange: v => updateContract(c.id, {
+        provider: v
+      })
+    }), /*#__PURE__*/React.createElement(SelectField, {
+      label: "Category",
+      value: c.category,
+      onChange: v => updateContract(c.id, {
+        category: v
+      }),
+      options: CONTRACT_CATEGORIES
+    }), /*#__PURE__*/React.createElement(NumberField, {
+      label: "Monthly amount",
+      value: c.monthlyAmount,
+      onChange: v => updateContract(c.id, {
+        monthlyAmount: v
+      })
+    }), /*#__PURE__*/React.createElement(DateField, {
+      label: "Renewal date",
+      value: c.renewalDate,
+      onChange: v => updateContract(c.id, {
+        renewalDate: v
+      })
+    }), /*#__PURE__*/React.createElement(TextField, {
+      label: "Notes",
+      value: c.notes,
+      onChange: v => updateContract(c.id, {
+        notes: v
+      })
+    })), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center"
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 12.5,
+        fontWeight: 600,
+        color: flag
+      }
+    }, days < 0 ? `Renewed ${Math.abs(days)} days ago` : `${days} days to renewal`), /*#__PURE__*/React.createElement(IconBtn, {
+      onClick: () => removeContract(c.id)
+    }, "Remove")));
+  }))), tab === "insurance" && /*#__PURE__*/React.createElement(Section, {
+    title: "Family coverage",
+    eyebrow: "Insurance",
+    right: /*#__PURE__*/React.createElement("button", {
+      className: "btn-primary",
+      onClick: addPolicy
+    }, "Add policy")
+  }, /*#__PURE__*/React.createElement(Card, {
+    style: {
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontWeight: 600,
+      fontSize: 13,
+      color: "var(--ink-1)",
+      marginBottom: 8
+    }
+  }, "Family members"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      flexWrap: "wrap",
+      alignItems: "center"
+    }
+  }, familyMembers.map(f => /*#__PURE__*/React.createElement("span", {
+    key: f,
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 6,
+      background: "var(--paper)",
+      border: "1px solid var(--hair-strong)",
+      borderRadius: 20,
+      padding: "4px 10px 4px 12px",
+      fontFamily: "var(--sans)",
+      fontSize: 12.5
+    }
+  }, f, f !== "ET" && f !== "SY" && /*#__PURE__*/React.createElement("button", {
+    onClick: () => removeFamilyMember(f),
+    style: {
+      border: "none",
+      background: "none",
+      cursor: "pointer",
+      color: "var(--ink-3)",
+      fontSize: 13,
+      padding: 0
+    }
+  }, "\xD7"))), /*#__PURE__*/React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      padding: "5px 10px",
+      fontSize: 12
+    },
+    onClick: addFamilyMember
+  }, "Add member"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto",
+      marginBottom: 20
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      borderCollapse: "collapse",
+      fontFamily: "var(--mono)",
+      fontSize: 12.5,
+      background: "#fff",
+      border: "1px solid var(--hair)",
+      borderRadius: 10
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+    style: {
+      textAlign: "left",
+      padding: "9px 14px",
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)",
+      textTransform: "uppercase",
+      borderBottom: "1px solid var(--hair-strong)"
+    }
+  }, "Type"), familyMembers.map(p => /*#__PURE__*/React.createElement("th", {
+    key: p,
+    style: {
+      textAlign: "right",
+      padding: "9px 14px",
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)",
+      borderBottom: "1px solid var(--hair-strong)"
+    }
+  }, p)), /*#__PURE__*/React.createElement("th", {
+    style: {
+      textAlign: "right",
+      padding: "9px 14px",
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)",
+      borderBottom: "1px solid var(--hair-strong)"
+    }
+  }, "Total"))), /*#__PURE__*/React.createElement("tbody", null, INSURANCE_TYPES.map(type => {
+    const rowTotal = policies.filter(p => p.type === type).reduce((a, p) => a + (Number(p.coverage) || 0), 0);
+    return /*#__PURE__*/React.createElement("tr", {
+      key: type
+    }, /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "8px 14px",
+        fontFamily: "var(--sans)",
+        fontSize: 12.5,
+        color: "var(--ink-2)",
+        borderBottom: "1px solid var(--hair)"
+      }
+    }, type), familyMembers.map(p => {
+      const v = policies.filter(pl => pl.type === type && pl.person === p).reduce((a, pl) => a + (Number(pl.coverage) || 0), 0);
+      return /*#__PURE__*/React.createElement("td", {
+        key: p,
+        style: {
+          padding: "8px 14px",
+          textAlign: "right",
+          borderBottom: "1px solid var(--hair)",
+          color: "var(--ink-1)"
+        }
+      }, v ? fmt(v) : DASH);
+    }), /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "8px 14px",
+        textAlign: "right",
+        borderBottom: "1px solid var(--hair)",
+        color: "var(--ink-1)",
+        fontWeight: 600
+      }
+    }, rowTotal ? fmt(rowTotal) : DASH));
+  })))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-3)",
+      marginBottom: 10
+    }
+  }, "Each policy premium feeds the Forecast tab automatically, spread by its payment frequency. No need to duplicate it in Recurring."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 10
+    }
+  }, policies.map(p => /*#__PURE__*/React.createElement(Card, {
+    key: p.id
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(3, minmax(0,1fr))",
+      gap: 10,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement(SelectField, {
+    label: "Person",
+    value: p.person,
+    onChange: v => updatePolicy(p.id, {
+      person: v
+    }),
+    options: familyMembers
+  }), /*#__PURE__*/React.createElement(SelectField, {
+    label: "Type",
+    value: p.type,
+    onChange: v => updatePolicy(p.id, {
+      type: v
+    }),
+    options: INSURANCE_TYPES
+  }), /*#__PURE__*/React.createElement(TextField, {
+    label: "Insurer",
+    value: p.insurer,
+    onChange: v => updatePolicy(p.id, {
+      insurer: v
+    })
+  }), /*#__PURE__*/React.createElement(TextField, {
+    label: "Product",
+    value: p.product,
+    onChange: v => updatePolicy(p.id, {
+      product: v
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Coverage / sum assured",
+    value: p.coverage,
+    onChange: v => updatePolicy(p.id, {
+      coverage: v
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Annual premium",
+    value: p.annualPremium,
+    onChange: v => updatePolicy(p.id, {
+      annualPremium: v
+    })
+  }), /*#__PURE__*/React.createElement(SelectField, {
+    label: "Payment frequency",
+    value: p.paymentFrequency,
+    onChange: v => updatePolicy(p.id, {
+      paymentFrequency: v
+    }),
+    options: FREQUENCIES
+  }), /*#__PURE__*/React.createElement(DateField, {
+    label: "Next payment date",
+    value: p.nextPaymentDate,
+    onChange: v => updatePolicy(p.id, {
+      nextPaymentDate: v
+    })
+  }), /*#__PURE__*/React.createElement(SelectField, {
+    label: "Payment method",
+    value: p.paymentMethod,
+    onChange: v => updatePolicy(p.id, {
+      paymentMethod: v
+    }),
+    options: PAYMENT_METHODS
+  }), /*#__PURE__*/React.createElement(TextField, {
+    label: "Paid from (account or card)",
+    value: p.paymentAccount,
+    onChange: v => updatePolicy(p.id, {
+      paymentAccount: v
+    })
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, /*#__PURE__*/React.createElement(IconBtn, {
+    onClick: () => removePolicy(p.id)
+  }, "Remove")))))), tab === "recurring" && /*#__PURE__*/React.createElement(Section, {
+    title: "Recurring payments",
+    eyebrow: "Planning register",
+    right: /*#__PURE__*/React.createElement("button", {
+      className: "btn-primary",
+      onClick: addRecurring
+    }, "Add recurring item")
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-3)",
+      marginBottom: 14
+    }
+  }, "Use this for lumpy or annual items that don\u2019t average out well in the trailing 3-month forecast baseline, like school fees or road tax. Insurance premiums are handled automatically from the Insurance tab."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 10
+    }
+  }, recurring.map(r => /*#__PURE__*/React.createElement(Card, {
+    key: r.id
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(3, minmax(0,1fr))",
+      gap: 10,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement(TextField, {
+    label: "Name",
+    value: r.name,
+    onChange: v => updateRecurring(r.id, {
+      name: v
+    })
+  }), /*#__PURE__*/React.createElement(SelectField, {
+    label: "Direction",
+    value: r.direction,
+    onChange: v => updateRecurring(r.id, {
+      direction: v
+    }),
+    options: ["expense", "income"]
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Amount",
+    value: r.amount,
+    onChange: v => updateRecurring(r.id, {
+      amount: v
+    })
+  }), /*#__PURE__*/React.createElement(SelectField, {
+    label: "Frequency",
+    value: r.frequency,
+    onChange: v => updateRecurring(r.id, {
+      frequency: v
+    }),
+    options: FREQUENCIES
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Due month (1 to 12)",
+    value: r.dueMonth,
+    onChange: v => updateRecurring(r.id, {
+      dueMonth: v
+    })
+  }), /*#__PURE__*/React.createElement(TextField, {
+    label: "Notes",
+    value: r.notes,
+    onChange: v => updateRecurring(r.id, {
+      notes: v
+    })
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "right"
+    }
+  }, /*#__PURE__*/React.createElement(IconBtn, {
+    onClick: () => removeRecurring(r.id)
+  }, "Remove")))), recurring.length === 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 13,
+      color: "var(--ink-3)"
+    }
+  }, "No recurring items yet."))), tab === "loans" && /*#__PURE__*/React.createElement(Section, {
+    title: "Loan amortisation",
+    eyebrow: "Housing and car",
+    right: /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 6
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      className: `tab-btn ${loanSub === "housing" ? "active" : ""}`,
+      onClick: () => setLoanSub("housing")
+    }, "Housing"), /*#__PURE__*/React.createElement("button", {
+      className: `tab-btn ${loanSub === "car" ? "active" : ""}`,
+      onClick: () => setLoanSub("car")
+    }, "Car"))
+  }, /*#__PURE__*/React.createElement(Card, {
+    style: {
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(4, minmax(0,1fr))",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement(NumberField, {
+    label: "Principal ($)",
+    value: activeLoan.principal,
+    onChange: v => persistAll({
+      [activeLoanKey]: {
+        ...activeLoan,
+        principal: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Interest rate (% p.a.)",
+    value: activeLoan.ratePct,
+    onChange: v => persistAll({
+      [activeLoanKey]: {
+        ...activeLoan,
+        ratePct: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Tenure (years)",
+    value: activeLoan.tenureYears,
+    onChange: v => persistAll({
+      [activeLoanKey]: {
+        ...activeLoan,
+        tenureYears: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(TextField, {
+    label: "Start month",
+    value: activeLoan.startMonth,
+    onChange: v => persistAll({
+      [activeLoanKey]: {
+        ...activeLoan,
+        startMonth: v
+      }
+    })
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 12,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Monthly payment",
+    value: fmt(activeAmort.payment, 2)
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Total interest",
+    value: fmt(activeAmort.totalInterest)
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Total repayment",
+    value: fmt(activeAmort.totalRepayment)
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Number of payments",
+    value: activeAmort.n
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 16,
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 13,
+      fontWeight: 600,
+      color: "var(--ink-1)"
+    }
+  }, "Yearly schedule"), /*#__PURE__*/React.createElement("button", {
+    className: "btn-secondary",
+    onClick: () => setShowMonthlySchedule(s => !s)
+  }, showMonthlySchedule ? "Collapse" : "Scrollable view")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto",
+      marginTop: 10,
+      maxHeight: showMonthlySchedule ? 420 : "none",
+      overflowY: showMonthlySchedule ? "auto" : "visible"
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      borderCollapse: "collapse",
+      fontFamily: "var(--mono)",
+      fontSize: 12.5,
+      background: "#fff",
+      border: "1px solid var(--hair)",
+      borderRadius: 10
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Year", "Principal paid", "Interest paid", "Remaining balance"].map(h => /*#__PURE__*/React.createElement("th", {
+    key: h,
+    style: {
+      textAlign: h === "Year" ? "left" : "right",
+      padding: "8px 12px",
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)",
+      textTransform: "uppercase",
+      borderBottom: "1px solid var(--hair-strong)"
+    }
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, activeAmort.yearly.map((y, i) => /*#__PURE__*/React.createElement("tr", {
+    key: i
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 12px",
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)",
+      borderBottom: "1px solid var(--hair)"
+    }
+  }, "Year ", i + 1), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 12px",
+      textAlign: "right",
+      borderBottom: "1px solid var(--hair)"
+    }
+  }, fmt(y.principal)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 12px",
+      textAlign: "right",
+      borderBottom: "1px solid var(--hair)"
+    }
+  }, fmt(y.interest)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 12px",
+      textAlign: "right",
+      borderBottom: "1px solid var(--hair)",
+      fontWeight: 600
+    }
+  }, fmt(y.balance)))))))), tab === "cpf" && /*#__PURE__*/React.createElement(Section, {
+    title: "CPF contributions",
+    eyebrow: "CPF Board rates effective 1 Jan 2026"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 12,
+      flexWrap: "wrap",
+      marginBottom: 20
+    }
+  }, /*#__PURE__*/React.createElement(KpiCard, {
+    label: "To Ordinary Account",
+    value: fmt(cpfFinal.oaAmt)
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: `To ${cpfResult.allocBand.saLabel}`,
+    value: fmt(cpfFinal.saAmt)
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "To MediSave",
+    value: fmt(cpfFinal.maAmt)
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Total this month",
+    value: fmt(cpfFinal.oaAmt + cpfFinal.saAmt + cpfFinal.maAmt),
+    sub: cpfSettings.manualOverride ? "Manual override active" : `Auto-calculated at ${fmtPct(cpfResult.contribBand.total, 0)} of wages`
+  })), /*#__PURE__*/React.createElement(Card, {
+    style: {
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--serif)",
+      fontSize: 17,
+      color: "var(--ink-1)",
+      marginBottom: 3
+    }
+  }, "ET"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12,
+      color: "var(--ink-3)",
+      marginBottom: 14
+    }
+  }, "Employed. Contributions split between employee and employer, then allocated across OA, ", cpfResult.allocBand.saLabel, " and MediSave by age band."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(2, minmax(0,1fr))",
+      gap: 12,
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement(NumberField, {
+    label: "Age",
+    value: cpfSettings.etAge,
+    onChange: v => persistAll({
+      cpfSettings: {
+        ...cpfSettings,
+        etAge: v
+      }
+    }),
+    hint: `Age band: ${cpfResult.contribBand.maxAge === 55 ? "55 and below" : `up to ${cpfResult.contribBand.maxAge}`}`
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Monthly salary",
+    value: cpfSettings.monthlyOW,
+    onChange: v => persistAll({
+      cpfSettings: {
+        ...cpfSettings,
+        monthlyOW: v
+      }
+    }),
+    hint: `CPF applies to first ${fmt(CPF_OW_CEILING)} only`
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Bonus paid this month",
+    value: cpfSettings.bonusThisMonth,
+    onChange: v => persistAll({
+      cpfSettings: {
+        ...cpfSettings,
+        bonusThisMonth: v
+      }
+    }),
+    hint: "Leave at 0 in non-bonus months"
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Salary already CPF-charged this year",
+    value: cpfSettings.annualOwToDate,
+    onChange: v => persistAll({
+      cpfSettings: {
+        ...cpfSettings,
+        annualOwToDate: v
+      }
+    }),
+    hint: "January to last month. Sets how much bonus is still CPF-liable."
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderTop: "1px solid var(--hair-strong)",
+      paddingTop: 4
+    }
+  }, /*#__PURE__*/React.createElement(Row, {
+    label: "Salary subject to CPF",
+    value: fmt(cpfResult.owSubject)
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Employee share",
+    value: fmt(cpfResult.owEmployee)
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Employer share",
+    value: fmt(cpfResult.owEmployer)
+  }), cpfSettings.bonusThisMonth > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Row, {
+    label: "Bonus ceiling remaining this year",
+    value: fmt(cpfResult.awCeiling)
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Bonus subject to CPF",
+    value: fmt(cpfResult.awSubject)
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Bonus CPF (employee + employer)",
+    value: fmt(cpfResult.awTotal)
+  })), /*#__PURE__*/React.createElement(Row, {
+    label: "Total contribution",
+    value: fmt(cpfResult.totalContribution),
+    strong: true
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 16,
+      paddingTop: 14,
+      borderTop: "1px solid var(--hair)"
+    }
+  }, /*#__PURE__*/React.createElement(CheckField, {
+    label: "Enter the OA / SA / MA split manually instead",
+    checked: cpfSettings.manualOverride,
+    onChange: v => persistAll({
+      cpfSettings: {
+        ...cpfSettings,
+        manualOverride: v
+      }
+    })
+  }), cpfSettings.manualOverride && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(3, minmax(0,1fr))",
+      gap: 10,
+      marginTop: 10
+    }
+  }, /*#__PURE__*/React.createElement(NumberField, {
+    label: "Ordinary Account",
+    value: cpfSettings.manualOA,
+    onChange: v => persistAll({
+      cpfSettings: {
+        ...cpfSettings,
+        manualOA: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: cpfResult.allocBand.saLabel === "SA" ? "Special Account" : "Retirement Account",
+    value: cpfSettings.manualSA,
+    onChange: v => persistAll({
+      cpfSettings: {
+        ...cpfSettings,
+        manualSA: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "MediSave",
+    value: cpfSettings.manualMA,
+    onChange: v => persistAll({
+      cpfSettings: {
+        ...cpfSettings,
+        manualMA: v
+      }
+    })
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 16
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn-primary",
+    onClick: () => {
+      setPendingCpfBump(cpfFinal);
+      setSaveMsg(`Queued for ${nextMonthName}`);
+      setTimeout(() => setSaveMsg(""), 4000);
+    }
+  }, "Apply to ", nextMonthName, " balances"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11.5,
+      color: "var(--ink-3)",
+      marginTop: 6
+    }
+  }, "Adds these amounts to ET\u2019s CPF balances when you next open Add month."))), /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--serif)",
+      fontSize: 17,
+      color: "var(--ink-1)",
+      marginBottom: 3
+    }
+  }, "SY"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12,
+      color: "var(--ink-3)",
+      marginBottom: 14
+    }
+  }, "Self-employed. Only MediSave is compulsory, estimated here at 25% of net trade income per your existing convention."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(2, minmax(0,1fr))",
+      gap: 12
+    }
+  }, /*#__PURE__*/React.createElement(NumberField, {
+    label: "Net trade income this period",
+    value: cpfSettings.syIncome,
+    onChange: v => persistAll({
+      cpfSettings: {
+        ...cpfSettings,
+        syIncome: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "flex-end"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: "100%"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)",
+      marginBottom: 4
+    }
+  }, "Estimated MediSave"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--mono)",
+      fontSize: 20,
+      fontWeight: 600,
+      color: "var(--ink-1)"
+    }
+  }, fmt(syMedisaveEstimate)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)",
+      marginTop: 2
+    }
+  }, "Capped by the Basic Healthcare Sum, ", fmt(75500), " in 2026.")))))), tab === "tax" && /*#__PURE__*/React.createElement(Section, {
+    title: "Income tax estimate",
+    eyebrow: "IRAS resident rates, YA2024 onwards"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-3)",
+      marginBottom: 14
+    }
+  }, "Covers CPF relief, NSman, qualifying child and earned income relief, plus an ad-hoc box for anything else such as donations, course fees, SRS or Parenthood Tax Rebate. Total reliefs are capped at ", fmt(80000), " per IRAS rules. This is an estimate, not a filing."), /*#__PURE__*/React.createElement(Card, {
+    style: {
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(3, minmax(0,1fr))",
+      gap: 10,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement(NumberField, {
+    label: "Annual employment income",
+    value: taxSettings.annualEmploymentIncome,
+    onChange: v => persistAll({
+      taxSettings: {
+        ...taxSettings,
+        annualEmploymentIncome: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Age",
+    value: taxSettings.age,
+    onChange: v => persistAll({
+      taxSettings: {
+        ...taxSettings,
+        age: v
+      }
+    }),
+    hint: "Sets earned income relief"
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Qualifying children",
+    value: taxSettings.numChildren,
+    onChange: v => persistAll({
+      taxSettings: {
+        ...taxSettings,
+        numChildren: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Child relief per child",
+    value: taxSettings.childReliefPerChild,
+    onChange: v => persistAll({
+      taxSettings: {
+        ...taxSettings,
+        childReliefPerChild: v
+      }
+    })
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "NSman relief",
+    value: taxSettings.nsmanRelief,
+    onChange: v => persistAll({
+      taxSettings: {
+        ...taxSettings,
+        nsmanRelief: v
+      }
+    })
+  })), /*#__PURE__*/React.createElement(CheckField, {
+    label: "Include CPF relief, using the monthly salary from the CPF tab",
+    checked: taxSettings.includeCpfRelief,
+    onChange: v => persistAll({
+      taxSettings: {
+        ...taxSettings,
+        includeCpfRelief: v
+      }
+    })
+  })), /*#__PURE__*/React.createElement(Card, {
+    style: {
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontWeight: 600,
+      fontSize: 13
+    }
+  }, "Ad-hoc reliefs and rebates"), /*#__PURE__*/React.createElement("button", {
+    className: "btn-secondary",
+    onClick: addTaxAdhoc,
+    style: {
+      padding: "5px 10px",
+      fontSize: 12
+    }
+  }, "Add item")), taxSettings.adhoc.length === 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-3)"
+    }
+  }, "For example an IPC donation at 250% deduction, course fees, SRS contribution, or Parenthood Tax Rebate."), taxSettings.adhoc.map(a => /*#__PURE__*/React.createElement("div", {
+    key: a.id,
+    style: {
+      display: "grid",
+      gridTemplateColumns: "2fr 1fr 1fr auto",
+      gap: 10,
+      alignItems: "end",
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement(TextField, {
+    label: "Name",
+    value: a.name,
+    onChange: v => updateTaxAdhoc(a.id, {
+      name: v
+    })
+  }), /*#__PURE__*/React.createElement(SelectField, {
+    label: "Type",
+    value: a.type,
+    onChange: v => updateTaxAdhoc(a.id, {
+      type: v
+    }),
+    options: ["relief", "rebate"]
+  }), /*#__PURE__*/React.createElement(NumberField, {
+    label: "Amount",
+    value: a.amount,
+    onChange: v => updateTaxAdhoc(a.id, {
+      amount: v
+    })
+  }), /*#__PURE__*/React.createElement(IconBtn, {
+    onClick: () => removeTaxAdhoc(a.id)
+  }, "Remove")))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 12,
+      flexWrap: "wrap",
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Total reliefs",
+    value: fmt(taxResult.totalReliefs),
+    sub: taxResult.totalReliefsUncapped > 80000 ? `Capped from ${fmt(taxResult.totalReliefsUncapped)}` : undefined
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Chargeable income",
+    value: fmt(taxResult.chargeableIncome)
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Tax before rebates",
+    value: fmt(taxResult.taxBeforeRebate, 2)
+  }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Net tax payable",
+    value: fmt(taxResult.netTax, 2),
+    sub: `Effective rate ${fmtPct(taxResult.effectiveRate, 2)}`
+  })), /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontWeight: 600,
+      fontSize: 13,
+      marginBottom: 4
+    }
+  }, "Relief breakdown"), /*#__PURE__*/React.createElement(Row, {
+    label: "CPF relief",
+    value: fmt(taxResult.cpfReliefAmt)
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Qualifying child relief",
+    value: fmt(taxResult.childRelief)
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Earned income relief",
+    value: fmt(taxResult.eir)
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "NSman relief",
+    value: fmt(taxSettings.nsmanRelief)
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Ad-hoc reliefs",
+    value: fmt(taxResult.adhocReliefs)
+  }), /*#__PURE__*/React.createElement(Row, {
+    label: "Total",
+    value: fmt(taxResult.totalReliefs),
+    strong: true
+  }))), tab === "forecast" && /*#__PURE__*/React.createElement(Section, {
+    title: "12-month forecast",
+    eyebrow: "Projection"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-3)",
+      marginBottom: 14
+    }
+  }, "Baseline income and expenses are the trailing 3-month average excluding big-ticket one-offs, layered with items from Recurring and insurance premiums from the Insurance tab. Simplified: no investment growth, no CPF movement beyond cash, no big-ticket surprises."), /*#__PURE__*/React.createElement(ResponsiveContainer, {
+    width: "100%",
+    height: 220
+  }, /*#__PURE__*/React.createElement(LineChart, {
+    data: forecast,
+    margin: {
+      left: -10,
+      right: 10
+    }
+  }, /*#__PURE__*/React.createElement(CartesianGrid, {
+    stroke: "var(--hair)",
+    vertical: false
+  }), /*#__PURE__*/React.createElement(XAxis, {
+    dataKey: "monthShort",
+    tick: {
+      fontFamily: "IBM Plex Sans",
+      fontSize: 11,
+      fill: "#767C86"
+    },
+    axisLine: {
+      stroke: "var(--hair-strong)"
+    },
+    tickLine: false
+  }), /*#__PURE__*/React.createElement(YAxis, {
+    tick: {
+      fontFamily: "IBM Plex Mono",
+      fontSize: 10,
+      fill: "#767C86"
+    },
+    axisLine: false,
+    tickLine: false,
+    width: 65,
+    tickFormatter: v => `$${(v / 1000).toFixed(0)}k`
+  }), /*#__PURE__*/React.createElement(Tooltip, {
+    formatter: v => fmt(v),
+    contentStyle: {
+      fontFamily: "IBM Plex Sans",
+      fontSize: 12,
+      borderRadius: 8,
+      border: "1px solid #DEDFD6"
+    }
+  }), /*#__PURE__*/React.createElement(Line, {
+    type: "monotone",
+    dataKey: "netWorth",
+    stroke: "#35577A",
+    strokeWidth: 2.5,
+    dot: {
+      r: 3
+    },
+    name: "Projected net worth"
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto",
+      marginTop: 16
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      borderCollapse: "collapse",
+      fontFamily: "var(--mono)",
+      fontSize: 12.5,
+      background: "#fff",
+      border: "1px solid var(--hair)",
+      borderRadius: 10
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Month", "Income", "Expenses", "Net cashflow", "Cumulative net worth"].map(h => /*#__PURE__*/React.createElement("th", {
+    key: h,
+    style: {
+      textAlign: h === "Month" ? "left" : "right",
+      padding: "8px 12px",
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)",
+      textTransform: "uppercase",
+      borderBottom: "1px solid var(--hair-strong)"
+    }
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, forecast.map(f => /*#__PURE__*/React.createElement("tr", {
+    key: f.month
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 12px",
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)",
+      borderBottom: "1px solid var(--hair)"
+    }
+  }, f.month), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 12px",
+      textAlign: "right",
+      borderBottom: "1px solid var(--hair)"
+    }
+  }, fmt(f.income)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 12px",
+      textAlign: "right",
+      borderBottom: "1px solid var(--hair)"
+    }
+  }, fmt(f.expenses)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 12px",
+      textAlign: "right",
+      borderBottom: "1px solid var(--hair)",
+      color: f.net >= 0 ? "var(--accent)" : "var(--warn)"
+    }
+  }, fmt(f.net)), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 12px",
+      textAlign: "right",
+      borderBottom: "1px solid var(--hair)",
+      fontWeight: 600
+    }
+  }, fmt(f.netWorth)))))))), tab === "history" && /*#__PURE__*/React.createElement(Section, {
+    title: "All months",
+    eyebrow: "Ledger"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      borderCollapse: "collapse",
+      fontFamily: "var(--mono)",
+      fontSize: 12.5
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+    style: {
+      textAlign: "left",
+      padding: "8px 10px",
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)",
+      textTransform: "uppercase",
+      borderBottom: "1px solid var(--hair-strong)"
+    }
+  }, "Metric"), records.map(r => /*#__PURE__*/React.createElement("th", {
+    key: r.month,
+    style: {
+      textAlign: "right",
+      padding: "8px 10px",
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)",
+      borderBottom: "1px solid var(--hair-strong)"
+    }
+  }, r.month)))), /*#__PURE__*/React.createElement("tbody", null, [["Total income", d => fmt(d.totalIncome)], ["Total expenses", d => fmt(d.totalExpenses)], ["Net cashflow", d => fmt(d.netCashflow)], ["Liquid cash", d => d.hasBalances ? fmt(d.totalLiquidCash) : DASH], ["Investments", d => d.hasBalances ? fmt(d.totalInvestments) : DASH], ["CPF combined", d => d.hasBalances ? fmt(d.combinedCpf) : DASH], ["Net worth", d => d.hasBalances ? fmt(d.netWorth) : DASH], ["Emergency buffer %", d => d.hasBalances ? fmtPct(d.bufferProgress) : DASH]].map(([label, get]) => /*#__PURE__*/React.createElement("tr", {
+    key: label
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "7px 10px",
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)",
+      borderBottom: "1px solid var(--hair)"
+    }
+  }, label), records.map(r => /*#__PURE__*/React.createElement("td", {
+    key: r.month,
+    style: {
+      padding: "7px 10px",
+      textAlign: "right",
+      borderBottom: "1px solid var(--hair)",
+      color: "var(--ink-1)"
+    }
+  }, get(derivedByMonth[r.month]))))))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 34,
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)",
+      textAlign: "center"
+    }
+  }, "Data is stored in your shared Firestore project, not shared with anyone outside it. Seeded from ET_SY_Balances_Tracker_Jun_2026.xlsx."));
 }
-
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
 </script>
 </body>
 </html>
