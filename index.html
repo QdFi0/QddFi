@@ -83,11 +83,15 @@ const {
   Area,
   LineChart,
   Line,
+  BarChart,
+  Bar: RBar,
+  Cell,
   XAxis,
   YAxis,
   CartesianGrid,
   Tooltip,
-  ResponsiveContainer
+  ResponsiveContainer,
+  ReferenceLine
 } = Recharts;
 
 /* ───────────────────────── helpers ───────────────────────── */
@@ -673,66 +677,93 @@ function computeDerived(record, assumptions, propertyAccounts) {
     ratios
   };
 }
+const RATIO_STATUS_COLORS = {
+  good: "#0F5D52",
+  watch: "#C88A2E",
+  attention: "#A6402B"
+};
 const RATIO_META = [{
   key: "basicLiquidity",
   label: "Basic liquidity ratio",
   fmt: fmtRatio,
   bench: "≥ 6.0x is good",
-  what: "How many months of expenses your liquid cash alone could cover."
+  what: "How many months of expenses your liquid cash alone could cover.",
+  group: "liquidity",
+  status: v => v >= 6 ? "good" : v >= 3 ? "watch" : "attention"
 }, {
   key: "netLiquidity",
   label: "Net liquidity ratio",
   fmt: fmtRatio,
   bench: "≥ 3.0x is adequate",
-  what: "Same as above, after subtracting what's owed on the credit card."
+  what: "Same as above, after subtracting what's owed on the credit card.",
+  group: "liquidity",
+  status: v => v >= 3 ? "good" : v >= 1.5 ? "watch" : "attention"
 }, {
   key: "liquidToNetWorth",
   label: "Liquid assets / net worth",
   fmt: v => fmtPct(v),
   bench: "10–20% healthy",
-  what: "How much of your total wealth is sitting in easily-accessible cash."
+  what: "How much of your total wealth is sitting in easily-accessible cash.",
+  group: "liquidity",
+  status: v => v >= 0.1 && v <= 0.2 ? "good" : v >= 0.05 && v <= 0.3 ? "watch" : "attention"
 }, {
   key: "savingsRatio",
   label: "Savings ratio",
   fmt: v => fmtPct(v),
   bench: "2026 target 28%",
-  what: "The share of your gross income you're actually keeping each month."
+  what: "The share of your gross income you're actually keeping each month.",
+  group: "wealth",
+  status: v => v >= 0.28 ? "good" : v >= 0.15 ? "watch" : "attention"
 }, {
   key: "debtToAsset",
   label: "Debt to asset ratio",
   fmt: v => fmtPct(v),
   bench: "< 40% healthy",
-  what: "How much of everything you own is financed by debt."
+  what: "How much of everything you own is financed by debt.",
+  group: "debt",
+  status: v => v < 0.4 ? "good" : v < 0.6 ? "watch" : "attention"
 }, {
   key: "debtServicing",
   label: "Debt servicing ratio (car)",
   fmt: v => fmtPct(v),
   bench: "MAS TDSR guideline < 60%",
-  what: "How much of your take-home pay goes to the car loan alone."
+  what: "How much of your take-home pay goes to the car loan alone.",
+  group: "debt",
+  status: v => v < 0.6 ? "good" : v < 0.7 ? "watch" : "attention"
 }, {
   key: "insPremiumLoad",
   label: "Insurance premium load",
   fmt: v => fmtPct(v),
   bench: "benchmark 3–5%",
-  what: "The share of your income spent on insurance premiums, endowments included."
+  what: "The share of your income spent on insurance premiums, endowments included.",
+  group: "debt",
+  status: v => v >= 0.03 && v <= 0.05 ? "good" : v >= 0.01 && v <= 0.08 ? "watch" : "attention"
 }, {
   key: "insPremiumLoadExclEnd",
   label: "Ins. load excl. endowments",
   fmt: v => fmtPct(v),
   bench: "benchmark 2–3%",
-  what: "Same, stripping out endowment/investment-linked premiums to isolate pure protection cost."
-}, {
-  key: "netInvestToNetWorth",
-  label: "Investments / net worth",
-  fmt: v => fmtPct(v),
-  bench: "grow over time",
-  what: "How much of your wealth is actively invested versus sitting in cash, property or CPF."
+  what: "Same, stripping out endowment/investment-linked premiums to isolate pure protection cost.",
+  group: "debt",
+  status: v => v >= 0.02 && v <= 0.03 ? "good" : v >= 0.01 && v <= 0.05 ? "watch" : "attention"
 }, {
   key: "coverageToIncome",
   label: "Coverage to income (ET)",
   fmt: fmtRatio,
   bench: "benchmark ≥ 10x",
-  what: "How many years of ET's income the death/TPD payout would replace."
+  what: "How many years of ET's income the death/TPD payout would replace.",
+  group: "debt",
+  status: v => v >= 10 ? "good" : v >= 5 ? "watch" : "attention"
+}];
+const RATIO_GROUPS = [{
+  key: "liquidity",
+  label: "Liquidity"
+}, {
+  key: "debt",
+  label: "Debt & coverage"
+}, {
+  key: "wealth",
+  label: "Wealth mix"
 }];
 const LABELS = {
   uob: "UOB One ETSY",
@@ -2107,7 +2138,12 @@ function App() {
         month: r.month.split(" ")[0],
         income: Math.round(d.totalIncome),
         expenses: Math.round(d.totalExpenses),
-        netWorth: d.hasBalances ? Math.round(d.netWorth) : null
+        netSavings: Math.round(d.totalIncome - d.totalExpenses),
+        netWorth: d.hasBalances ? Math.round(d.netWorth) : null,
+        liquidCash: d.hasBalances ? Math.round(d.totalLiquidCash) : null,
+        investments: d.hasBalances ? Math.round(d.totalInvestments) : null,
+        cpf: d.hasBalances ? Math.round(d.combinedCpf) : null,
+        propertyEquity: d.hasBalances ? Math.round(d.propertyEquity) : null
       };
     });
   }, [records, derivedByMonth]);
@@ -2530,15 +2566,53 @@ function App() {
   }, "Loading ledger\u2026");
   const current = derivedByMonth[selectedMonth];
   const currentRecord = records.find(r => r.month === selectedMonth);
-  const ytdRecords = records.slice(0, records.findIndex(r => r.month === selectedMonth) + 1);
-  const expenseRows = (() => {
+  const selectedIdx = records.findIndex(r => r.month === selectedMonth);
+  const ytdRecords = records.slice(0, selectedIdx + 1);
+  const trailingBaselineRecords = records.slice(Math.max(0, selectedIdx - 3), selectedIdx);
+  const expenseRowsFull = (() => {
     const source = expenseView === "ytd" ? ytdRecords : currentRecord ? [currentRecord] : [];
-    return categories.expense.filter(c => !c.archived).map(c => ({
-      ...c,
-      value: source.reduce((a, r) => a + catVal(r, c), 0)
-    })).filter(c => c.value > 0).sort((a, b) => b.value - a.value);
+    const monthCount = expenseView === "ytd" ? ytdRecords.length : 1;
+    return categories.expense.filter(c => !c.archived).map(c => {
+      const value = source.reduce((a, r) => a + catVal(r, c), 0);
+      const currentMonthlyAvg = value / monthCount;
+      const baselineMonthlyAvg = trailingBaselineRecords.length ? trailingBaselineRecords.reduce((a, r) => a + catVal(r, c), 0) / trailingBaselineRecords.length : null;
+      const variance = baselineMonthlyAvg !== null && baselineMonthlyAvg > 0 ? (currentMonthlyAvg - baselineMonthlyAvg) / baselineMonthlyAvg : null;
+      return {
+        ...c,
+        value,
+        baselineMonthlyAvg,
+        variance
+      };
+    }).filter(c => c.value > 0).sort((a, b) => b.value - a.value);
   })();
-  const expenseTotal = expenseRows.reduce((a, c) => a + c.value, 0);
+  const expenseTotal = expenseRowsFull.reduce((a, c) => a + c.value, 0);
+  const investmentsTrend = (() => {
+    const withBalances = trendData.filter(d => d.investments !== null);
+    if (withBalances.length < 2) return null;
+    const latest = withBalances[withBalances.length - 1];
+    const baseline = withBalances[Math.max(0, withBalances.length - 4)];
+    if (baseline.month === latest.month) return null;
+    return {
+      up: latest.investments > baseline.investments,
+      sinceMonth: baseline.month
+    };
+  })();
+  const expenseTopRows = expenseRowsFull.slice(0, 5);
+  const expenseOtherRows = expenseRowsFull.slice(5);
+  const expenseOtherRow = expenseOtherRows.length ? (() => {
+    const value = expenseOtherRows.reduce((a, c) => a + c.value, 0);
+    const baselineSum = expenseOtherRows.some(c => c.baselineMonthlyAvg === null) ? null : expenseOtherRows.reduce((a, c) => a + c.baselineMonthlyAvg, 0);
+    const monthCount = expenseView === "ytd" ? ytdRecords.length : 1;
+    const currentMonthlyAvg = value / monthCount;
+    const variance = baselineSum !== null && baselineSum > 0 ? (currentMonthlyAvg - baselineSum) / baselineSum : null;
+    return {
+      key: "__other",
+      label: `Other (${expenseOtherRows.length} categor${expenseOtherRows.length === 1 ? "y" : "ies"})`,
+      color: "#B9B6AC",
+      value,
+      variance
+    };
+  })() : null;
   const avgMonthlyExpenses = records.length ? records.reduce((a, r) => a + computeDerived(r, assumptions, accounts.property).totalExpenses, 0) / records.length : 0;
   return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -2625,7 +2699,79 @@ function App() {
       fontSize: 11.5
     },
     onClick: () => setShowBufferDetail(s => !s)
-  }, showBufferDetail ? "Hide" : "How is this calculated?"))), /*#__PURE__*/React.createElement("div", {
+  }, showBufferDetail ? "Hide" : "How is this calculated?"))), current && current.hasBalances && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+      gap: 10,
+      marginTop: 16
+    }
+  }, RATIO_GROUPS.map(g => /*#__PURE__*/React.createElement("div", {
+    key: g.key,
+    style: {
+      background: "#fff",
+      border: "1px solid var(--hair)",
+      borderRadius: 10,
+      padding: "10px 14px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      letterSpacing: "0.06em",
+      textTransform: "uppercase",
+      color: "var(--ink-3)",
+      fontWeight: 600,
+      marginBottom: 6
+    }
+  }, g.label), RATIO_META.filter(m => m.group === g.key).map(m => {
+    const value = current.ratios[m.key];
+    const status = m.status(value);
+    return /*#__PURE__*/React.createElement("div", {
+      key: m.key,
+      title: `${m.what} (${m.bench})`,
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        gap: 8,
+        padding: "3px 0"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        minWidth: 0
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        width: 7,
+        height: 7,
+        borderRadius: "50%",
+        background: RATIO_STATUS_COLORS[status],
+        flexShrink: 0,
+        display: "inline-block"
+      }
+    }), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 12,
+        color: "var(--ink-2)",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap"
+      }
+    }, m.label)), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: "var(--mono)",
+        fontSize: 12.5,
+        fontWeight: 600,
+        color: "var(--ink-1)",
+        whiteSpace: "nowrap"
+      }
+    }, m.fmt(value)));
+  })))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 4,
@@ -2805,7 +2951,7 @@ function App() {
       className: `tab-btn ${expenseView === "ytd" ? "active" : ""}`,
       onClick: () => setExpenseView("ytd")
     }, "Year to date"))
-  }, expenseRows.length === 0 ? /*#__PURE__*/React.createElement("div", {
+  }, expenseRowsFull.length === 0 ? /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: "var(--sans)",
       fontSize: 13,
@@ -2813,13 +2959,25 @@ function App() {
     }
   }, "No expenses logged yet.") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11.5,
+      color: "var(--ink-3)",
+      marginBottom: 8
+    }
+  }, "Top 5 categories, with variance vs. trailing 3-month average"), /*#__PURE__*/React.createElement("div", {
+    style: {
       background: "#fff",
       border: "1px solid var(--hair)",
       borderRadius: 10,
       overflow: "hidden"
     }
-  }, expenseRows.map((c, i) => {
+  }, [...expenseTopRows, ...(expenseOtherRow ? [expenseOtherRow] : [])].map((c, i) => {
     const pct = c.value / expenseTotal;
+    const hasVariance = c.variance !== null && c.variance !== undefined;
+    const varianceUp = hasVariance && c.variance > 0.005;
+    const varianceDown = hasVariance && c.variance < -0.005;
+    const varianceColor = varianceUp ? "var(--warn)" : varianceDown ? "#0F5D52" : "var(--ink-3)";
+    const varianceLabel = !hasVariance ? null : (varianceUp ? "▲ " : varianceDown ? "▼ " : "— ") + fmtPct(Math.abs(c.variance), 0);
     return /*#__PURE__*/React.createElement("div", {
       key: c.key,
       style: {
@@ -2865,7 +3023,14 @@ function App() {
         fontSize: 11.5,
         color: "var(--ink-3)"
       }
-    }, fmt(c.value / ytdRecords.length), "/mo avg"), /*#__PURE__*/React.createElement("span", {
+    }, fmt(c.value / ytdRecords.length), "/mo avg"), varianceLabel && /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 11.5,
+        fontWeight: 600,
+        color: varianceColor
+      }
+    }, varianceLabel), /*#__PURE__*/React.createElement("span", {
       style: {
         fontFamily: "var(--sans)",
         fontSize: 11.5,
@@ -2898,12 +3063,12 @@ function App() {
       color: "var(--ink-1)"
     }
   }, fmt(expenseTotal))))), /*#__PURE__*/React.createElement(Section, {
-    title: "Income vs. expenses",
-    eyebrow: "Monthly trend"
+    title: "Net savings",
+    eyebrow: "Income minus expenses, by month"
   }, /*#__PURE__*/React.createElement(ResponsiveContainer, {
     width: "100%",
-    height: 220
-  }, /*#__PURE__*/React.createElement(AreaChart, {
+    height: 200
+  }, /*#__PURE__*/React.createElement(BarChart, {
     data: trendData,
     margin: {
       left: -10,
@@ -2941,29 +3106,23 @@ function App() {
       borderRadius: 8,
       border: "1px solid #DEDFD6"
     }
-  }), /*#__PURE__*/React.createElement(Area, {
-    type: "monotone",
-    dataKey: "income",
-    stroke: "#0F5D52",
-    fill: "#0F5D52",
-    fillOpacity: 0.12,
-    strokeWidth: 2,
-    name: "Income"
-  }), /*#__PURE__*/React.createElement(Area, {
-    type: "monotone",
-    dataKey: "expenses",
-    stroke: "#A6402B",
-    fill: "#A6402B",
-    fillOpacity: 0.1,
-    strokeWidth: 2,
-    name: "Expenses"
-  })))), /*#__PURE__*/React.createElement(Section, {
-    title: "Net worth",
+  }), /*#__PURE__*/React.createElement(ReferenceLine, {
+    y: 0,
+    stroke: "var(--hair-strong)"
+  }), /*#__PURE__*/React.createElement(RBar, {
+    dataKey: "netSavings",
+    name: "Net savings",
+    radius: [3, 3, 3, 3]
+  }, trendData.map((d, i) => /*#__PURE__*/React.createElement(Cell, {
+    key: i,
+    fill: d.netSavings >= 0 ? "#0F5D52" : "#A6402B"
+  }))))))), /*#__PURE__*/React.createElement(Section, {
+    title: "Net worth composition",
     eyebrow: "Since Apr 2026 (first tracked balance sheet)"
   }, /*#__PURE__*/React.createElement(ResponsiveContainer, {
     width: "100%",
-    height: 200
-  }, /*#__PURE__*/React.createElement(LineChart, {
+    height: 220
+  }, /*#__PURE__*/React.createElement(AreaChart, {
     data: trendData.filter(d => d.netWorth !== null),
     margin: {
       left: -10,
@@ -2992,8 +3151,7 @@ function App() {
     axisLine: false,
     tickLine: false,
     width: 65,
-    tickFormatter: v => `$${(v / 1000).toFixed(0)}k`,
-    domain: ["dataMin - 5000", "dataMax + 5000"]
+    tickFormatter: v => `$${(v / 1000).toFixed(0)}k`
   }), /*#__PURE__*/React.createElement(Tooltip, {
     formatter: v => fmt(v),
     contentStyle: {
@@ -3002,64 +3160,85 @@ function App() {
       borderRadius: 8,
       border: "1px solid #DEDFD6"
     }
-  }), /*#__PURE__*/React.createElement(Line, {
+  }), /*#__PURE__*/React.createElement(Area, {
     type: "monotone",
-    dataKey: "netWorth",
+    dataKey: "propertyEquity",
+    stackId: "nw",
     stroke: "#35577A",
-    strokeWidth: 2.5,
-    dot: {
-      r: 3
-    },
-    name: "Net worth"
-  })))), current.hasBalances && /*#__PURE__*/React.createElement(Section, {
-    title: "Financial health ratios",
-    eyebrow: selectedMonth
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      background: "#fff",
-      border: "1px solid var(--hair)",
-      borderRadius: 10,
-      overflow: "hidden"
-    }
-  }, RATIO_META.map((m, i) => /*#__PURE__*/React.createElement("div", {
-    key: m.key,
+    fill: "#35577A",
+    fillOpacity: 0.75,
+    strokeWidth: 1,
+    name: "Property equity"
+  }), /*#__PURE__*/React.createElement(Area, {
+    type: "monotone",
+    dataKey: "cpf",
+    stackId: "nw",
+    stroke: "#7F77DD",
+    fill: "#7F77DD",
+    fillOpacity: 0.75,
+    strokeWidth: 1,
+    name: "CPF combined"
+  }), /*#__PURE__*/React.createElement(Area, {
+    type: "monotone",
+    dataKey: "investments",
+    stackId: "nw",
+    stroke: "#378ADD",
+    fill: "#378ADD",
+    fillOpacity: 0.75,
+    strokeWidth: 1,
+    name: "Investments"
+  }), /*#__PURE__*/React.createElement(Area, {
+    type: "monotone",
+    dataKey: "liquidCash",
+    stackId: "nw",
+    stroke: "#0F5D52",
+    fill: "#0F5D52",
+    fillOpacity: 0.75,
+    strokeWidth: 1,
+    name: "Liquid cash"
+  }))), current.hasBalances && current.netWorth != null && /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center",
-      padding: "10px 16px",
-      borderTop: i === 0 ? "none" : "1px solid var(--hair)",
-      gap: 12
+      flexWrap: "wrap",
+      gap: "10px 18px",
+      marginTop: 10
     }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  }, [["Liquid cash", "#0F5D52", current.totalLiquidCash], ["Investments", "#378ADD", current.totalInvestments], ["CPF combined", "#7F77DD", current.combinedCpf], ["Property equity", "#35577A", current.propertyEquity]].map(([label, color, value]) => /*#__PURE__*/React.createElement("div", {
+    key: label,
     style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 6,
       fontFamily: "var(--sans)",
-      fontSize: 13,
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      width: 8,
+      height: 8,
+      borderRadius: 2,
+      background: color,
+      display: "inline-block"
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "var(--ink-3)"
+    }
+  }, label), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: "var(--mono)",
+      fontWeight: 600,
       color: "var(--ink-1)"
     }
-  }, m.label), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 11.5,
-      color: "var(--ink-3)",
-      marginTop: 2
-    }
-  }, m.what), /*#__PURE__*/React.createElement("div", {
+  }, fmt(value, 0)), label === "Investments" && investmentsTrend && /*#__PURE__*/React.createElement("span", {
+    title: `vs. ${investmentsTrend.sinceMonth}`,
     style: {
       fontFamily: "var(--sans)",
       fontSize: 11,
-      color: "var(--ink-3)",
-      marginTop: 1
-    }
-  }, m.bench)), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--mono)",
-      fontSize: 14,
       fontWeight: 600,
-      color: "var(--ink-1)",
-      whiteSpace: "nowrap"
+      color: investmentsTrend.up ? "#0F5D52" : "#C88A2E"
     }
-  }, m.fmt(current.ratios[m.key]))))))), tab === "add" && draft && /*#__PURE__*/React.createElement("div", {
+  }, investmentsTrend.up ? "▲ growing" : "▼ flat/down"))))), tab === "add" && draft && /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 20
     }
