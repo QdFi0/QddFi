@@ -1603,7 +1603,9 @@ function CategorySettingsList({
       flexDirection: "column",
       gap: 10
     }
-  }, list.map(c => /*#__PURE__*/React.createElement("div", {
+  }, list.map(c => {
+    const isFixed = type === "income" ? c.key === "payrollEt" : CORE_EXPENSE_KEYS.includes(c.key);
+    return /*#__PURE__*/React.createElement("div", {
     key: c.key,
     style: {
       border: "1px solid var(--hair)",
@@ -1683,9 +1685,9 @@ function CategorySettingsList({
     onClick: () => onUpdate(c.key, {
       archived: !c.archived
     })
-  }, c.archived ? "Unarchive" : "Archive"), (type === "income" ? !c.protected : !c.core) && /*#__PURE__*/React.createElement(IconBtn, {
+  }, c.archived ? "Unarchive" : "Archive"), !isFixed && /*#__PURE__*/React.createElement(IconBtn, {
     onClick: () => onRemove(c.key)
-  }, "Delete"), (type === "income" ? c.protected : c.core) && /*#__PURE__*/React.createElement("span", {
+  }, "Delete"), isFixed && /*#__PURE__*/React.createElement("span", {
     style: {
       fontFamily: "var(--sans)",
       fontSize: 10.5,
@@ -1745,7 +1747,8 @@ function CategorySettingsList({
       border: "1px dashed var(--hair-strong)",
       width: 130
     }
-  })))));
+  })));
+  }));
 }
 function Card({
   children,
@@ -1877,10 +1880,11 @@ function App() {
   const [newBudgetCat, setNewBudgetCat] = useState("");
   const [newBudgetAmount, setNewBudgetAmount] = useState(0);
   const [newBudgetPeriod, setNewBudgetPeriod] = useState("monthly");
-  const [categories, setCategories] = useState({
+  const [categoriesRaw, setCategories] = useState({
     expense: seedExpenseCategories(),
     income: seedIncomeCategories()
   });
+  const categories = useMemo(() => reconcileCategories(categoriesRaw), [categoriesRaw]);
   const [newCatLabel, setNewCatLabel] = useState("");
   const [newCatGroup, setNewCatGroup] = useState("variable");
   const [incomeNewCatLabel, setIncomeNewCatLabel] = useState("");
