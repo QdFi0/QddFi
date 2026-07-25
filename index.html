@@ -195,6 +195,20 @@ const EXPENSE_CATS = [{
   color: "#791F1F"
 }];
 const catVal = (record, cat) => (record.expenses[cat.sub] || {})[cat.key] || 0;
+const normalizeBudget = b => {
+  if (!b) return {
+    amount: 0,
+    period: "monthly"
+  };
+  if (typeof b === "number") return {
+    amount: b,
+    period: "monthly"
+  };
+  return {
+    amount: Number(b.amount) || 0,
+    period: b.period === "annual" ? "annual" : "monthly"
+  };
+};
 const BLANK_BALANCES = {
   liquidCash: {
     uob: 0,
@@ -1379,6 +1393,9 @@ function App() {
   const [saveMsg, setSaveMsg] = useState("");
   const [showMonthlySchedule, setShowMonthlySchedule] = useState(false);
   const [syncError, setSyncError] = useState("");
+  const [newBudgetCat, setNewBudgetCat] = useState("");
+  const [newBudgetAmount, setNewBudgetAmount] = useState(0);
+  const [newBudgetPeriod, setNewBudgetPeriod] = useState("monthly");
 
   /* ─── Firestore load (replaces window.storage.get) ─── */
   useEffect(() => {
@@ -1629,11 +1646,24 @@ function App() {
       familyMembers: next
     });
   };
-  const updateBudget = (key, val) => {
+  const setBudgetEntry = (key, patch) => {
     const next = {
       ...budgets,
-      [key]: val
+      [key]: {
+        ...normalizeBudget(budgets[key]),
+        ...patch
+      }
     };
+    setBudgets(next);
+    persistAll({
+      budgets: next
+    });
+  };
+  const removeBudget = key => {
+    const next = {
+      ...budgets
+    };
+    delete next[key];
     setBudgets(next);
     persistAll({
       budgets: next
@@ -2470,79 +2500,205 @@ function App() {
       setDraft(null);
       setTab("dashboard");
     }
-  }, "Cancel"))), tab === "budgets" && /*#__PURE__*/React.createElement(Section, {
-    title: "Budgets and goals",
-    eyebrow: selectedMonth
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 12.5,
-      color: "var(--ink-3)",
-      marginBottom: 14
-    }
-  }, "Set a monthly budget per category. Bars turn amber near the limit and red once you\u2019re over, based on ", selectedMonth, " actuals."), /*#__PURE__*/React.createElement("div", {
-    style: {
-      background: "#fff",
-      border: "1px solid var(--hair)",
-      borderRadius: 10,
-      overflow: "hidden"
-    }
-  }, EXPENSE_CATS.map((c, i) => {
-    const actual = currentRecord ? catVal(currentRecord, c) : 0;
-    const budget = Number(budgets[c.key]) || 0;
-    const pct = budget > 0 ? actual / budget : 0;
-    const barColor = pct >= 1 ? "var(--warn)" : pct >= 0.8 ? "var(--amber)" : "var(--accent)";
-    return /*#__PURE__*/React.createElement("div", {
-      key: c.key,
-      style: {
-        padding: "12px 16px",
-        borderTop: i === 0 ? "none" : "1px solid var(--hair)"
-      }
+  }, "Cancel"))), tab === "budgets" && (() => {
+    const budgetedKeys = Object.keys(budgets);
+    const unbudgetedCats = EXPENSE_CATS.filter(c => !budgetedKeys.includes(c.key));
+    const statsFor = key => {
+      const cat = EXPENSE_CATS.find(c => c.key === key);
+      if (!cat) return null;
+      const last3 = records.slice(-3);
+      const avg3 = last3.length ? last3.reduce((a, r) => a + catVal(r, cat), 0) / last3.length : 0;
+      const monthActual = currentRecord ? catVal(currentRecord, cat) : 0;
+      const ytdActual = ytdRecords.reduce((a, r) => a + catVal(r, cat), 0);
+      const monthsElapsed = ytdRecords.length || 1;
+      const paceAnnual = ytdActual / monthsElapsed * 12;
+      return {
+        cat,
+        avg3,
+        monthActual,
+        ytdActual,
+        paceAnnual
+      };
+    };
+    const newCatStats = newBudgetCat ? statsFor(newBudgetCat) : null;
+    return /*#__PURE__*/React.createElement(Section, {
+      title: "Budgets and goals",
+      eyebrow: selectedMonth
     }, /*#__PURE__*/React.createElement("div", {
       style: {
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        marginBottom: 6,
-        gap: 10,
-        flexWrap: "wrap"
+        fontFamily: "var(--sans)",
+        fontSize: 12.5,
+        color: "var(--ink-3)",
+        marginBottom: 14
+      }
+    }, "Track a budget for as many or as few categories as you like \u2014 monthly or annual. Bars turn amber near the limit and red once you\u2019re over."), /*#__PURE__*/React.createElement(Card, {
+      style: {
+        marginBottom: 18
       }
     }, /*#__PURE__*/React.createElement("div", {
       style: {
         fontFamily: "var(--sans)",
+        fontWeight: 600,
         fontSize: 13,
-        color: "var(--ink-1)"
+        color: "var(--ink-1)",
+        marginBottom: 10
       }
-    }, c.label), /*#__PURE__*/React.createElement("div", {
+    }, "Add a budget"), unbudgetedCats.length === 0 ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 12.5,
+        color: "var(--ink-3)"
+      }
+    }, "Every tracked category already has a budget.") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gridTemplateColumns: "repeat(3, minmax(0,1fr))",
+        gap: 10,
+        alignItems: "end"
+      }
+    }, /*#__PURE__*/React.createElement("label", {
       style: {
         display: "flex",
-        gap: 8,
-        alignItems: "center"
-      }
-    }, /*#__PURE__*/React.createElement("span", {
-      style: {
-        fontFamily: "var(--mono)",
+        flexDirection: "column",
+        gap: 4,
+        fontFamily: "var(--sans)",
         fontSize: 12.5,
         color: "var(--ink-2)"
       }
-    }, fmt(actual), " /"), /*#__PURE__*/React.createElement("input", {
-      type: "number",
-      value: budgets[c.key] ?? "",
-      placeholder: "set budget",
-      onChange: e => updateBudget(c.key, e.target.value === "" ? 0 : parseFloat(e.target.value)),
+    }, "Category", /*#__PURE__*/React.createElement("select", {
+      value: newBudgetCat,
+      onChange: e => setNewBudgetCat(e.target.value)
+    }, /*#__PURE__*/React.createElement("option", {
+      value: ""
+    }, "Choose a category\u2026"), unbudgetedCats.map(c => /*#__PURE__*/React.createElement("option", {
+      key: c.key,
+      value: c.key
+    }, c.label)))), /*#__PURE__*/React.createElement(NumberField, {
+      label: "Budget amount",
+      value: newBudgetAmount,
+      onChange: setNewBudgetAmount
+    }), /*#__PURE__*/React.createElement(SelectField, {
+      label: "Period",
+      value: newBudgetPeriod === "annual" ? "Annual" : "Monthly",
+      onChange: v => setNewBudgetPeriod(v === "Annual" ? "annual" : "monthly"),
+      options: ["Monthly", "Annual"]
+    })), newCatStats && /*#__PURE__*/React.createElement("div", {
       style: {
-        width: 90,
-        fontFamily: "var(--mono)",
-        fontSize: 12.5,
-        padding: "4px 7px",
-        borderRadius: 6,
-        border: "1px solid var(--hair-strong)"
+        fontFamily: "var(--sans)",
+        fontSize: 11.5,
+        color: "var(--ink-3)",
+        marginTop: 8
       }
-    }))), budget > 0 && /*#__PURE__*/React.createElement(Bar, {
-      pct: pct,
-      color: barColor
-    }));
-  }))), tab === "contracts" && /*#__PURE__*/React.createElement(Section, {
+    }, "For reference: ", newCatStats.cat.label, " averaged ", fmt(newCatStats.avg3), "/mo over the last 3 months, and came to ", fmt(newCatStats.monthActual), " in ", selectedMonth, ". Use this to set a realistic target."), /*#__PURE__*/React.createElement("button", {
+      className: "btn-primary",
+      style: {
+        marginTop: 12
+      },
+      disabled: !newBudgetCat,
+      onClick: () => {
+        if (!newBudgetCat) return;
+        setBudgetEntry(newBudgetCat, {
+          amount: newBudgetAmount,
+          period: newBudgetPeriod
+        });
+        setNewBudgetCat("");
+        setNewBudgetAmount(0);
+        setNewBudgetPeriod("monthly");
+      }
+    }, "Add budget"))), budgetedKeys.length === 0 ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 13,
+        color: "var(--ink-3)"
+      }
+    }, "No budgets set yet. Add one above to start tracking.") : /*#__PURE__*/React.createElement("div", {
+      style: {
+        background: "#fff",
+        border: "1px solid var(--hair)",
+        borderRadius: 10,
+        overflow: "hidden"
+      }
+    }, budgetedKeys.map((key, i) => {
+      const entry = normalizeBudget(budgets[key]);
+      const s = statsFor(key);
+      if (!s) return null;
+      const isAnnual = entry.period === "annual";
+      const compareBasis = isAnnual ? s.paceAnnual : s.monthActual;
+      const pct = entry.amount > 0 ? compareBasis / entry.amount : 0;
+      const barColor = pct >= 1 ? "var(--warn)" : pct >= 0.8 ? "var(--amber)" : "var(--accent)";
+      return /*#__PURE__*/React.createElement("div", {
+        key: key,
+        style: {
+          padding: "12px 16px",
+          borderTop: i === 0 ? "none" : "1px solid var(--hair)"
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginBottom: 6,
+          gap: 10,
+          flexWrap: "wrap"
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 13,
+          color: "var(--ink-1)"
+        }
+      }, s.cat.label), /*#__PURE__*/React.createElement("div", {
+        style: {
+          display: "flex",
+          gap: 8,
+          alignItems: "center",
+          flexWrap: "wrap"
+        }
+      }, /*#__PURE__*/React.createElement("select", {
+        value: isAnnual ? "Annual" : "Monthly",
+        onChange: e => setBudgetEntry(key, {
+          period: e.target.value === "Annual" ? "annual" : "monthly"
+        }),
+        style: {
+          fontSize: 11.5,
+          padding: "3px 6px"
+        }
+      }, /*#__PURE__*/React.createElement("option", null, "Monthly"), /*#__PURE__*/React.createElement("option", null, "Annual")), /*#__PURE__*/React.createElement("input", {
+        type: "number",
+        value: entry.amount ?? "",
+        placeholder: "set budget",
+        onChange: e => setBudgetEntry(key, {
+          amount: e.target.value === "" ? 0 : parseFloat(e.target.value)
+        }),
+        style: {
+          width: 90,
+          fontFamily: "var(--mono)",
+          fontSize: 12.5,
+          padding: "4px 7px",
+          borderRadius: 6,
+          border: "1px solid var(--hair-strong)"
+        }
+      }), /*#__PURE__*/React.createElement(IconBtn, {
+        onClick: () => removeBudget(key)
+      }, "Remove"))), entry.amount > 0 && /*#__PURE__*/React.createElement(Bar, {
+        pct: pct,
+        color: barColor
+      }), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 11.5,
+          color: "var(--ink-3)",
+          marginTop: 6
+        }
+      }, isAnnual ? `${fmt(s.ytdActual)} spent YTD \u00B7 on pace for ${fmt(s.paceAnnual)} this year vs ${fmt(entry.amount)}/yr budget` : `${fmt(s.monthActual)} this month vs ${fmt(entry.amount)}/mo budget`), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 11,
+          color: "var(--ink-3)"
+        }
+      }, `3-mo avg ${fmt(s.avg3)}/mo for reference`));
+    })));
+  })(), tab === "contracts" && /*#__PURE__*/React.createElement(Section, {
     title: "Utility and contract renewals",
     eyebrow: "Contracts",
     right: /*#__PURE__*/React.createElement("button", {
