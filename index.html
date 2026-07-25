@@ -588,7 +588,7 @@ const INITIAL_RECORDS = [{
     }
   }
 }];
-function computeDerived(record, assumptions) {
+function computeDerived(record, assumptions, propertyAccounts) {
   const totalIncome = sum(record.income);
   const totalFixedNonFinancial = sum(record.expenses.fixedNonFinancial);
   const totalFixedFinancial = sum(record.expenses.fixedFinancial);
@@ -619,11 +619,29 @@ function computeDerived(record, assumptions) {
   const etCpfTotal = sum(b.cpfEt);
   const syCpfTotal = sum(b.cpfSy);
   const combinedCpf = etCpfTotal + syCpfTotal;
-  const totalLiabilities = b.property.hdbLoan + b.property.carLoan + b.property.creditCard;
-  const propertyEquity = b.property.hdbValue - b.property.hdbLoan;
-  const netWorth = totalLiquidCash + totalInvestments + combinedCpf + propertyEquity - b.property.carLoan - b.property.creditCard;
-  const totalAssets = totalLiquidCash + totalInvestments + combinedCpf + b.property.hdbValue;
-  const currentLiquidCashNetCC = totalLiquidCash - b.property.creditCard;
+  const propAccounts = propertyAccounts && propertyAccounts.length ? propertyAccounts : [{
+    key: "hdbValue",
+    type: "asset"
+  }, {
+    key: "hdbLoan",
+    type: "liability",
+    shortTermLiability: false
+  }, {
+    key: "carLoan",
+    type: "liability",
+    shortTermLiability: false
+  }, {
+    key: "creditCard",
+    type: "liability",
+    shortTermLiability: true
+  }];
+  const totalPropertyAssets = propAccounts.filter(a => a.type === "asset").reduce((s, a) => s + (Number((b.property || {})[a.key]) || 0), 0);
+  const totalLiabilities = propAccounts.filter(a => a.type === "liability").reduce((s, a) => s + (Number((b.property || {})[a.key]) || 0), 0);
+  const totalShortTermLiabilities = propAccounts.filter(a => a.type === "liability" && a.shortTermLiability).reduce((s, a) => s + (Number((b.property || {})[a.key]) || 0), 0);
+  const propertyEquity = totalPropertyAssets - totalLiabilities;
+  const netWorth = totalLiquidCash + totalInvestments + combinedCpf + propertyEquity;
+  const totalAssets = totalLiquidCash + totalInvestments + combinedCpf + totalPropertyAssets;
+  const currentLiquidCashNetCC = totalLiquidCash - totalShortTermLiabilities;
   const bufferProgress = currentLiquidCashNetCC / assumptions.emergencyBufferTarget;
   const bufferGap = Math.max(assumptions.emergencyBufferTarget - currentLiquidCashNetCC, 0);
   const ratios = {
@@ -758,18 +776,29 @@ const LABELS = {
   bigTicket: "Big ticket / one-off"
 };
 const CONTRACT_CATEGORIES = ["Telco / Mobile", "Broadband", "Utilities", "Insurance", "Subscriptions", "Other"];
+const CORE_EXPENSE_KEYS = ["housingUtilities", "transportation", "fnb", "groceries", "subscriptions", "insurance"];
+const EXPENSE_LABEL_OVERRIDES = {
+  housingUtilities: "Utilities",
+  transportation: "Transport",
+  fnb: "Food"
+};
+const CATEGORY_ICONS = ["🏠", "💡", "🚌", "🍔", "🛒", "📺", "🛡️", "💰", "📈", "✈️", "⚕️", "🎁", "🛍️", "⛳", "🧾", "🚗", "👶", "🐾", "📚", "☕", "🎮", "💼", "🏦", "📱", "❓"];
 const seedExpenseCategories = () => EXPENSE_CATS.map(c => ({
   key: c.key,
-  label: c.label,
+  label: EXPENSE_LABEL_OVERRIDES[c.key] || c.label,
   group: c.sub,
   color: c.color,
+  icon: "",
   subcats: [],
   archived: false,
-  core: true
+  core: CORE_EXPENSE_KEYS.includes(c.key)
 }));
-const seedIncomeCategories = () => Object.keys(BLANK_INCOME).map(k => ({
+const INCOME_COLORS = ["#0F5D52", "#378ADD", "#993C1D", "#7F77DD"];
+const seedIncomeCategories = () => Object.keys(BLANK_INCOME).map((k, i) => ({
   key: k,
   label: LABELS[k] || k,
+  color: INCOME_COLORS[i % INCOME_COLORS.length],
+  icon: "",
   subcats: [],
   archived: false,
   core: true,
@@ -786,6 +815,63 @@ const EXPENSE_GROUPS = [{
   key: "variable",
   label: "Variable expenses"
 }];
+const seedAccounts = () => ({
+  liquidCash: [{
+    key: "uob",
+    label: LABELS.uob
+  }, {
+    key: "dbsEtsy",
+    label: LABELS.dbsEtsy
+  }, {
+    key: "dbsEt",
+    label: LABELS.dbsEt
+  }, {
+    key: "syReserve",
+    label: LABELS.syReserve
+  }, {
+    key: "cash",
+    label: LABELS.cash
+  }],
+  investments: [{
+    key: "endowusEt",
+    label: LABELS.endowusEt
+  }, {
+    key: "endowusSy",
+    label: LABELS.endowusSy
+  }, {
+    key: "moomooEt",
+    label: LABELS.moomooEt
+  }, {
+    key: "moomooSy",
+    label: LABELS.moomooSy
+  }, {
+    key: "cdp",
+    label: LABELS.cdp
+  }, {
+    key: "other",
+    label: LABELS.other
+  }],
+  property: [{
+    key: "hdbValue",
+    label: LABELS.hdbValue,
+    type: "asset"
+  }, {
+    key: "hdbLoan",
+    label: LABELS.hdbLoan,
+    type: "liability",
+    shortTermLiability: false
+  }, {
+    key: "carLoan",
+    label: LABELS.carLoan,
+    type: "liability",
+    shortTermLiability: false
+  }, {
+    key: "creditCard",
+    label: LABELS.creditCard,
+    type: "liability",
+    shortTermLiability: true
+  }]
+});
 const INSURANCE_TYPES = ["Death/TPD", "CI/ECI", "Personal Accident", "Hospitalisation", "Endowment"];
 const FREQUENCIES = ["Monthly", "Quarterly", "Semi-Annual", "Annual"];
 const PAYMENT_METHODS = ["GIRO", "Credit card", "PayNow", "Cheque", "Other"];
@@ -1301,6 +1387,40 @@ function FieldGrid({
     onChange: val => onChange(k, val)
   }))));
 }
+function AccountFieldGrid({
+  title,
+  accounts,
+  obj,
+  onChange,
+  cols = 3
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      fontFamily: "var(--sans)",
+      fontWeight: 600,
+      color: "var(--ink-2)",
+      marginBottom: 8,
+      textTransform: "uppercase",
+      letterSpacing: "0.04em"
+    }
+  }, title), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: `repeat(${cols}, minmax(0,1fr))`,
+      gap: 10
+    }
+  }, accounts.map(a => /*#__PURE__*/React.createElement(NumberField, {
+    key: a.key,
+    label: a.label,
+    value: obj[a.key] || 0,
+    onChange: val => onChange(a.key, val)
+  }))));
+}
 function CategoryFieldGrid({
   title,
   cats,
@@ -1334,7 +1454,7 @@ function CategoryFieldGrid({
       const v = obj[c.key];
       return /*#__PURE__*/React.createElement(NumberField, {
         key: c.key,
-        label: c.label,
+        label: c.icon ? `${c.icon} ${c.label}` : c.label,
         value: v && typeof v === "object" ? sum(v) : v || 0,
         onChange: val => onChange(c.key, val)
       });
@@ -1356,7 +1476,7 @@ function CategoryFieldGrid({
         color: "var(--ink-2)",
         marginBottom: 6
       }
-    }, c.label, " \u2014 total ", fmt(sum(subVals))), /*#__PURE__*/React.createElement("div", {
+    }, c.icon ? `${c.icon} ${c.label}` : c.label, " \u2014 total ", fmt(sum(subVals))), /*#__PURE__*/React.createElement("div", {
       style: {
         display: "grid",
         gridTemplateColumns: "repeat(3, minmax(0,1fr))",
@@ -1372,6 +1492,75 @@ function CategoryFieldGrid({
       })
     }))));
   })));
+}
+function AccountSettingsList({
+  group,
+  list,
+  onUpdate,
+  onRemove
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 8
+    }
+  }, list.map(a => /*#__PURE__*/React.createElement("div", {
+    key: a.key,
+    style: {
+      display: "flex",
+      gap: 8,
+      alignItems: "center",
+      flexWrap: "wrap",
+      border: "1px solid var(--hair)",
+      borderRadius: 8,
+      padding: 8
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    value: a.label,
+    onChange: e => onUpdate(a.key, {
+      label: e.target.value
+    }),
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 13,
+      padding: "4px 7px",
+      borderRadius: 6,
+      border: "1px solid var(--hair-strong)",
+      flex: "1 1 160px"
+    }
+  }), group === "property" && /*#__PURE__*/React.createElement("select", {
+    value: a.type,
+    onChange: e => onUpdate(a.key, {
+      type: e.target.value
+    }),
+    style: {
+      fontSize: 11.5,
+      padding: "3px 6px"
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "asset"
+  }, "Asset"), /*#__PURE__*/React.createElement("option", {
+    value: "liability"
+  }, "Liability")), group === "property" && a.type === "liability" && /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 4,
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)"
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: !!a.shortTermLiability,
+    onChange: e => onUpdate(a.key, {
+      shortTermLiability: e.target.checked
+    })
+  }), "Short-term (counts against buffer)"), /*#__PURE__*/React.createElement(IconBtn, {
+    onClick: () => onRemove(a.key)
+  }, "Delete"))));
 }
 function CategorySettingsList({
   type,
@@ -1405,7 +1594,37 @@ function CategorySettingsList({
       flexWrap: "wrap",
       marginBottom: 8
     }
-  }, /*#__PURE__*/React.createElement("input", {
+  }, /*#__PURE__*/React.createElement("select", {
+    value: c.icon || "",
+    onChange: e => onUpdate(c.key, {
+      icon: e.target.value
+    }),
+    style: {
+      fontSize: 15,
+      padding: "3px 4px",
+      width: 46
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "\u2014"), CATEGORY_ICONS.map(ic => /*#__PURE__*/React.createElement("option", {
+    key: ic,
+    value: ic
+  }, ic))), /*#__PURE__*/React.createElement("input", {
+    type: "color",
+    value: c.color || "#5F5E5A",
+    onChange: e => onUpdate(c.key, {
+      color: e.target.value
+    }),
+    title: "Category colour",
+    style: {
+      width: 30,
+      height: 28,
+      padding: 0,
+      border: "1px solid var(--hair-strong)",
+      borderRadius: 6,
+      cursor: "pointer"
+    }
+  }), /*#__PURE__*/React.createElement("input", {
     type: "text",
     value: c.label,
     onChange: e => onUpdate(c.key, {
@@ -1641,6 +1860,9 @@ function App() {
   const [newCatGroup, setNewCatGroup] = useState("variable");
   const [incomeNewCatLabel, setIncomeNewCatLabel] = useState("");
   const [newSubLabel, setNewSubLabel] = useState({});
+  const [accounts, setAccounts] = useState(seedAccounts());
+  const [newAccountLabel, setNewAccountLabel] = useState({});
+  const [settingsView, setSettingsView] = useState("menu");
 
   /* ─── Firestore load (replaces window.storage.get) ─── */
   useEffect(() => {
@@ -1660,6 +1882,7 @@ function App() {
           setRecurring(p.recurring || []);
           setFamilyMembers(p.familyMembers || ["ET", "SY"]);
           if (p.categories) setCategories(p.categories);
+          if (p.accounts) setAccounts(p.accounts);
           if (p.housingLoan) setHousingLoan(p.housingLoan);
           if (p.carLoan) setCarLoan(p.carLoan);
           if (p.cpfSettings) setCpfSettings(p.cpfSettings);
@@ -1678,7 +1901,8 @@ function App() {
             categories: {
               expense: seedExpenseCategories(),
               income: seedIncomeCategories()
-            }
+            },
+            accounts: seedAccounts()
           });
         }
       } catch (err) {
@@ -1701,6 +1925,7 @@ function App() {
       recurring: patch.recurring ?? recurring,
       familyMembers: patch.familyMembers ?? familyMembers,
       categories: patch.categories ?? categories,
+      accounts: patch.accounts ?? accounts,
       housingLoan: patch.housingLoan ?? housingLoan,
       carLoan: patch.carLoan ?? carLoan,
       cpfSettings: patch.cpfSettings ?? cpfSettings,
@@ -1714,6 +1939,7 @@ function App() {
     if (patch.recurring) setRecurring(patch.recurring);
     if (patch.familyMembers) setFamilyMembers(patch.familyMembers);
     if (patch.categories) setCategories(patch.categories);
+    if (patch.accounts) setAccounts(patch.accounts);
     if (patch.housingLoan) setHousingLoan(patch.housingLoan);
     if (patch.carLoan) setCarLoan(patch.carLoan);
     if (patch.cpfSettings) setCpfSettings(patch.cpfSettings);
@@ -1730,10 +1956,10 @@ function App() {
     if (!records) return {};
     const map = {};
     records.forEach(r => {
-      map[r.month] = computeDerived(r, assumptions);
+      map[r.month] = computeDerived(r, assumptions, accounts.property);
     });
     return map;
-  }, [records, assumptions]);
+  }, [records, assumptions, accounts]);
   const trendData = useMemo(() => {
     if (!records) return [];
     return records.map(r => {
@@ -1755,6 +1981,16 @@ function App() {
   const startDraft = () => {
     const last = records[records.length - 1];
     const balances = JSON.parse(JSON.stringify(last.balances || BLANK_BALANCES));
+    const ensureAccountKeys = (obj, list) => {
+      const out = { ...obj };
+      list.forEach(a => {
+        if (out[a.key] === undefined) out[a.key] = 0;
+      });
+      return out;
+    };
+    balances.liquidCash = ensureAccountKeys(balances.liquidCash || {}, accounts.liquidCash);
+    balances.investments = ensureAccountKeys(balances.investments || {}, accounts.investments);
+    balances.property = ensureAccountKeys(balances.property || {}, accounts.property);
     if (pendingCpfBump) {
       balances.cpfEt.oa += pendingCpfBump.oaAmt;
       balances.cpfEt.sa += pendingCpfBump.saAmt;
@@ -1986,6 +2222,48 @@ function App() {
       subcats: (cat.subcats || []).filter(s => s.key !== subKey)
     });
   };
+  const addAccount = (group, label) => {
+    if (!label || !label.trim()) return;
+    const item = {
+      key: `acct_${uid()}`,
+      label: label.trim()
+    };
+    if (group === "property") {
+      item.type = "asset";
+      item.shortTermLiability = false;
+    }
+    const next = {
+      ...accounts,
+      [group]: [...accounts[group], item]
+    };
+    setAccounts(next);
+    persistAll({
+      accounts: next
+    });
+  };
+  const updateAccount = (group, key, patch) => {
+    const next = {
+      ...accounts,
+      [group]: accounts[group].map(a => a.key === key ? {
+        ...a,
+        ...patch
+      } : a)
+    };
+    setAccounts(next);
+    persistAll({
+      accounts: next
+    });
+  };
+  const removeAccount = (group, key) => {
+    const next = {
+      ...accounts,
+      [group]: accounts[group].filter(a => a.key !== key)
+    };
+    setAccounts(next);
+    persistAll({
+      accounts: next
+    });
+  };
   const addTaxAdhoc = () => persistAll({
     taxSettings: {
       ...taxSettings,
@@ -2057,7 +2335,7 @@ function App() {
     if (!records || records.length === 0) return [];
     const last3 = records.slice(-3);
     const avgIncome = last3.reduce((a, r) => a + r.income.payrollEt + r.income.piano + r.income.interestDividends, 0) / last3.length;
-    const avgExpense = last3.reduce((a, r) => a + computeDerived(r, assumptions).totalExpenses - (r.expenses.variable.bigTicket || 0), 0) / last3.length;
+    const avgExpense = last3.reduce((a, r) => a + computeDerived(r, assumptions, accounts.property).totalExpenses - (r.expenses.variable.bigTicket || 0), 0) / last3.length;
     const lastRec = records[records.length - 1];
     const lastDerived = derivedByMonth[lastRec.month];
     let cumNetWorth = lastDerived.hasBalances ? lastDerived.netWorth : 0;
@@ -2116,7 +2394,7 @@ function App() {
     })).filter(c => c.value > 0).sort((a, b) => b.value - a.value);
   })();
   const expenseTotal = expenseRows.reduce((a, c) => a + c.value, 0);
-  const avgMonthlyExpenses = records.length ? records.reduce((a, r) => a + computeDerived(r, assumptions).totalExpenses, 0) / records.length : 0;
+  const avgMonthlyExpenses = records.length ? records.reduce((a, r) => a + computeDerived(r, assumptions, accounts.property).totalExpenses, 0) / records.length : 0;
   return /*#__PURE__*/React.createElement("div", {
     style: {
       "--serif": "'Spectral', Georgia, serif",
@@ -2252,7 +2530,7 @@ function App() {
       color: "var(--ink-3)",
       marginBottom: 12
     }
-  }, "Progress = (liquid cash \u2212 credit card balance) \xF7 target. Credit card is subtracted because that money is already committed."), /*#__PURE__*/React.createElement("div", {
+  }, "Progress = (liquid cash \u2212 short-term liabilities) \xF7 target. Short-term liabilities (e.g. credit card) are subtracted because that money is already committed."), /*#__PURE__*/React.createElement("div", {
     style: {
       borderTop: "1px solid var(--hair-strong)"
     }
@@ -2260,8 +2538,8 @@ function App() {
     label: "Total liquid cash",
     value: fmt(current.totalLiquidCash, 2)
   }), /*#__PURE__*/React.createElement(Row, {
-    label: "Less: credit card balance",
-    value: "−" + fmt(currentRecord.balances.property.creditCard, 2).replace("$", "$"),
+    label: "Less: short-term liabilities",
+    value: "−" + fmt(accounts.property.filter(a => a.type === "liability" && a.shortTermLiability).reduce((s, a) => s + (Number((currentRecord.balances.property || {})[a.key]) || 0), 0), 2).replace("$", "$"),
     color: "var(--warn)"
   }), /*#__PURE__*/React.createElement(Row, {
     label: "Cash available for buffer",
@@ -2430,7 +2708,7 @@ function App() {
         fontSize: 13,
         color: "var(--ink-1)"
       }
-    }, c.label)), /*#__PURE__*/React.createElement("div", {
+    }, c.icon ? `${c.icon} ${c.label}` : c.label)), /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
         gap: 12,
@@ -2728,12 +3006,14 @@ function App() {
       color: "var(--ink-1)",
       marginBottom: 10
     }
-  }, "Balances"), /*#__PURE__*/React.createElement(FieldGrid, {
+  }, "Balances"), /*#__PURE__*/React.createElement(AccountFieldGrid, {
     title: "Liquid cash",
+    accounts: accounts.liquidCash,
     obj: draft.balances.liquidCash,
     onChange: (k, v) => updateDraftField("balances", "liquidCash", k, v)
-  }), /*#__PURE__*/React.createElement(FieldGrid, {
+  }), /*#__PURE__*/React.createElement(AccountFieldGrid, {
     title: "Investments",
+    accounts: accounts.investments,
     obj: draft.balances.investments,
     onChange: (k, v) => updateDraftField("balances", "investments", k, v)
   }), /*#__PURE__*/React.createElement(FieldGrid, {
@@ -2744,8 +3024,9 @@ function App() {
     title: "CPF \u2014 SY",
     obj: draft.balances.cpfSy,
     onChange: (k, v) => updateDraftField("balances", "cpfSy", k, v)
-  }), /*#__PURE__*/React.createElement(FieldGrid, {
+  }), /*#__PURE__*/React.createElement(AccountFieldGrid, {
     title: "Property and loans",
+    accounts: accounts.property,
     obj: draft.balances.property,
     onChange: (k, v) => updateDraftField("balances", "property", k, v)
   })), /*#__PURE__*/React.createElement(Card, {
@@ -2781,7 +3062,7 @@ function App() {
     obj: draft.expenses.variable,
     onChange: (k, v) => updateDraftField("expenses", "variable", k, v)
   })), (() => {
-    const preview = computeDerived(draft, assumptions);
+    const preview = computeDerived(draft, assumptions, accounts.property);
     return /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
@@ -2894,7 +3175,7 @@ function App() {
     }, "Choose a category\u2026"), unbudgetedCats.map(c => /*#__PURE__*/React.createElement("option", {
       key: c.key,
       value: c.key
-    }, c.label)))), /*#__PURE__*/React.createElement(NumberField, {
+    }, c.icon ? `${c.icon} ${c.label}` : c.label)))), /*#__PURE__*/React.createElement(NumberField, {
       label: "Budget amount",
       value: newBudgetAmount,
       onChange: setNewBudgetAmount
@@ -2968,7 +3249,7 @@ function App() {
           fontSize: 13,
           color: "var(--ink-1)"
         }
-      }, s.cat.label), /*#__PURE__*/React.createElement("div", {
+      }, s.cat.icon ? `${s.cat.icon} ${s.cat.label}` : s.cat.label), /*#__PURE__*/React.createElement("div", {
         style: {
           display: "flex",
           gap: 8,
@@ -4216,126 +4497,255 @@ function App() {
       borderBottom: "1px solid var(--hair)",
       color: "var(--ink-1)"
     }
-  }, get(derivedByMonth[r.month]))))))))), tab === "settings" && /*#__PURE__*/React.createElement(Section, {
-    title: "Settings",
-    eyebrow: "Categories"
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 12.5,
-      color: "var(--ink-3)",
-      marginBottom: 14
+  }, get(derivedByMonth[r.month]))))))))), tab === "settings" && (() => {
+    if (settingsView === "menu") {
+      return /*#__PURE__*/React.createElement(Section, {
+        title: "Settings"
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(220px,1fr))",
+          gap: 12
+        }
+      }, /*#__PURE__*/React.createElement("button", {
+        className: "btn-secondary",
+        style: {
+          textAlign: "left",
+          padding: 16
+        },
+        onClick: () => setSettingsView("categories")
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontWeight: 600,
+          fontSize: 14,
+          color: "var(--ink-1)",
+          marginBottom: 4
+        }
+      }, "Categories"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 12,
+          color: "var(--ink-3)"
+        }
+      }, "Income and expense categories, sub-categories, colours and icons.")), /*#__PURE__*/React.createElement("button", {
+        className: "btn-secondary",
+        style: {
+          textAlign: "left",
+          padding: 16
+        },
+        onClick: () => setSettingsView("accounts")
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontWeight: 600,
+          fontSize: 14,
+          color: "var(--ink-1)",
+          marginBottom: 4
+        }
+      }, "Accounts"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 12,
+          color: "var(--ink-3)"
+        }
+      }, "Liquid cash, investments, and property/loan accounts."))));
     }
-  }, "Rename, recategorise, archive, or add categories \u2014 and break any of them into sub-categories. Archiving hides a category from new entries and budgets without deleting past data. Built-in expense categories and Payroll can be renamed and archived but not deleted; every other income category can be deleted. Toggle whether an income category is CPF-linked \u2014 that feeds the reference figure on the CPF tab. Tax is always calculated off the payroll total, not its sub-categories."), /*#__PURE__*/React.createElement(Card, {
-    style: {
-      marginBottom: 16
+    if (settingsView === "categories") {
+      return /*#__PURE__*/React.createElement(Section, {
+        title: "Categories",
+        eyebrow: "Settings",
+        right: /*#__PURE__*/React.createElement(IconBtn, {
+          onClick: () => setSettingsView("menu")
+        }, "\u2190 Back to Settings")
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 12.5,
+          color: "var(--ink-3)",
+          marginBottom: 14
+        }
+      }, "Rename, recolour, re-icon, recategorise, archive, or add categories \u2014 and break any of them into sub-categories. Archiving hides a category from new entries and budgets without deleting past data. Utilities, Transport, Food, Groceries, Subscriptions and Insurance are the minimum fixed expense categories and Payroll is the fixed income category \u2014 they can be renamed but not deleted. Every other category can be deleted. Toggle whether an income category is CPF-linked \u2014 that feeds the reference figure on the CPF tab. Tax is always calculated off the payroll total, not its sub-categories."), /*#__PURE__*/React.createElement(Card, {
+        style: {
+          marginBottom: 16
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontWeight: 600,
+          fontSize: 13,
+          color: "var(--ink-1)",
+          marginBottom: 10
+        }
+      }, "Income categories"), /*#__PURE__*/React.createElement(CategorySettingsList, {
+        type: "income",
+        list: categories.income,
+        onUpdate: (key, patch) => updateCategory("income", key, patch),
+        onRemove: key => removeCategory("income", key),
+        onAddSub: (key, label) => addSubcat("income", key, label),
+        onRemoveSub: (key, subKey) => removeSubcat("income", key, subKey),
+        newSubLabel: newSubLabel,
+        setNewSubLabel: setNewSubLabel
+      }), /*#__PURE__*/React.createElement("div", {
+        style: {
+          display: "flex",
+          gap: 8,
+          alignItems: "center",
+          flexWrap: "wrap",
+          marginTop: 14,
+          paddingTop: 14,
+          borderTop: "1px solid var(--hair)"
+        }
+      }, /*#__PURE__*/React.createElement("input", {
+        type: "text",
+        placeholder: "New income source, e.g. Rental income",
+        value: incomeNewCatLabel,
+        onChange: e => setIncomeNewCatLabel(e.target.value),
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 13,
+          padding: "6px 9px",
+          borderRadius: 6,
+          border: "1px solid var(--hair-strong)",
+          flex: "1 1 220px"
+        }
+      }), /*#__PURE__*/React.createElement("button", {
+        className: "btn-primary",
+        disabled: !incomeNewCatLabel.trim(),
+        onClick: () => {
+          const cpfLinked = window.confirm("Should this income source be tied to CPF calculation? It will then show up as CPF-linked income on the CPF tab.\n\nOK = yes, tie to CPF. Cancel = no.");
+          addCategory("income", incomeNewCatLabel, cpfLinked);
+          setIncomeNewCatLabel("");
+        }
+      }, "Add category"))), /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontWeight: 600,
+          fontSize: 13,
+          color: "var(--ink-1)",
+          marginBottom: 10
+        }
+      }, "Expense categories"), /*#__PURE__*/React.createElement(CategorySettingsList, {
+        type: "expense",
+        list: categories.expense,
+        onUpdate: (key, patch) => updateCategory("expense", key, patch),
+        onRemove: key => removeCategory("expense", key),
+        onAddSub: (key, label) => addSubcat("expense", key, label),
+        onRemoveSub: (key, subKey) => removeSubcat("expense", key, subKey),
+        newSubLabel: newSubLabel,
+        setNewSubLabel: setNewSubLabel
+      }), /*#__PURE__*/React.createElement("div", {
+        style: {
+          display: "flex",
+          gap: 8,
+          alignItems: "center",
+          flexWrap: "wrap",
+          marginTop: 14,
+          paddingTop: 14,
+          borderTop: "1px solid var(--hair)"
+        }
+      }, /*#__PURE__*/React.createElement("input", {
+        type: "text",
+        placeholder: "New expense category, e.g. Golf",
+        value: newCatLabel,
+        onChange: e => setNewCatLabel(e.target.value),
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 13,
+          padding: "6px 9px",
+          borderRadius: 6,
+          border: "1px solid var(--hair-strong)",
+          flex: "1 1 220px"
+        }
+      }), /*#__PURE__*/React.createElement("select", {
+        value: newCatGroup,
+        onChange: e => setNewCatGroup(e.target.value),
+        style: {
+          fontSize: 12,
+          padding: "5px 8px"
+        }
+      }, EXPENSE_GROUPS.map(g => /*#__PURE__*/React.createElement("option", {
+        key: g.key,
+        value: g.key
+      }, g.label))), /*#__PURE__*/React.createElement("button", {
+        className: "btn-primary",
+        disabled: !newCatLabel.trim(),
+        onClick: () => {
+          addCategory("expense", newCatLabel, newCatGroup);
+          setNewCatLabel("");
+        }
+      }, "Add category"))));
     }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontWeight: 600,
-      fontSize: 13,
-      color: "var(--ink-1)",
-      marginBottom: 10
-    }
-  }, "Expense categories"), /*#__PURE__*/React.createElement(CategorySettingsList, {
-    type: "expense",
-    list: categories.expense,
-    onUpdate: (key, patch) => updateCategory("expense", key, patch),
-    onRemove: key => removeCategory("expense", key),
-    onAddSub: (key, label) => addSubcat("expense", key, label),
-    onRemoveSub: (key, subKey) => removeSubcat("expense", key, subKey),
-    newSubLabel: newSubLabel,
-    setNewSubLabel: setNewSubLabel
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 8,
-      alignItems: "center",
-      flexWrap: "wrap",
-      marginTop: 14,
-      paddingTop: 14,
-      borderTop: "1px solid var(--hair)"
-    }
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "text",
-    placeholder: "New expense category, e.g. Transport",
-    value: newCatLabel,
-    onChange: e => setNewCatLabel(e.target.value),
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 13,
-      padding: "6px 9px",
-      borderRadius: 6,
-      border: "1px solid var(--hair-strong)",
-      flex: "1 1 220px"
-    }
-  }), /*#__PURE__*/React.createElement("select", {
-    value: newCatGroup,
-    onChange: e => setNewCatGroup(e.target.value),
-    style: {
-      fontSize: 12,
-      padding: "5px 8px"
-    }
-  }, EXPENSE_GROUPS.map(g => /*#__PURE__*/React.createElement("option", {
-    key: g.key,
-    value: g.key
-  }, g.label))), /*#__PURE__*/React.createElement("button", {
-    className: "btn-primary",
-    disabled: !newCatLabel.trim(),
-    onClick: () => {
-      addCategory("expense", newCatLabel, newCatGroup);
-      setNewCatLabel("");
-    }
-  }, "Add category"))), /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontWeight: 600,
-      fontSize: 13,
-      color: "var(--ink-1)",
-      marginBottom: 10
-    }
-  }, "Income categories"), /*#__PURE__*/React.createElement(CategorySettingsList, {
-    type: "income",
-    list: categories.income,
-    onUpdate: (key, patch) => updateCategory("income", key, patch),
-    onRemove: key => removeCategory("income", key),
-    onAddSub: (key, label) => addSubcat("income", key, label),
-    onRemoveSub: (key, subKey) => removeSubcat("income", key, subKey),
-    newSubLabel: newSubLabel,
-    setNewSubLabel: setNewSubLabel
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 8,
-      alignItems: "center",
-      flexWrap: "wrap",
-      marginTop: 14,
-      paddingTop: 14,
-      borderTop: "1px solid var(--hair)"
-    }
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "text",
-    placeholder: "New income source, e.g. Rental income",
-    value: incomeNewCatLabel,
-    onChange: e => setIncomeNewCatLabel(e.target.value),
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 13,
-      padding: "6px 9px",
-      borderRadius: 6,
-      border: "1px solid var(--hair-strong)",
-      flex: "1 1 220px"
-    }
-  }), /*#__PURE__*/React.createElement("button", {
-    className: "btn-primary",
-    disabled: !incomeNewCatLabel.trim(),
-    onClick: () => {
-      const cpfLinked = window.confirm("Should this income source be tied to CPF calculation? It will then show up as CPF-linked income on the CPF tab.\n\nOK = yes, tie to CPF. Cancel = no.");
-      addCategory("income", incomeNewCatLabel, cpfLinked);
-      setIncomeNewCatLabel("");
-    }
-  }, "Add category")))), /*#__PURE__*/React.createElement("div", {
+    const accountGroups = [["liquidCash", "Liquid cash"], ["investments", "Investments"], ["property", "Property and loans"]];
+    return /*#__PURE__*/React.createElement(Section, {
+      title: "Accounts",
+      eyebrow: "Settings",
+      right: /*#__PURE__*/React.createElement(IconBtn, {
+        onClick: () => setSettingsView("menu")
+      }, "\u2190 Back to Settings")
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 12.5,
+        color: "var(--ink-3)",
+        marginBottom: 14
+      }
+    }, "Rename, add, or remove the accounts under Liquid cash, Investments, and Property and loans. For property accounts, mark whether each is an asset or a liability, and whether a liability is short-term (like a credit card) \u2014 short-term liabilities are subtracted from your emergency buffer. CPF sub-accounts (OA/SA/MA for ET and SY) are fixed to match CPF Board rules and can't be renamed or removed here."), accountGroups.map(([group, label]) => /*#__PURE__*/React.createElement(Card, {
+      key: group,
+      style: {
+        marginBottom: 16
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontWeight: 600,
+        fontSize: 13,
+        color: "var(--ink-1)",
+        marginBottom: 10
+      }
+    }, label), /*#__PURE__*/React.createElement(AccountSettingsList, {
+      group: group,
+      list: accounts[group],
+      onUpdate: (key, patch) => updateAccount(group, key, patch),
+      onRemove: key => removeAccount(group, key)
+    }), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 8,
+        alignItems: "center",
+        flexWrap: "wrap",
+        marginTop: 14,
+        paddingTop: 14,
+        borderTop: "1px solid var(--hair)"
+      }
+    }, /*#__PURE__*/React.createElement("input", {
+      type: "text",
+      placeholder: "New account name",
+      value: newAccountLabel[group] || "",
+      onChange: e => setNewAccountLabel({
+        ...newAccountLabel,
+        [group]: e.target.value
+      }),
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 13,
+        padding: "6px 9px",
+        borderRadius: 6,
+        border: "1px solid var(--hair-strong)",
+        flex: "1 1 220px"
+      }
+    }), /*#__PURE__*/React.createElement("button", {
+      className: "btn-primary",
+      disabled: !(newAccountLabel[group] || "").trim(),
+      onClick: () => {
+        addAccount(group, newAccountLabel[group]);
+        setNewAccountLabel({
+          ...newAccountLabel,
+          [group]: ""
+        });
+      }
+    }, "Add account")))));
+  })(), /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 34,
       fontFamily: "var(--sans)",
