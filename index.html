@@ -104,6 +104,19 @@ const fmtPct = (n, d = 1) => ((n || 0) * 100).toFixed(d) + "%";
 const fmtRatio = n => (n || 0).toFixed(2) + "x";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const sum = obj => Object.values(obj).reduce((a, b) => a + (b && typeof b === "object" ? sum(b) : Number(b) || 0), 0);
+const sumByOwner = (balancesObj, accountDefs) => {
+  const result = {
+    ET: 0,
+    SY: 0,
+    Joint: 0
+  };
+  (accountDefs || []).forEach(a => {
+    const v = Number((balancesObj || {})[a.key]) || 0;
+    const owner = a.owner || "Joint";
+    result[owner] = (result[owner] || 0) + v;
+  });
+  return result;
+};
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const daysUntil = iso => Math.ceil((new Date(iso) - new Date(todayISO())) / 86400000);
 const DASH = "—";
@@ -592,7 +605,7 @@ const INITIAL_RECORDS = [{
     }
   }
 }];
-function computeDerived(record, assumptions, propertyAccounts) {
+function computeDerived(record, assumptions, accounts) {
   const totalIncome = sum(record.income);
   const totalFixedNonFinancial = sum(record.expenses.fixedNonFinancial);
   const totalFixedFinancial = sum(record.expenses.fixedFinancial);
@@ -620,10 +633,12 @@ function computeDerived(record, assumptions, propertyAccounts) {
   const b = record.balances;
   const totalLiquidCash = sum(b.liquidCash);
   const totalInvestments = sum(b.investments);
+  const liquidCashByOwner = sumByOwner(b.liquidCash, accounts && accounts.liquidCash);
+  const investmentsByOwner = sumByOwner(b.investments, accounts && accounts.investments);
   const etCpfTotal = sum(b.cpfEt);
   const syCpfTotal = sum(b.cpfSy);
   const combinedCpf = etCpfTotal + syCpfTotal;
-  const propAccounts = propertyAccounts && propertyAccounts.length ? propertyAccounts : [{
+  const propAccounts = accounts && accounts.property && accounts.property.length ? accounts.property : [{
     key: "hdbValue",
     type: "asset"
   }, {
@@ -643,6 +658,20 @@ function computeDerived(record, assumptions, propertyAccounts) {
   const totalLiabilities = propAccounts.filter(a => a.type === "liability").reduce((s, a) => s + (Number((b.property || {})[a.key]) || 0), 0);
   const totalShortTermLiabilities = propAccounts.filter(a => a.type === "liability" && a.shortTermLiability).reduce((s, a) => s + (Number((b.property || {})[a.key]) || 0), 0);
   const propertyEquity = totalPropertyAssets - totalLiabilities;
+  const propertyEquityByOwner = (() => {
+    const result = {
+      ET: 0,
+      SY: 0,
+      Joint: 0
+    };
+    propAccounts.forEach(a => {
+      const v = Number((b.property || {})[a.key]) || 0;
+      const owner = a.owner || "Joint";
+      const signed = a.type === "liability" ? -v : v;
+      result[owner] = (result[owner] || 0) + signed;
+    });
+    return result;
+  })();
   const netWorth = totalLiquidCash + totalInvestments + combinedCpf + propertyEquity;
   const totalAssets = totalLiquidCash + totalInvestments + combinedCpf + totalPropertyAssets;
   const currentLiquidCashNetCC = totalLiquidCash - totalShortTermLiabilities;
@@ -664,11 +693,14 @@ function computeDerived(record, assumptions, propertyAccounts) {
     ...base,
     totalLiquidCash,
     totalInvestments,
+    liquidCashByOwner,
+    investmentsByOwner,
     etCpfTotal,
     syCpfTotal,
     combinedCpf,
     totalLiabilities,
     propertyEquity,
+    propertyEquityByOwner,
     netWorth,
     totalAssets,
     currentLiquidCashNetCC,
@@ -888,58 +920,73 @@ const EXPENSE_GROUPS = [{
 const seedAccounts = () => ({
   liquidCash: [{
     key: "uob",
-    label: LABELS.uob
+    label: LABELS.uob,
+    owner: "Joint"
   }, {
     key: "dbsEtsy",
-    label: LABELS.dbsEtsy
+    label: LABELS.dbsEtsy,
+    owner: "Joint"
   }, {
     key: "dbsEt",
-    label: LABELS.dbsEt
+    label: LABELS.dbsEt,
+    owner: "Joint"
   }, {
     key: "syReserve",
-    label: LABELS.syReserve
+    label: LABELS.syReserve,
+    owner: "Joint"
   }, {
     key: "cash",
-    label: LABELS.cash
+    label: LABELS.cash,
+    owner: "Joint"
   }],
   investments: [{
     key: "endowusEt",
-    label: LABELS.endowusEt
+    label: LABELS.endowusEt,
+    owner: "Joint"
   }, {
     key: "endowusSy",
-    label: LABELS.endowusSy
+    label: LABELS.endowusSy,
+    owner: "Joint"
   }, {
     key: "moomooEt",
-    label: LABELS.moomooEt
+    label: LABELS.moomooEt,
+    owner: "Joint"
   }, {
     key: "moomooSy",
-    label: LABELS.moomooSy
+    label: LABELS.moomooSy,
+    owner: "Joint"
   }, {
     key: "cdp",
-    label: LABELS.cdp
+    label: LABELS.cdp,
+    owner: "Joint"
   }, {
     key: "other",
-    label: LABELS.other
+    label: LABELS.other,
+    owner: "Joint"
   }],
   property: [{
     key: "hdbValue",
     label: LABELS.hdbValue,
-    type: "asset"
+    type: "asset",
+    owner: "Joint"
   }, {
     key: "hdbLoan",
     label: LABELS.hdbLoan,
     type: "liability",
-    shortTermLiability: false
+    shortTermLiability: false,
+    owner: "Joint"
   }, {
     key: "carLoan",
     label: LABELS.carLoan,
     type: "liability",
-    shortTermLiability: false
+    shortTermLiability: false,
+    owner: "Joint"
   }, {
     key: "creditCard",
     label: LABELS.creditCard,
     type: "liability",
-    shortTermLiability: true
+    shortTermLiability: true,
+    owner: "Joint"
   }]
 });
 const INSURANCE_TYPES = ["Death/TPD", "CI/ECI", "Personal Accident", "Hospitalisation", "Endowment"];
@@ -1646,7 +1693,25 @@ function AccountSettingsList({
       border: "1px solid var(--hair-strong)",
       flex: "1 1 160px"
     }
-  }), group === "property" && /*#__PURE__*/React.createElement("select", {
+  }), (group === "liquidCash" || group === "investments" || group === "property") && /*#__PURE__*/React.createElement("select", {
+    value: a.owner || "Joint",
+    onChange: e => onUpdate(a.key, {
+      owner: e.target.value
+    }),
+    style: {
+      fontSize: 11.5,
+      padding: "3px 6px",
+      fontFamily: "var(--sans)",
+      borderRadius: 6,
+      border: "1px solid var(--hair-strong)"
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "ET"
+  }, "ET"), /*#__PURE__*/React.createElement("option", {
+    value: "SY"
+  }, "SY"), /*#__PURE__*/React.createElement("option", {
+    value: "Joint"
+  }, "Joint")), group === "property" && /*#__PURE__*/React.createElement("select", {
     value: a.type,
     onChange: e => onUpdate(a.key, {
       type: e.target.value
@@ -2056,6 +2121,7 @@ function App() {
   const [showAssumptions, setShowAssumptions] = useState(false);
   const [showBufferDetail, setShowBufferDetail] = useState(false);
   const [ratioHint, setRatioHint] = useState(null);
+  const [ownerSplitOpen, setOwnerSplitOpen] = useState(null);
   const [draft, setDraft] = useState(null);
   const [saveMsg, setSaveMsg] = useState("");
   const [showMonthlySchedule, setShowMonthlySchedule] = useState(false);
@@ -2095,7 +2161,18 @@ function App() {
           setRecurring(p.recurring || []);
           setFamilyMembers(p.familyMembers || ["ET", "SY"]);
           if (p.categories) setCategories(reconcileCategories(p.categories));
-          if (p.accounts) setAccounts(p.accounts);
+          if (p.accounts) {
+            const withOwnerDefault = list => (list || []).map(a => ({
+              owner: "Joint",
+              ...a
+            }));
+            setAccounts({
+              ...p.accounts,
+              liquidCash: withOwnerDefault(p.accounts.liquidCash),
+              investments: withOwnerDefault(p.accounts.investments),
+              property: withOwnerDefault(p.accounts.property)
+            });
+          }
           if (p.dismissedHints) setDismissedHints(p.dismissedHints);
           if (p.housingLoan) setHousingLoan(p.housingLoan);
           if (p.carLoan) setCarLoan(p.carLoan);
@@ -2173,7 +2250,7 @@ function App() {
     if (!records) return {};
     const map = {};
     records.forEach(r => {
-      map[r.month] = computeDerived(r, assumptions, accounts.property);
+      map[r.month] = computeDerived(r, assumptions, accounts);
     });
     return map;
   }, [records, assumptions, accounts]);
@@ -2453,6 +2530,10 @@ function App() {
     if (group === "property") {
       item.type = "asset";
       item.shortTermLiability = false;
+      item.owner = "Joint";
+    }
+    if (group === "liquidCash" || group === "investments") {
+      item.owner = "Joint";
     }
     const next = {
       ...accounts,
@@ -2563,7 +2644,7 @@ function App() {
     if (!records || records.length === 0) return [];
     const last3 = records.slice(-3);
     const avgIncome = last3.reduce((a, r) => a + r.income.payrollEt + r.income.piano + r.income.interestDividends, 0) / last3.length;
-    const avgExpense = last3.reduce((a, r) => a + computeDerived(r, assumptions, accounts.property).totalExpenses - (r.expenses.variable.bigTicket || 0), 0) / last3.length;
+    const avgExpense = last3.reduce((a, r) => a + computeDerived(r, assumptions, accounts).totalExpenses - (r.expenses.variable.bigTicket || 0), 0) / last3.length;
     const lastRec = records[records.length - 1];
     const lastDerived = derivedByMonth[lastRec.month];
     let cumNetWorth = lastDerived.hasBalances ? lastDerived.netWorth : 0;
@@ -2660,7 +2741,7 @@ function App() {
       variance
     };
   })() : null;
-  const avgMonthlyExpenses = records.length ? records.reduce((a, r) => a + computeDerived(r, assumptions, accounts.property).totalExpenses, 0) / records.length : 0;
+  const avgMonthlyExpenses = records.length ? records.reduce((a, r) => a + computeDerived(r, assumptions, accounts).totalExpenses, 0) / records.length : 0;
   return /*#__PURE__*/React.createElement("div", {
     style: {
       "--serif": "'Spectral', Georgia, serif",
@@ -2744,13 +2825,7 @@ function App() {
     style: {
       flex: 1
     }
-  }), tab === "dashboard" && /*#__PURE__*/React.createElement("select", {
-    value: selectedMonth,
-    onChange: e => setSelectedMonth(e.target.value)
-  }, records.map(r => /*#__PURE__*/React.createElement("option", {
-    key: r.month,
-    value: r.month
-  }, r.month))), saveMsg && /*#__PURE__*/React.createElement("span", {
+  }), saveMsg && /*#__PURE__*/React.createElement("span", {
     style: {
       fontFamily: "var(--sans)",
       fontSize: 12.5,
@@ -2844,7 +2919,7 @@ function App() {
   }, trendData.map((d, i) => /*#__PURE__*/React.createElement(Cell, {
     key: i,
     fill: d.netSavings >= 0 ? "#0F5D52" : "#A6402B"
-  }))))))), /*#__PURE__*/React.createElement(Section, {
+  })))))), /*#__PURE__*/React.createElement(Section, {
     title: "Expense breakdown",
     eyebrow: expenseView === "ytd" ? `Year to date · Jan–${selectedMonth.split(" ")[0]}` : selectedMonth,
     right: /*#__PURE__*/React.createElement("div", {
@@ -3093,15 +3168,20 @@ function App() {
       gap: "10px 18px",
       marginTop: 10
     }
-  }, [["Liquid cash", "#0F5D52", current.totalLiquidCash], ["Investments", "#378ADD", current.totalInvestments], ["CPF combined", "#7F77DD", current.combinedCpf], ["Property equity", "#35577A", current.propertyEquity]].map(([label, color, value]) => /*#__PURE__*/React.createElement("div", {
+  }, [["Liquid cash", "#0F5D52", current.totalLiquidCash, current.liquidCashByOwner], ["Investments", "#378ADD", current.totalInvestments, current.investmentsByOwner], ["CPF combined", "#7F77DD", current.combinedCpf, {
+    ET: current.etCpfTotal,
+    SY: current.syCpfTotal
+  }], ["Property equity", "#35577A", current.propertyEquity, current.propertyEquityByOwner]].map(([label, color, value, splitData]) => /*#__PURE__*/React.createElement("div", {
     key: label,
     style: {
       display: "flex",
       alignItems: "center",
       gap: 6,
       fontFamily: "var(--sans)",
-      fontSize: 12
-    }
+      fontSize: 12,
+      cursor: splitData ? "pointer" : "default"
+    },
+    onClick: () => splitData && setOwnerSplitOpen(o => o === label ? null : label)
   }, /*#__PURE__*/React.createElement("span", {
     style: {
       width: 8,
@@ -3112,7 +3192,11 @@ function App() {
     }
   }), /*#__PURE__*/React.createElement("span", {
     style: {
-      color: "var(--ink-3)"
+      color: "var(--ink-3)",
+      textDecoration: splitData ? "underline" : "none",
+      textDecorationStyle: "dotted",
+      textDecorationColor: "var(--hair-strong)",
+      textUnderlineOffset: 3
     }
   }, label), /*#__PURE__*/React.createElement("span", {
     style: {
@@ -3128,7 +3212,46 @@ function App() {
       fontWeight: 600,
       color: investmentsTrend.up ? "#0F5D52" : "#C88A2E"
     }
-  }, investmentsTrend.up ? "▲ growing" : "▼ flat/down"))))), showBufferDetail && current.hasBalances && /*#__PURE__*/React.createElement(Card, {
+  }, investmentsTrend.up ? "▲ growing" : "▼ flat/down"))), ownerSplitOpen && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      display: "flex",
+      gap: 16,
+      flexWrap: "wrap",
+      background: "#F7F6F1",
+      border: "1px solid var(--hair)",
+      borderRadius: 8,
+      padding: "8px 14px"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)"
+    }
+  }, ownerSplitOpen, " split:"), Object.entries((() => {
+    if (ownerSplitOpen === "Liquid cash") return current.liquidCashByOwner;
+    if (ownerSplitOpen === "Investments") return current.investmentsByOwner;
+    if (ownerSplitOpen === "Property equity") return current.propertyEquityByOwner;
+    if (ownerSplitOpen === "CPF combined") return {
+      ET: current.etCpfTotal,
+      SY: current.syCpfTotal
+    };
+    return {};
+  })()).filter(([, v]) => v !== 0).map(([owner, v]) => /*#__PURE__*/React.createElement("span", {
+    key: owner,
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12,
+      color: "var(--ink-2)"
+    }
+  }, owner, ": ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: "var(--mono)",
+      fontWeight: 600,
+      color: "var(--ink-1)"
+    }
+  }, fmt(v, 0))))))), showBufferDetail && current.hasBalances && /*#__PURE__*/React.createElement(Card, {
     style: {
       marginTop: 18
     }
@@ -3388,7 +3511,7 @@ function App() {
       },
       onClick: () => setRatioHint(null)
     }, "Got it"));
-  })())), tab === "add" && draft && /*#__PURE__*/React.createElement("div", {
+  })()))), tab === "add" && draft && /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 20
     }
@@ -3536,7 +3659,7 @@ function App() {
     obj: draft.expenses.variable,
     onChange: (k, v) => updateDraftField("expenses", "variable", k, v)
   })), (() => {
-    const preview = computeDerived(draft, assumptions, accounts.property);
+    const preview = computeDerived(draft, assumptions, accounts);
     return /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
