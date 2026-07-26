@@ -2363,6 +2363,7 @@ function App() {
   const [settingsView, setSettingsView] = useState("menu");
   const [dismissedHints, setDismissedHints] = useState({});
   const [confirmRemoveContractId, setConfirmRemoveContractId] = useState(null);
+  const [confirmRemovePolicyId, setConfirmRemovePolicyId] = useState(null);
 
   /* ─── Firestore load (replaces window.storage.get) ─── */
   useEffect(() => {
@@ -2553,6 +2554,7 @@ function App() {
     id: uid(),
     name: "",
     provider: "",
+    contractNumber: "",
     category: (categories.expense.find(c => !c.archived) || {}).label || "",
     monthlyAmount: "",
     renewalDate: todayISO(),
@@ -2591,12 +2593,14 @@ function App() {
     type: INSURANCE_TYPES[0],
     insurer: "",
     product: "",
+    policyNumber: "",
     coverage: 0,
     annualPremium: 0,
     paymentFrequency: "Annual",
     nextPaymentDate: todayISO(),
     paymentMethod: "GIRO",
-    paymentAccount: ""
+    paymentAccount: "",
+    locked: false
   }]);
   const updatePolicy = (id, patch) => {
     const next = policies.map(p => p.id === id ? {
@@ -2606,6 +2610,13 @@ function App() {
     setPolicies(next);
     persistAll({
       policies: next
+    });
+  };
+  const togglePolicyLock = id => {
+    const target = policies.find(p => p.id === id);
+    if (!target) return;
+    updatePolicy(id, {
+      locked: !target.locked
     });
   };
   const removePolicy = id => {
@@ -2642,18 +2653,49 @@ function App() {
     });
   };
   const addFamilyMember = () => {
-    const name = prompt("Family member name (e.g. Child 1, Mum):");
-    if (name && !familyMembers.includes(name)) {
-      const next = [...familyMembers, name];
-      setFamilyMembers(next);
+    let name = "New member";
+    let n = 1;
+    while (familyMembers.includes(name)) {
+      n += 1;
+      name = `New member ${n}`;
+    }
+    const next = [...familyMembers, name];
+    setFamilyMembers(next);
+    persistAll({
+      familyMembers: next
+    });
+  };
+  const renameFamilyMember = (index, newName) => {
+    const oldName = familyMembers[index];
+    const next = familyMembers.map((f, i) => i === index ? newName : f);
+    setFamilyMembers(next);
+    const trimmed = (newName || "").trim();
+    if (trimmed && trimmed !== oldName) {
+      // Keep any policies already assigned to this person pointed at the
+      // renamed value, instead of leaving them referencing a name that no
+      // longer exists in the household member list.
+      const nextPolicies = policies.map(p => p.person === oldName ? {
+        ...p,
+        person: trimmed
+      } : p);
+      setPolicies(nextPolicies);
+      persistAll({
+        familyMembers: next,
+        policies: nextPolicies
+      });
+    } else {
       persistAll({
         familyMembers: next
       });
     }
   };
-  const removeFamilyMember = name => {
-    if (name === "ET" || name === "SY") return;
-    const next = familyMembers.filter(f => f !== name);
+  const removeFamilyMember = index => {
+    // Always keep at least one household member — the Insurance tab's
+    // Person field and coverage table both assume the list isn't empty.
+    if (familyMembers.length <= 1) return;
+    // Removing by position (not by name) avoids accidentally deleting the
+    // wrong entry — or both — if two members ever end up with the same name.
+    const next = familyMembers.filter((f, i) => i !== index);
     setFamilyMembers(next);
     persistAll({
       familyMembers: next
@@ -4135,7 +4177,7 @@ function App() {
       }, `3-mo avg ${fmt(s.avg3)}/mo for reference`));
     })));
   })(), tab === "contracts" && /*#__PURE__*/React.createElement(Section, {
-    title: "Utility and contract renewals",
+    title: "Contract tracker",
     eyebrow: "Contracts",
     right: /*#__PURE__*/React.createElement("button", {
       className: "btn-primary",
@@ -4229,6 +4271,15 @@ function App() {
       hintOnFocus: true,
       onChange: v => updateContract(c.id, {
         provider: v
+      })
+    }), /*#__PURE__*/React.createElement(TextField, {
+      label: "Contract number",
+      value: c.contractNumber || "",
+      disabled: locked,
+      hint: "Your account or contract reference number, if you have one.",
+      hintOnFocus: true,
+      onChange: v => updateContract(c.id, {
+        contractNumber: v
       })
     }), /*#__PURE__*/React.createElement(CategorySelectField, {
       label: "Category",
@@ -4336,41 +4387,48 @@ function App() {
   }, "Family members"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
+      flexDirection: "column",
       gap: 8,
-      flexWrap: "wrap",
-      alignItems: "center"
+      marginBottom: 10
     }
-  }, familyMembers.map(f => /*#__PURE__*/React.createElement("span", {
-    key: f,
+  }, familyMembers.map((f, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
     style: {
       display: "flex",
-      alignItems: "center",
-      gap: 6,
-      background: "var(--paper)",
-      border: "1px solid var(--hair-strong)",
-      borderRadius: 20,
-      padding: "4px 10px 4px 12px",
-      fontFamily: "var(--sans)",
-      fontSize: 12.5
+      gap: 8,
+      alignItems: "center"
     }
-  }, f, f !== "ET" && f !== "SY" && /*#__PURE__*/React.createElement("button", {
-    onClick: () => removeFamilyMember(f),
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    value: f,
+    onChange: e => renameFamilyMember(i, e.target.value),
     style: {
-      border: "none",
-      background: "none",
-      cursor: "pointer",
-      color: "var(--ink-3)",
-      fontSize: 13,
-      padding: 0
+      fontFamily: "var(--sans)",
+      fontSize: 13.5,
+      padding: "7px 9px",
+      borderRadius: 6,
+      border: "1px solid var(--hair-strong)",
+      background: "#fff",
+      color: "var(--ink-1)",
+      flex: "1 1 220px",
+      maxWidth: 260
     }
-  }, "\xD7"))), /*#__PURE__*/React.createElement("button", {
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "btn-secondary",
+    disabled: familyMembers.length <= 1,
+    onClick: () => removeFamilyMember(i),
+    style: {
+      padding: "5px 10px",
+      fontSize: 12
+    }
+  }, "Remove")))), /*#__PURE__*/React.createElement("button", {
     className: "btn-secondary",
     style: {
       padding: "5px 10px",
       fontSize: 12
     },
     onClick: addFamilyMember
-  }, "Add member"))), /*#__PURE__*/React.createElement("div", {
+  }, "Add member")), /*#__PURE__*/React.createElement("div", {
     style: {
       overflowX: "auto",
       marginBottom: 20
@@ -4453,92 +4511,140 @@ function App() {
       color: "var(--ink-3)",
       marginBottom: 10
     }
-  }, "Each policy premium feeds the Forecast tab automatically, spread by its payment frequency. No need to duplicate it in Recurring."), /*#__PURE__*/React.createElement("div", {
+  }, "Each policy premium feeds the Forecast automatically and appears as a tracked item in Recurring \u2014 no need to add it there yourself."), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
       gap: 10
     }
-  }, policies.map(p => /*#__PURE__*/React.createElement(Card, {
-    key: p.id
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "repeat(3, minmax(0,1fr))",
-      gap: 10,
-      marginBottom: 10
-    }
-  }, /*#__PURE__*/React.createElement(SelectField, {
-    label: "Person",
-    value: p.person,
-    onChange: v => updatePolicy(p.id, {
-      person: v
-    }),
-    options: familyMembers
-  }), /*#__PURE__*/React.createElement(SelectField, {
-    label: "Type",
-    value: p.type,
-    onChange: v => updatePolicy(p.id, {
-      type: v
-    }),
-    options: INSURANCE_TYPES
-  }), /*#__PURE__*/React.createElement(TextField, {
-    label: "Insurer",
-    value: p.insurer,
-    onChange: v => updatePolicy(p.id, {
-      insurer: v
-    })
-  }), /*#__PURE__*/React.createElement(TextField, {
-    label: "Product",
-    value: p.product,
-    onChange: v => updatePolicy(p.id, {
-      product: v
-    })
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Coverage / sum assured",
-    value: p.coverage,
-    onChange: v => updatePolicy(p.id, {
-      coverage: v
-    })
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Annual premium",
-    value: p.annualPremium,
-    onChange: v => updatePolicy(p.id, {
-      annualPremium: v
-    })
-  }), /*#__PURE__*/React.createElement(SelectField, {
-    label: "Payment frequency",
-    value: p.paymentFrequency,
-    onChange: v => updatePolicy(p.id, {
-      paymentFrequency: v
-    }),
-    options: FREQUENCIES
-  }), /*#__PURE__*/React.createElement(DateField, {
-    label: "Next payment date",
-    value: p.nextPaymentDate,
-    onChange: v => updatePolicy(p.id, {
-      nextPaymentDate: v
-    })
-  }), /*#__PURE__*/React.createElement(SelectField, {
-    label: "Payment method",
-    value: p.paymentMethod,
-    onChange: v => updatePolicy(p.id, {
-      paymentMethod: v
-    }),
-    options: PAYMENT_METHODS
-  }), /*#__PURE__*/React.createElement(TextField, {
-    label: "Paid from (account or card)",
-    value: p.paymentAccount,
-    onChange: v => updatePolicy(p.id, {
-      paymentAccount: v
-    })
-  })), /*#__PURE__*/React.createElement("div", {
-    style: {
-      textAlign: "right"
-    }
-  }, /*#__PURE__*/React.createElement(IconBtn, {
-    onClick: () => removePolicy(p.id)
-  }, "Remove")))))), tab === "recurring" && /*#__PURE__*/React.createElement(Section, {
+  }, policies.map(p => {
+    const locked = !!p.locked;
+    return /*#__PURE__*/React.createElement(Card, {
+      key: p.id
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "flex-end",
+        marginBottom: 8
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 10.5,
+        fontWeight: 700,
+        letterSpacing: "0.05em",
+        textTransform: "uppercase",
+        padding: "3px 8px",
+        borderRadius: 999,
+        background: locked ? "#E7F0EC" : "#FBF3E4",
+        color: locked ? "var(--accent)" : "var(--amber)"
+      }
+    }, locked ? "Saved" : "Draft \u2014 not yet saved")), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gridTemplateColumns: "repeat(3, minmax(0,1fr))",
+        gap: 10,
+        marginBottom: 10
+      }
+    }, /*#__PURE__*/React.createElement(SelectField, {
+      label: "Person",
+      value: p.person,
+      disabled: locked,
+      onChange: v => updatePolicy(p.id, {
+        person: v
+      }),
+      options: familyMembers
+    }), /*#__PURE__*/React.createElement(SelectField, {
+      label: "Type",
+      value: p.type,
+      disabled: locked,
+      onChange: v => updatePolicy(p.id, {
+        type: v
+      }),
+      options: INSURANCE_TYPES
+    }), /*#__PURE__*/React.createElement(TextField, {
+      label: "Insurer",
+      value: p.insurer,
+      disabled: locked,
+      onChange: v => updatePolicy(p.id, {
+        insurer: v
+      })
+    }), /*#__PURE__*/React.createElement(TextField, {
+      label: "Product",
+      value: p.product,
+      disabled: locked,
+      onChange: v => updatePolicy(p.id, {
+        product: v
+      })
+    }), /*#__PURE__*/React.createElement(TextField, {
+      label: "Policy number",
+      value: p.policyNumber || "",
+      disabled: locked,
+      onChange: v => updatePolicy(p.id, {
+        policyNumber: v
+      })
+    }), /*#__PURE__*/React.createElement(NumberField, {
+      label: "Coverage / sum assured",
+      value: p.coverage,
+      disabled: locked,
+      onChange: v => updatePolicy(p.id, {
+        coverage: v
+      })
+    }), /*#__PURE__*/React.createElement(NumberField, {
+      label: "Annual premium",
+      value: p.annualPremium,
+      disabled: locked,
+      onChange: v => updatePolicy(p.id, {
+        annualPremium: v
+      })
+    }), /*#__PURE__*/React.createElement(SelectField, {
+      label: "Payment frequency",
+      value: p.paymentFrequency,
+      disabled: locked,
+      onChange: v => updatePolicy(p.id, {
+        paymentFrequency: v
+      }),
+      options: FREQUENCIES
+    }), /*#__PURE__*/React.createElement(DateField, {
+      label: "Next payment date",
+      value: p.nextPaymentDate,
+      disabled: locked,
+      onChange: v => updatePolicy(p.id, {
+        nextPaymentDate: v
+      })
+    }), /*#__PURE__*/React.createElement(SelectField, {
+      label: "Payment method",
+      value: p.paymentMethod,
+      disabled: locked,
+      onChange: v => updatePolicy(p.id, {
+        paymentMethod: v
+      }),
+      options: PAYMENT_METHODS
+    }), /*#__PURE__*/React.createElement(TextField, {
+      label: "Paid from (account or card)",
+      value: p.paymentAccount,
+      disabled: locked,
+      onChange: v => updatePolicy(p.id, {
+        paymentAccount: v
+      })
+    })), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "flex-end",
+        gap: 8
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      className: locked ? "btn-secondary" : "btn-primary",
+      disabled: !locked && !(p.insurer || "").trim(),
+      onClick: () => togglePolicyLock(p.id),
+      style: {
+        padding: "5px 10px",
+        fontSize: 12
+      }
+    }, locked ? "Edit" : "Save"), /*#__PURE__*/React.createElement(IconBtn, {
+      onClick: () => setConfirmRemovePolicyId(p.id)
+    }, "Remove")));
+  }))), tab === "recurring" && /*#__PURE__*/React.createElement(Section, {
     title: "Recurring payments",
     eyebrow: "Planning register",
     right: /*#__PURE__*/React.createElement("button", {
@@ -4625,7 +4731,80 @@ function App() {
       fontSize: 11,
       color: "var(--ink-3)"
     }
-  }, "Synced from the Contracts tab \u2014 update amounts there and they'll flow into this register and the Forecast automatically.")), /*#__PURE__*/React.createElement("div", {
+  }, "Synced from the Contracts tab \u2014 update amounts there and they'll flow into this register and the Forecast automatically.")), policies.filter(p => Number(p.annualPremium) > 0).length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      letterSpacing: "0.06em",
+      textTransform: "uppercase",
+      color: "var(--ink-3)",
+      fontWeight: 600,
+      marginBottom: 8
+    }
+  }, "From insurance \u2014 tracked automatically"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 6,
+      marginBottom: 8
+    }
+  }, policies.filter(p => Number(p.annualPremium) > 0).map(p => /*#__PURE__*/React.createElement("div", {
+    key: p.id,
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      padding: "8px 12px",
+      background: "#FAF9F4",
+      border: "1px solid var(--hair)",
+      borderRadius: 8,
+      gap: 10,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 13,
+      fontWeight: 600,
+      color: "var(--ink-1)"
+    }
+  }, p.insurer || "Untitled policy"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)"
+    }
+  }, `${p.person} \u2014 ${p.type}`)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: "var(--mono)",
+      fontSize: 13,
+      fontWeight: 600,
+      color: "var(--ink-1)"
+    }
+  }, `${fmt(p.annualPremium)}/yr`), /*#__PURE__*/React.createElement("button", {
+    className: "btn-secondary",
+    style: {
+      padding: "4px 9px",
+      fontSize: 11
+    },
+    onClick: () => setTab("insurance")
+  }, "Edit in Insurance"))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)"
+    }
+  }, "Synced from the Insurance tab \u2014 update premiums there and they'll flow into this register and the Forecast automatically.")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -5761,6 +5940,15 @@ function App() {
     onConfirm: () => {
       removeContract(confirmRemoveContractId);
       setConfirmRemoveContractId(null);
+    }
+  }), confirmRemovePolicyId && /*#__PURE__*/React.createElement(ConfirmDialog, {
+    title: "Remove this policy?",
+    message: "Recurring payments and the Forecast will stop tracking this premium. This can't be undone.",
+    confirmLabel: "Remove policy",
+    onCancel: () => setConfirmRemovePolicyId(null),
+    onConfirm: () => {
+      removePolicy(confirmRemovePolicyId);
+      setConfirmRemovePolicyId(null);
     }
   }));
 }
