@@ -1582,7 +1582,7 @@ function CategorySelectField({
 }) {
   const [focused, setFocused] = useState(false);
   const showHint = hint && (hintOnFocus ? focused : true);
-  const cats = (categories || []).filter(c => !c.archived);
+  const cats = (categories || []).filter(c => !c.archived).slice().sort((a, b) => a.label.localeCompare(b.label));
   const known = new Set();
   cats.forEach(c => {
     known.add(c.label);
@@ -1612,7 +1612,7 @@ function CategorySelectField({
   }, !isKnownOrEmpty && /*#__PURE__*/React.createElement("option", {
     value: value
   }, value), cats.map(c => {
-    const subs = c.subcats || [];
+    const subs = (c.subcats || []).slice().sort((a, b) => a.label.localeCompare(b.label));
     if (subs.length === 0) {
       return /*#__PURE__*/React.createElement("option", {
         key: c.key,
@@ -2471,11 +2471,12 @@ function App() {
     name: "",
     provider: "",
     category: (categories.expense.find(c => !c.archived) || {}).label || "",
-    monthlyAmount: 0,
+    monthlyAmount: "",
     renewalDate: todayISO(),
     renewalFrequency: "Annual",
     notes: "",
-    locked: false
+    locked: false,
+    createdAt: new Date().toISOString()
   }]);
   const updateContract = (id, patch) => {
     const next = contracts.map(c => c.id === id ? {
@@ -4087,15 +4088,29 @@ function App() {
       year: "numeric"
     });
     const locked = !!c.locked;
+    const addedNice = c.createdAt ? new Date(c.createdAt).toLocaleDateString("en-SG", {
+      day: "numeric",
+      month: "short",
+      year: "numeric"
+    }) : null;
     return /*#__PURE__*/React.createElement(Card, {
       key: c.id
     }, /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
-        justifyContent: "flex-end",
-        marginBottom: 8
+        justifyContent: "space-between",
+        alignItems: "center",
+        marginBottom: 8,
+        gap: 8,
+        flexWrap: "wrap"
       }
     }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 11,
+        color: "var(--ink-3)"
+      }
+    }, addedNice ? `Added ${addedNice}` : ""), /*#__PURE__*/React.createElement("span", {
       style: {
         fontFamily: "var(--sans)",
         fontSize: 10.5,
