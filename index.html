@@ -123,15 +123,29 @@ const daysUntil = iso => Math.ceil((new Date(iso) - new Date(todayISO())) / 8640
 // Projects a stored renewal/anchor date forward by its cadence until it lands
 // on the next upcoming occurrence, so a lapsed date still shows a useful
 // "days until next payment" countdown instead of just "renewed X days ago".
+// Built entirely in UTC (matching todayISO's UTC-based day string) and always
+// rebuilt from the original year/month rather than repeatedly mutating a
+// running date, so month-end anchors (e.g. the 31st) clamp to the last valid
+// day of a shorter month instead of silently rolling into the next one.
 const nextOccurrence = (iso, frequency) => {
   const stepMonths = frequency === "Monthly" ? 1 : frequency === "Quarterly" ? 3 : frequency === "Semi-Annual" ? 6 : 12;
   const base = new Date(iso);
   if (isNaN(base.getTime())) return iso;
   const today = new Date(todayISO());
-  let d = new Date(base.getTime());
+  const originalDay = base.getUTCDate();
+  const startYear = base.getUTCFullYear();
+  const startMonth = base.getUTCMonth();
+  const build = monthsElapsed => {
+    const targetMonthIndex = startMonth + monthsElapsed;
+    const daysInTargetMonth = new Date(Date.UTC(startYear, targetMonthIndex + 1, 0)).getUTCDate();
+    return new Date(Date.UTC(startYear, targetMonthIndex, Math.min(originalDay, daysInTargetMonth)));
+  };
+  let steps = 0;
+  let d = build(0);
   let guard = 0;
-  while (d < today && guard < 1000) {
-    d.setMonth(d.getMonth() + stepMonths);
+  while (d < today && guard < 2000) {
+    steps += stepMonths;
+    d = build(steps);
     guard++;
   }
   return d.toISOString().slice(0, 10);
@@ -2162,6 +2176,74 @@ function IconBtn({
     }
   }, children);
 }
+// A small centred confirmation modal, used before destructive actions.
+// Clicking the dimmed backdrop cancels, same as the Cancel button.
+function ConfirmDialog({
+  title,
+  message,
+  confirmLabel = "Remove",
+  cancelLabel = "Cancel",
+  onConfirm,
+  onCancel
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "fixed",
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      background: "rgba(27,36,48,0.45)",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      zIndex: 1000,
+      padding: 20
+    },
+    onClick: onCancel
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#fff",
+      borderRadius: 12,
+      padding: 22,
+      maxWidth: 380,
+      width: "100%",
+      boxShadow: "0 12px 40px rgba(27,36,48,0.25)"
+    },
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--serif)",
+      fontSize: 17,
+      color: "var(--ink-1)",
+      marginBottom: 8
+    }
+  }, title), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 13,
+      color: "var(--ink-2)",
+      lineHeight: 1.5,
+      marginBottom: 18
+    }
+  }, message), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "flex-end",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn-secondary",
+    onClick: onCancel
+  }, cancelLabel), /*#__PURE__*/React.createElement("button", {
+    className: "btn-primary",
+    style: {
+      background: "var(--warn)",
+      borderColor: "var(--warn)"
+    },
+    onClick: onConfirm
+  }, confirmLabel))));
+}
 function Bar({
   pct,
   color
@@ -2280,6 +2362,7 @@ function App() {
   const [newAccountLabel, setNewAccountLabel] = useState({});
   const [settingsView, setSettingsView] = useState("menu");
   const [dismissedHints, setDismissedHints] = useState({});
+  const [confirmRemoveContractId, setConfirmRemoveContractId] = useState(null);
 
   /* ─── Firestore load (replaces window.storage.get) ─── */
   useEffect(() => {
@@ -4222,14 +4305,14 @@ function App() {
       }
     }, /*#__PURE__*/React.createElement("button", {
       className: locked ? "btn-secondary" : "btn-primary",
-      disabled: !locked && !c.name.trim(),
+      disabled: !locked && !(c.name || "").trim(),
       onClick: () => toggleContractLock(c.id),
       style: {
         padding: "5px 10px",
         fontSize: 12
       }
     }, locked ? "Edit" : "Save"), /*#__PURE__*/React.createElement(IconBtn, {
-      onClick: () => removeContract(c.id)
+      onClick: () => setConfirmRemoveContractId(c.id)
     }, "Remove"))));
   }))), tab === "insurance" && /*#__PURE__*/React.createElement(Section, {
     title: "Family coverage",
@@ -5670,7 +5753,16 @@ function App() {
       color: "var(--ink-3)",
       textAlign: "center"
     }
-  }, "Data is stored in your shared Firestore project, not shared with anyone outside it. Seeded from ET_SY_Balances_Tracker_Jun_2026.xlsx."));
+  }, "Data is stored in your shared Firestore project, not shared with anyone outside it. Seeded from ET_SY_Balances_Tracker_Jun_2026.xlsx."), confirmRemoveContractId && /*#__PURE__*/React.createElement(ConfirmDialog, {
+    title: "Remove this contract?",
+    message: "Recurring payments and the Forecast will stop tracking this expense. This can't be undone.",
+    confirmLabel: "Remove contract",
+    onCancel: () => setConfirmRemoveContractId(null),
+    onConfirm: () => {
+      removeContract(confirmRemoveContractId);
+      setConfirmRemoveContractId(null);
+    }
+  }));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
 </script>
