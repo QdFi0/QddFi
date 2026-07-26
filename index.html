@@ -12,6 +12,8 @@
 <!-- Recharts (needs PropTypes) -->
 <script src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
 <script src="https://unpkg.com/recharts@2.12.0/umd/Recharts.js"></script>
+<!-- SheetJS: real .xlsx export -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 
 <!-- Firebase v8 — the classic pure-UMD SDK. Deliberately NOT using v9+ "compat"
      builds: those ship with ES-module internals that can trip up plain
@@ -2292,6 +2294,635 @@ function Row({
 
 /* ───────────────────────── main app ───────────────────────── */
 
+
+/* ══════════════════════════════════════════════════════════════════
+   TRANSACTION LEDGER
+   Daily double-entry style ledger. Balances are DERIVED here:
+   balance = opening balance + Σ of every posted transaction.
+   Transactions live in their own Firestore subcollection (one doc
+   each) so ET and SY can both write concurrently without the
+   whole-document overwrite in persistAll clobbering each other.
+   ══════════════════════════════════════════════════════════════════ */
+
+const TXN_COL = LEDGER_DOC.collection("transactions");
+const rc = React.createElement;
+
+const ACCOUNT_GROUP_LABELS = {
+  liquidCash: "Liquid cash",
+  investments: "Investments",
+  cpfEt: "CPF — ET",
+  cpfSy: "CPF — SY",
+  property: "Property & loans"
+};
+
+// Flattens the grouped `accounts` state (plus the CPF sub-accounts, which
+// live only inside balances and have no entry in `accounts`) into one flat,
+// addressable list. Key format is "group.ref" so it maps straight back into
+// the existing record.balances shape.
+const buildRegistry = accounts => {
+  const out = [];
+  const push = (group, a, kind) => out.push({
+    key: `${group}.${a.key}`,
+    group,
+    ref: a.key,
+    label: a.label,
+    kind,
+    owner: a.owner || "Joint",
+    shortTermLiability: !!a.shortTermLiability
+  });
+  (accounts.liquidCash || []).forEach(a => push("liquidCash", a, "asset"));
+  (accounts.investments || []).forEach(a => push("investments", a, "asset"));
+  [["cpfEt", "ET"], ["cpfSy", "SY"]].forEach(([g, who]) =>
+    ["oa", "sa", "ma"].forEach(s => out.push({
+      key: `${g}.${s}`,
+      group: g,
+      ref: s,
+      label: `CPF ${who} — ${s.toUpperCase()}`,
+      kind: "asset",
+      owner: who,
+      shortTermLiability: false
+    }))
+  );
+  (accounts.property || []).forEach(a =>
+    push("property", a, a.type === "liability" ? "liability" : "asset")
+  );
+  return out;
+};
+
+const acctByKey = (registry, key) => registry.find(a => a.key === key);
+
+// dir: +1 = money flows INTO this account, -1 = money flows OUT of it.
+// For an asset, an inflow raises the stored number. For a liability the
+// stored number is the magnitude of what's owed, so an inflow (a card
+// payment, or a cashback credit) PAYS IT DOWN and lowers the number.
+const storedDelta = (kind, dir, amount) =>
+  (kind === "liability" ? -1 : 1) * dir * (Number(amount) || 0);
+
+const computeBalances = (registry, opening, txns) => {
+  const bal = {};
+  registry.forEach(a => { bal[a.key] = Number((opening || {})[a.key]) || 0; });
+  (txns || []).forEach(t => {
+    if (t.voided) return;
+    if (t.type === "adjustment") {
+      if (bal[t.account] !== undefined) bal[t.account] += Number(t.storedDelta) || 0;
+      return;
+    }
+    const amt = Number(t.amount) || 0;
+    const from = acctByKey(registry, t.account);
+    if (t.type === "expense" && from) bal[t.account] += storedDelta(from.kind, -1, amt);
+    if (t.type === "income" && from) bal[t.account] += storedDelta(from.kind, +1, amt);
+    if (t.type === "transfer") {
+      const to = acctByKey(registry, t.toAccount);
+      if (from) bal[t.account] += storedDelta(from.kind, -1, amt);
+      if (to) bal[t.toAccount] += storedDelta(to.kind, +1, amt);
+    }
+  });
+  return bal;
+};
+
+// Seeds opening balances from an existing monthly record, so the historical
+// snapshots you already have become the ledger's starting position.
+const openingFromRecord = (record, registry) => {
+  const out = {};
+  registry.forEach(a => {
+    const grp = ((record || {}).balances || {})[a.group] || {};
+    out[a.key] = Number(grp[a.ref]) || 0;
+  });
+  return out;
+};
+
+const MONTH_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const isoToMonthLabel = iso => {
+  const [y, m] = (iso || "").split("-");
+  return m ? `${MONTH_ABBR[parseInt(m, 10) - 1]} ${y}` : "";
+};
+const isoToDayLabel = iso => {
+  const d = new Date(iso + "T00:00:00Z");
+  if (isNaN(d.getTime())) return iso;
+  const wd = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getUTCDay()];
+  return `${wd}, ${d.getUTCDate()} ${MONTH_ABBR[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+};
+const startOfMonthISO = () => todayISO().slice(0, 8) + "01";
+const monthsAgoISO = n => {
+  const d = new Date(todayISO() + "T00:00:00Z");
+  d.setUTCMonth(d.getUTCMonth() - n);
+  return d.toISOString().slice(0, 10);
+};
+
+const downloadBlob = (content, filename, mime) => {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+const EXPORT_HEADERS = ["Date","Type","Amount","Account","To account","Category","Sub-category","Who","Payee","Note"];
+
+const txnToRow = (t, registry, catLookup) => {
+  const from = acctByKey(registry, t.account);
+  const to = acctByKey(registry, t.toAccount);
+  const c = catLookup(t.category, t.subcat);
+  return [
+    t.date || "",
+    t.type === "adjustment" ? "Balance adjustment" : (t.type || ""),
+    t.type === "adjustment" ? (Number(t.storedDelta) || 0) : (Number(t.amount) || 0),
+    from ? from.label : (t.account || ""),
+    to ? to.label : "",
+    c.cat,
+    c.sub,
+    t.who || "",
+    t.payee || "",
+    t.note || ""
+  ];
+};
+
+const exportCsv = (rows, filename) => {
+  const esc = v => {
+    const s = String(v == null ? "" : v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const csv = [EXPORT_HEADERS, ...rows].map(r => r.map(esc).join(",")).join("\r\n");
+  downloadBlob("\uFEFF" + csv, filename + ".csv", "text/csv;charset=utf-8;");
+};
+
+const exportXlsx = (rows, filename) => {
+  if (typeof XLSX === "undefined") {
+    alert("Excel export library didn't load — using CSV instead (opens fine in Excel).");
+    exportCsv(rows, filename);
+    return;
+  }
+  const ws = XLSX.utils.aoa_to_sheet([EXPORT_HEADERS, ...rows]);
+  ws["!cols"] = [{wch:11},{wch:18},{wch:12},{wch:22},{wch:22},{wch:20},{wch:18},{wch:7},{wch:18},{wch:28}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Transactions");
+  XLSX.writeFile(wb, filename + ".xlsx");
+};
+
+/* ───────────── small shared inputs ───────────── */
+
+function LedgerLabel({ children }) {
+  return rc("div", {
+    style: {
+      fontFamily: "var(--sans)", fontSize: 11, fontWeight: 600,
+      color: "var(--ink-3)", textTransform: "uppercase",
+      letterSpacing: "0.05em", marginBottom: 4
+    }
+  }, children);
+}
+
+const inputStyle = {
+  fontFamily: "var(--sans)", fontSize: 13, padding: "7px 9px",
+  borderRadius: 6, border: "1px solid var(--hair-strong)",
+  background: "#fff", color: "var(--ink-1)", width: "100%"
+};
+
+function AccountSelect({ registry, value, onChange, placeholder }) {
+  const groups = ["liquidCash", "investments", "cpfEt", "cpfSy", "property"];
+  return rc("select", { value: value || "", onChange: e => onChange(e.target.value), style: inputStyle },
+    rc("option", { value: "" }, placeholder || "Select account…"),
+    groups.map(g => {
+      const items = registry.filter(a => a.group === g);
+      if (!items.length) return null;
+      return rc("optgroup", { key: g, label: ACCOUNT_GROUP_LABELS[g] },
+        items.map(a => rc("option", { key: a.key, value: a.key },
+          a.label + (a.kind === "liability" ? " (liability)" : ""))));
+    })
+  );
+}
+
+function LedgerCategorySelect({ cats, value, subValue, onChange }) {
+  const active = (cats || []).filter(c => !c.archived);
+  const cur = active.find(c => c.key === value);
+  const subs = (cur && cur.subcats) || [];
+  return rc("div", { style: { display: "flex", gap: 6 } },
+    rc("select", {
+      value: value || "",
+      onChange: e => onChange(e.target.value, ""),
+      style: { ...inputStyle, flex: subs.length ? "1 1 55%" : "1 1 100%" }
+    },
+      rc("option", { value: "" }, "Category…"),
+      active.map(c => rc("option", { key: c.key, value: c.key }, (c.icon ? c.icon + " " : "") + c.label))
+    ),
+    subs.length > 0 && rc("select", {
+      value: subValue || "",
+      onChange: e => onChange(value, e.target.value),
+      style: { ...inputStyle, flex: "1 1 45%" }
+    },
+      rc("option", { value: "" }, "— all —"),
+      subs.map(s => rc("option", { key: s.key, value: s.key }, s.label))
+    )
+  );
+}
+
+/* ───────────── reconcile dialog ───────────── */
+
+function ReconcileDialog({ account, computed, onCancel, onConfirm }) {
+  const [actual, setActual] = useState(computed);
+  const [note, setNote] = useState("");
+  const [date, setDate] = useState(todayISO());
+  const diff = (Number(actual) || 0) - computed;
+  return rc("div", {
+    onClick: onCancel,
+    style: {
+      position: "fixed", inset: 0, background: "rgba(27,36,48,0.45)",
+      display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1200
+    }
+  }, rc("div", {
+    onClick: e => e.stopPropagation(),
+    style: { background: "#fff", borderRadius: 10, padding: 22, width: 420, maxWidth: "92vw" }
+  },
+    rc("div", { style: { fontFamily: "var(--serif)", fontSize: 19, color: "var(--ink-1)", marginBottom: 4 } },
+      "Adjust balance"),
+    rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 16 } },
+      account.label),
+    rc("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 } },
+      rc("div", null,
+        rc(LedgerLabel, null, "Ledger says"),
+        rc("div", { style: { fontFamily: "var(--mono)", fontSize: 15, color: "var(--ink-2)", padding: "7px 0" } },
+          fmt(computed, 2))
+      ),
+      rc("div", null,
+        rc(LedgerLabel, null, "Actual balance"),
+        rc("input", {
+          type: "number", step: "0.01", value: actual,
+          onFocus: e => e.target.select(),
+          onChange: e => setActual(e.target.value === "" ? 0 : parseFloat(e.target.value)),
+          style: { ...inputStyle, fontFamily: "var(--mono)" }
+        })
+      )
+    ),
+    rc("div", { style: { marginBottom: 12 } },
+      rc(LedgerLabel, null, "Date of adjustment"),
+      rc("input", { type: "date", value: date, onChange: e => setDate(e.target.value), style: inputStyle })
+    ),
+    rc("div", { style: { marginBottom: 16 } },
+      rc(LedgerLabel, null, "Reason (optional)"),
+      rc("input", {
+        type: "text", value: note, placeholder: "e.g. bank interest, missed entry",
+        onChange: e => setNote(e.target.value), style: inputStyle
+      })
+    ),
+    rc("div", {
+      style: {
+        background: Math.abs(diff) < 0.005 ? "#F3F2EE" : "#FBF3E6",
+        border: "1px solid var(--hair)", borderRadius: 8, padding: 12, marginBottom: 16,
+        fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)"
+      }
+    }, Math.abs(diff) < 0.005
+      ? "No difference — nothing will be recorded."
+      : `A ${diff > 0 ? "increase" : "decrease"} of ${fmt(Math.abs(diff), 2)} will be written to the ledger as a balance adjustment entry.`),
+    rc("div", { style: { display: "flex", gap: 8, justifyContent: "flex-end" } },
+      rc("button", { className: "btn-secondary", onClick: onCancel }, "Cancel"),
+      rc("button", {
+        className: "btn-primary",
+        disabled: Math.abs(diff) < 0.005,
+        onClick: () => onConfirm({ storedDelta: diff, note, date })
+      }, "Record adjustment")
+    )
+  ));
+}
+
+/* ───────────── main tab ───────────── */
+
+function TransactionsTab({
+  registry, balances, txns, categories, familyMembers,
+  onSave, onDelete, onReconcile, opening, onSetOpening,
+  latestRecord, onRollup, txnError
+}) {
+  const blank = {
+    id: null, date: todayISO(), type: "expense", amount: "",
+    account: "", toAccount: "", category: "", subcat: "",
+    payee: "", note: "", who: (familyMembers || ["ET"])[0] || "ET"
+  };
+  const [form, setForm] = useState(blank);
+  const [from, setFrom] = useState(monthsAgoISO(1));
+  const [to, setTo] = useState(todayISO());
+  const [filterAccount, setFilterAccount] = useState("");
+  const [search, setSearch] = useState("");
+  const [reconciling, setReconciling] = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [showAccounts, setShowAccounts] = useState(true);
+
+  const set = patch => setForm(f => ({ ...f, ...patch }));
+  const isTransfer = form.type === "transfer";
+  const catList = form.type === "income" ? categories.income : categories.expense;
+
+  const catLookup = (catKey, subKey) => {
+    const all = [...(categories.income || []), ...(categories.expense || [])];
+    const c = all.find(x => x.key === catKey);
+    if (!c) return { cat: catKey === "balanceAdjustment" ? "Balance adjustment" : (catKey || ""), sub: "" };
+    const s = (c.subcats || []).find(x => x.key === subKey);
+    return { cat: c.label, sub: s ? s.label : "" };
+  };
+
+  const canSave = form.amount !== "" && Number(form.amount) > 0 && form.account &&
+    (isTransfer ? form.toAccount && form.toAccount !== form.account : !!form.category);
+
+  const submit = () => {
+    if (!canSave) return;
+    onSave({
+      id: form.id || uid(),
+      date: form.date,
+      type: form.type,
+      amount: Math.abs(Number(form.amount)) || 0,
+      account: form.account,
+      toAccount: isTransfer ? form.toAccount : null,
+      category: isTransfer ? null : form.category,
+      subcat: isTransfer ? null : (form.subcat || null),
+      payee: form.payee || "",
+      note: form.note || "",
+      who: form.who || "",
+      createdAt: new Date().toISOString()
+    });
+    setForm({ ...blank, date: form.date, type: form.type, account: form.account, who: form.who });
+  };
+
+  const inRange = (txns || []).filter(t => {
+    if (t.date < from || t.date > to) return false;
+    if (filterAccount && t.account !== filterAccount && t.toAccount !== filterAccount) return false;
+    if (search) {
+      const c = catLookup(t.category, t.subcat);
+      const hay = `${t.payee} ${t.note} ${c.cat} ${c.sub}`.toLowerCase();
+      if (!hay.includes(search.toLowerCase())) return false;
+    }
+    return true;
+  }).sort((a, b) => b.date.localeCompare(a.date) || (b.createdAt || "").localeCompare(a.createdAt || ""));
+
+  const totals = inRange.reduce((acc, t) => {
+    if (t.type === "income") acc.income += Number(t.amount) || 0;
+    if (t.type === "expense") acc.expense += Number(t.amount) || 0;
+    if (t.type === "adjustment") acc.adjust += Number(t.storedDelta) || 0;
+    return acc;
+  }, { income: 0, expense: 0, adjust: 0 });
+
+  const byDay = [];
+  inRange.forEach(t => {
+    const last = byDay[byDay.length - 1];
+    if (last && last.date === t.date) last.items.push(t);
+    else byDay.push({ date: t.date, items: [t] });
+  });
+
+  const rows = () => inRange.map(t => txnToRow(t, registry, catLookup));
+  const fname = `transactions_${from}_to_${to}`;
+
+  const netWorth = registry.reduce((a, acc) =>
+    a + (acc.kind === "liability" ? -1 : 1) * (balances[acc.key] || 0), 0);
+
+  const needsOpening = !opening || Object.keys(opening).length === 0;
+
+  return rc("div", { style: { marginTop: 20 } },
+
+    txnError && rc(Card, { style: { marginBottom: 14, borderColor: "#A6402B", background: "#FBEAF0" } },
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "#A6402B" } }, txnError)),
+
+    needsOpening && rc(Card, { style: { marginBottom: 14, background: "#FBF3E6" } },
+      rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13.5, color: "var(--ink-1)", marginBottom: 6 } },
+        "Set your opening balances"),
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", marginBottom: 12, lineHeight: 1.5 } },
+        `The ledger needs a starting position before it can derive balances. This will copy the closing balances from ${latestRecord ? latestRecord.month : "your latest month"} and treat them as the opening position. Every transaction you log from here on adjusts them.`),
+      rc("button", { className: "btn-primary", onClick: onSetOpening }, "Use latest month as opening balances")),
+
+    /* ── quick add ── */
+    rc(Card, null,
+      rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 } },
+        rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 14, color: "var(--ink-1)" } },
+          form.id ? "Edit entry" : "New entry"),
+        form.id && rc(IconBtn, { onClick: () => setForm(blank) }, "Cancel edit")),
+
+      rc("div", { style: { display: "flex", gap: 6, marginBottom: 12 } },
+        [["expense", "Expense"], ["income", "Income"], ["transfer", "Transfer"]].map(([v, l]) =>
+          rc("button", {
+            key: v,
+            onClick: () => set({ type: v, category: "", subcat: "", toAccount: "" }),
+            className: form.type === v ? "btn-primary" : "btn-secondary",
+            style: { padding: "6px 14px", fontSize: 12.5 }
+          }, l))),
+
+      rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: 10, marginBottom: 10 } },
+        rc("div", null, rc(LedgerLabel, null, "Date"),
+          rc("input", { type: "date", value: form.date, onChange: e => set({ date: e.target.value }), style: inputStyle })),
+        rc("div", null, rc(LedgerLabel, null, "Amount"),
+          rc("input", {
+            type: "number", step: "0.01", value: form.amount, placeholder: "0.00",
+            onFocus: e => e.target.select(),
+            onKeyDown: e => { if (e.key === "Enter") submit(); },
+            onChange: e => set({ amount: e.target.value }),
+            style: { ...inputStyle, fontFamily: "var(--mono)" }
+          })),
+        rc("div", null, rc(LedgerLabel, null, isTransfer ? "From account" : "Account"),
+          rc(AccountSelect, { registry, value: form.account, onChange: v => set({ account: v }) })),
+        rc("div", null,
+          rc(LedgerLabel, null, isTransfer ? "To account" : "Who"),
+          isTransfer
+            ? rc(AccountSelect, { registry, value: form.toAccount, onChange: v => set({ toAccount: v }), placeholder: "Destination…" })
+            : rc("select", { value: form.who, onChange: e => set({ who: e.target.value }), style: inputStyle },
+                (familyMembers || ["ET", "SY"]).map(m => rc("option", { key: m, value: m }, m)),
+                rc("option", { value: "Joint" }, "Joint")))
+      ),
+
+      !isTransfer && rc("div", { style: { display: "grid", gridTemplateColumns: "2fr 1fr 2fr", gap: 10, marginBottom: 12 } },
+        rc("div", null, rc(LedgerLabel, null, "Category"),
+          rc(LedgerCategorySelect, {
+            cats: catList, value: form.category, subValue: form.subcat,
+            onChange: (c, s) => set({ category: c, subcat: s })
+          })),
+        rc("div", null, rc(LedgerLabel, null, "Payee"),
+          rc("input", { type: "text", value: form.payee, placeholder: "optional", onChange: e => set({ payee: e.target.value }), style: inputStyle })),
+        rc("div", null, rc(LedgerLabel, null, "Note"),
+          rc("input", {
+            type: "text", value: form.note, placeholder: "optional",
+            onKeyDown: e => { if (e.key === "Enter") submit(); },
+            onChange: e => set({ note: e.target.value }), style: inputStyle
+          }))
+      ),
+
+      isTransfer && rc("div", { style: { marginBottom: 12 } },
+        rc(LedgerLabel, null, "Note"),
+        rc("input", {
+          type: "text", value: form.note, placeholder: "e.g. paying off card",
+          onKeyDown: e => { if (e.key === "Enter") submit(); },
+          onChange: e => set({ note: e.target.value }), style: inputStyle
+        })),
+
+      rc("div", { style: { display: "flex", alignItems: "center", gap: 12 } },
+        rc("button", { className: "btn-primary", disabled: !canSave, onClick: submit },
+          form.id ? "Update entry" : "Add entry"),
+        rc("span", { style: { fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)" } },
+          isTransfer
+            ? "Transfers move money between your own accounts — they don't count as income or expense."
+            : "Press Enter from the amount or note field to save quickly.")
+      )
+    ),
+
+    /* ── account balances ── */
+    rc(Card, { style: { marginTop: 14 } },
+      rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: showAccounts ? 12 : 0 } },
+        rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 14, color: "var(--ink-1)" } },
+          "Live balances  ·  net ", fmt(netWorth)),
+        rc(IconBtn, { onClick: () => setShowAccounts(s => !s) }, showAccounts ? "Hide" : "Show")),
+      showAccounts && ["liquidCash", "investments", "cpfEt", "cpfSy", "property"].map(g => {
+        const items = registry.filter(a => a.group === g);
+        if (!items.length) return null;
+        return rc("div", { key: g, style: { marginBottom: 14 } },
+          rc(LedgerLabel, null, ACCOUNT_GROUP_LABELS[g]),
+          rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 8 } },
+            items.map(a => rc("div", {
+              key: a.key,
+              style: {
+                border: "1px solid var(--hair)", borderRadius: 8, padding: "8px 10px",
+                display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8
+              }
+            },
+              rc("div", { style: { minWidth: 0 } },
+                rc("div", {
+                  style: {
+                    fontFamily: "var(--sans)", fontSize: 12, color: "var(--ink-2)",
+                    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis"
+                  }
+                }, a.label),
+                rc("div", {
+                  style: {
+                    fontFamily: "var(--mono)", fontSize: 14,
+                    color: a.kind === "liability" ? "#A6402B" : "var(--ink-1)"
+                  }
+                }, fmt(balances[a.key] || 0, 2))),
+              rc(IconBtn, { onClick: () => setReconciling(a) }, "Adjust")
+            )))
+        );
+      })
+    ),
+
+    /* ── filters + export ── */
+    rc(Card, { style: { marginTop: 14 } },
+      rc("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1.4fr 1.4fr", gap: 10, marginBottom: 12 } },
+        rc("div", null, rc(LedgerLabel, null, "From"),
+          rc("input", { type: "date", value: from, onChange: e => setFrom(e.target.value), style: inputStyle })),
+        rc("div", null, rc(LedgerLabel, null, "To"),
+          rc("input", { type: "date", value: to, onChange: e => setTo(e.target.value), style: inputStyle })),
+        rc("div", null, rc(LedgerLabel, null, "Account"),
+          rc(AccountSelect, { registry, value: filterAccount, onChange: setFilterAccount, placeholder: "All accounts" })),
+        rc("div", null, rc(LedgerLabel, null, "Search"),
+          rc("input", { type: "text", value: search, placeholder: "payee, note, category", onChange: e => setSearch(e.target.value), style: inputStyle }))
+      ),
+      rc("div", { style: { display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 } },
+        [["This month", () => { setFrom(startOfMonthISO()); setTo(todayISO()); }],
+         ["Last 3 months", () => { setFrom(monthsAgoISO(3)); setTo(todayISO()); }],
+         ["Last 12 months", () => { setFrom(monthsAgoISO(12)); setTo(todayISO()); }],
+         ["Year to date", () => { setFrom(todayISO().slice(0, 4) + "-01-01"); setTo(todayISO()); }]
+        ].map(([l, fn]) => rc(IconBtn, { key: l, onClick: fn }, l))),
+      rc("div", {
+        style: {
+          display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center",
+          paddingTop: 12, borderTop: "1px solid var(--hair)"
+        }
+      },
+        rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)" } },
+          `${inRange.length} entr${inRange.length === 1 ? "y" : "ies"}`),
+        rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)" } },
+          "Income ", rc("span", { style: { fontFamily: "var(--mono)" } }, fmt(totals.income))),
+        rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)" } },
+          "Expenses ", rc("span", { style: { fontFamily: "var(--mono)" } }, fmt(totals.expense))),
+        rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, fontWeight: 600, color: "var(--ink-1)" } },
+          "Net ", rc("span", { style: { fontFamily: "var(--mono)" } }, fmt(totals.income - totals.expense))),
+        rc("div", { style: { flex: 1 } }),
+        rc(IconBtn, { onClick: () => exportCsv(rows(), fname) }, "Export CSV"),
+        rc(IconBtn, { onClick: () => exportXlsx(rows(), fname) }, "Export Excel"),
+        rc(IconBtn, { onClick: () => onRollup(from, to) }, "Push to monthly record")
+      )
+    ),
+
+    /* ── list ── */
+    rc(Card, { style: { marginTop: 14 } },
+      byDay.length === 0
+        ? rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-3)", padding: "20px 0", textAlign: "center" } },
+            "No transactions in this range yet.")
+        : byDay.map(day => {
+            const dayNet = day.items.reduce((a, t) =>
+              a + (t.type === "income" ? Number(t.amount) || 0 : t.type === "expense" ? -(Number(t.amount) || 0) : 0), 0);
+            return rc("div", { key: day.date, style: { marginBottom: 16 } },
+              rc("div", {
+                style: {
+                  display: "flex", justifyContent: "space-between",
+                  fontFamily: "var(--sans)", fontSize: 11.5, fontWeight: 600,
+                  color: "var(--ink-3)", textTransform: "uppercase", letterSpacing: "0.05em",
+                  paddingBottom: 6, borderBottom: "1px solid var(--hair)", marginBottom: 6
+                }
+              }, rc("span", null, isoToDayLabel(day.date)),
+                 rc("span", { style: { fontFamily: "var(--mono)", textTransform: "none" } }, fmt(dayNet, 2))),
+              day.items.map(t => {
+                const c = catLookup(t.category, t.subcat);
+                const acc = acctByKey(registry, t.account);
+                const dest = acctByKey(registry, t.toAccount);
+                const isAdj = t.type === "adjustment";
+                const amt = isAdj ? Number(t.storedDelta) || 0 : Number(t.amount) || 0;
+                const colour = isAdj ? "var(--ink-3)"
+                  : t.type === "income" ? "#2F6B4F"
+                  : t.type === "transfer" ? "var(--ink-3)" : "var(--ink-1)";
+                return rc("div", {
+                  key: t.id,
+                  style: {
+                    display: "flex", alignItems: "center", gap: 10,
+                    padding: "7px 0", borderBottom: "1px solid #F3F2EE"
+                  }
+                },
+                  rc("div", { style: { flex: "1 1 auto", minWidth: 0 } },
+                    rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-1)" } },
+                      isAdj ? "Balance adjustment"
+                        : t.type === "transfer" ? `Transfer → ${dest ? dest.label : "?"}`
+                        : c.cat + (c.sub ? " — " + c.sub : "")),
+                    rc("div", {
+                      style: {
+                        fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)",
+                        whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis"
+                      }
+                    }, [acc ? acc.label : "?", t.payee, t.note, t.who].filter(Boolean).join("  ·  "))),
+                  rc("div", {
+                    style: {
+                      fontFamily: "var(--mono)", fontSize: 13.5, color: colour,
+                      whiteSpace: "nowrap"
+                    }
+                  }, (t.type === "income" ? "+" : t.type === "expense" ? "−" : "") + fmt(Math.abs(amt), 2).replace("-", "")),
+                  rc("div", { style: { display: "flex", gap: 4 } },
+                    !isAdj && rc(IconBtn, {
+                      onClick: () => setForm({
+                        id: t.id, date: t.date, type: t.type, amount: t.amount,
+                        account: t.account, toAccount: t.toAccount || "",
+                        category: t.category || "", subcat: t.subcat || "",
+                        payee: t.payee || "", note: t.note || "", who: t.who || "ET"
+                      })
+                    }, "Edit"),
+                    rc(IconBtn, { onClick: () => setConfirmDelete(t) }, "Delete"))
+                );
+              })
+            );
+          })
+    ),
+
+    reconciling && rc(ReconcileDialog, {
+      account: reconciling,
+      computed: balances[reconciling.key] || 0,
+      onCancel: () => setReconciling(null),
+      onConfirm: ({ storedDelta: sd, note, date }) => {
+        onReconcile(reconciling, sd, note, date);
+        setReconciling(null);
+      }
+    }),
+
+    confirmDelete && rc(ConfirmDialog, {
+      title: "Delete entry",
+      message: "This removes the transaction and re-derives every affected balance. This can't be undone.",
+      confirmLabel: "Delete",
+      onConfirm: () => { onDelete(confirmDelete.id); setConfirmDelete(null); },
+      onCancel: () => setConfirmDelete(null)
+    })
+  );
+}
+
 function App() {
   const [records, setRecords] = useState(null);
   const [assumptions, setAssumptions] = useState(DEFAULT_ASSUMPTIONS);
@@ -2364,6 +2995,9 @@ function App() {
   const [dismissedHints, setDismissedHints] = useState({});
   const [confirmRemoveContractId, setConfirmRemoveContractId] = useState(null);
   const [confirmRemovePolicyId, setConfirmRemovePolicyId] = useState(null);
+  const [txns, setTxns] = useState([]);
+  const [openingBalances, setOpeningBalances] = useState({});
+  const [txnError, setTxnError] = useState("");
 
   /* ─── Firestore load (replaces window.storage.get) ─── */
   useEffect(() => {
@@ -2395,6 +3029,7 @@ function App() {
               property: withOwnerDefault(p.accounts.property)
             });
           }
+          if (p.openingBalances) setOpeningBalances(p.openingBalances);
           if (p.dismissedHints) setDismissedHints(p.dismissedHints);
           if (p.housingLoan) setHousingLoan(p.housingLoan);
           if (p.carLoan) setCarLoan(p.carLoan);
@@ -2440,6 +3075,7 @@ function App() {
       familyMembers: patch.familyMembers ?? familyMembers,
       categories: patch.categories ?? categories,
       accounts: patch.accounts ?? accounts,
+      openingBalances: patch.openingBalances ?? openingBalances,
       dismissedHints: patch.dismissedHints ?? dismissedHints,
       housingLoan: patch.housingLoan ?? housingLoan,
       carLoan: patch.carLoan ?? carLoan,
@@ -2455,6 +3091,7 @@ function App() {
     if (patch.familyMembers) setFamilyMembers(patch.familyMembers);
     if (patch.categories) setCategories(patch.categories);
     if (patch.accounts) setAccounts(patch.accounts);
+    if (patch.openingBalances) setOpeningBalances(patch.openingBalances);
     if (patch.dismissedHints) setDismissedHints(patch.dismissedHints);
     if (patch.housingLoan) setHousingLoan(patch.housingLoan);
     if (patch.carLoan) setCarLoan(patch.carLoan);
@@ -2498,6 +3135,98 @@ function App() {
     const idx = MONTH_ORDER.indexOf(records[records.length - 1].month);
     return MONTH_ORDER[idx + 1] || "New month";
   }, [records]);
+  /* ─── Transaction ledger ─── */
+  // Live listener on the subcollection: each transaction is its own document,
+  // so two people writing at once can't overwrite each other the way the
+  // single-document persistAll does, and both see entries appear immediately.
+  useEffect(() => {
+    const unsub = TXN_COL.onSnapshot(
+      snap => { setTxns(snap.docs.map(d => d.data())); setTxnError(""); },
+      err => { console.error(err); setTxnError("Could not read transactions \u2014 check your Firestore rules allow the 'transactions' subcollection."); }
+    );
+    return () => unsub();
+  }, []);
+
+  const registry = useMemo(() => buildRegistry(accounts), [accounts]);
+  const liveBalances = useMemo(
+    () => computeBalances(registry, openingBalances, txns),
+    [registry, openingBalances, txns]
+  );
+
+  const saveTxn = async t => {
+    try { await TXN_COL.doc(t.id).set(t); setTxnError(""); }
+    catch (err) { console.error(err); setTxnError("Could not save that entry to shared storage."); }
+  };
+  const deleteTxn = async id => {
+    try { await TXN_COL.doc(id).delete(); }
+    catch (err) { console.error(err); setTxnError("Could not delete that entry."); }
+  };
+  const reconcileAccount = (account, sd, note, date) => saveTxn({
+    id: uid(), date, type: "adjustment",
+    storedDelta: sd, amount: Math.abs(sd),
+    account: account.key, toAccount: null,
+    category: "balanceAdjustment", subcat: null,
+    payee: "", note: note || "", who: "",
+    createdAt: new Date().toISOString()
+  });
+  const setOpeningFromLatest = () => {
+    const last = records[records.length - 1];
+    if (!last) return;
+    persistAll({ openingBalances: openingFromRecord(last, registry) });
+    setSaveMsg("Opening balances set");
+    setTimeout(() => setSaveMsg(""), 3000);
+  };
+
+  // Rolls a date range of transactions up into the monthly record shape the
+  // dashboard, budgets and forecast tabs already read, so the ledger feeds
+  // the rest of the app instead of sitting beside it.
+  const rollupToRecord = (fromISO, toISO) => {
+    const monthLabel = isoToMonthLabel(toISO);
+    if (!monthLabel) return;
+    const inR = txns.filter(t => t.date >= fromISO && t.date <= toISO && !t.voided);
+    const activeExpense = categories.expense.filter(c => !c.archived);
+    const activeIncome = categories.income.filter(c => !c.archived);
+    const blank = cats => Object.fromEntries(cats.map(c => [c.key,
+      c.subcats && c.subcats.length ? Object.fromEntries(c.subcats.map(s => [s.key, 0])) : 0]));
+    const income = blank(activeIncome);
+    const expenses = {
+      fixedNonFinancial: blank(activeExpense.filter(c => c.group === "fixedNonFinancial")),
+      fixedFinancial: blank(activeExpense.filter(c => c.group === "fixedFinancial")),
+      variable: blank(activeExpense.filter(c => c.group === "variable"))
+    };
+    const add = (bucket, catKey, subKey, amt) => {
+      if (!bucket || bucket[catKey] === undefined) return;
+      if (bucket[catKey] && typeof bucket[catKey] === "object") {
+        if (subKey && bucket[catKey][subKey] !== undefined) bucket[catKey][subKey] += amt;
+        else {
+          const first = Object.keys(bucket[catKey])[0];
+          if (first) bucket[catKey][first] += amt;
+        }
+      } else bucket[catKey] += amt;
+    };
+    inR.forEach(t => {
+      const amt = Number(t.amount) || 0;
+      if (t.type === "income") add(income, t.category, t.subcat, amt);
+      else if (t.type === "expense") {
+        const c = activeExpense.find(x => x.key === t.category);
+        if (c) add(expenses[c.group], t.category, t.subcat, amt);
+      }
+    });
+    const balances = JSON.parse(JSON.stringify(BLANK_BALANCES));
+    registry.forEach(a => {
+      if (!balances[a.group]) balances[a.group] = {};
+      balances[a.group][a.ref] = Math.round((liveBalances[a.key] || 0) * 100) / 100;
+    });
+    const rec = { month: monthLabel, income, expenses, balances };
+    const idx = records.findIndex(r => r.month === monthLabel);
+    const nextRecords = idx >= 0 ? records.map((r, i) => i === idx ? rec : r) : [...records, rec];
+    nextRecords.sort((a, b) => MONTH_ORDER.indexOf(a.month) - MONTH_ORDER.indexOf(b.month));
+    persistAll({ records: nextRecords });
+    setSelectedMonth(monthLabel);
+    setSaveMsg(`${monthLabel} ${idx >= 0 ? "updated" : "created"} from transactions`);
+    setTimeout(() => setSaveMsg(""), 4000);
+  };
+
   const blankFromCats = cats => Object.fromEntries(cats.map(c => [c.key, c.subcats && c.subcats.length ? Object.fromEntries(c.subcats.map(s => [s.key, 0])) : 0]));
   const startDraft = () => {
     const last = records[records.length - 1];
@@ -3047,6 +3776,7 @@ function App() {
         .tab-btn { font-family: var(--sans); font-size: 12.5px; font-weight: 500; padding: 7px 12px; border-radius: 7px; border: 1px solid transparent; cursor: pointer; background: none; color: var(--ink-2); white-space: nowrap; }
         .tab-btn.active { background: #fff; border-color: var(--hair-strong); color: var(--ink-1); }
         .btn-primary { font-family: var(--sans); font-size: 13px; font-weight: 600; padding: 9px 16px; border-radius: 7px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; }
+        .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
         .btn-secondary { font-family: var(--sans); font-size: 13px; font-weight: 500; padding: 9px 16px; border-radius: 7px; border: 1px solid var(--hair-strong); background: #fff; color: var(--ink-2); cursor: pointer; }
         select, input[type=date] { font-family: var(--sans); font-size: 13px; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--hair-strong); background: #fff; color: var(--ink-1); }
       `), syncError && /*#__PURE__*/React.createElement("div", {
@@ -3094,7 +3824,7 @@ function App() {
       flexWrap: "wrap",
       alignItems: "center"
     }
-  }, [["dashboard", "Dashboard"], ["add", "Add month"], ["budgets", "Budgets"], ["contracts", "Contracts"], ["insurance", "Insurance"], ["recurring", "Recurring"], ["loans", "Loans"], ["cpf", "CPF"], ["tax", "Tax"], ["forecast", "Forecast"], ["history", "History"], ["settings", "Settings"]].map(([id, label]) => /*#__PURE__*/React.createElement("button", {
+  }, [["dashboard", "Dashboard"], ["daily", "Daily ledger"], ["add", "Add month"], ["budgets", "Budgets"], ["contracts", "Contracts"], ["insurance", "Insurance"], ["recurring", "Recurring"], ["loans", "Loans"], ["cpf", "CPF"], ["tax", "Tax"], ["forecast", "Forecast"], ["history", "History"], ["settings", "Settings"]].map(([id, label]) => /*#__PURE__*/React.createElement("button", {
     key: id,
     className: `tab-btn ${tab === id ? "active" : ""}`,
     onClick: () => {
@@ -3790,7 +4520,21 @@ function App() {
       },
       onClick: () => setRatioHint(null)
     }, "Got it"));
-  })()))), tab === "add" && draft && /*#__PURE__*/React.createElement("div", {
+  })()))), tab === "daily" && rc(TransactionsTab, {
+    registry: registry,
+    balances: liveBalances,
+    txns: txns,
+    categories: categories,
+    familyMembers: familyMembers,
+    opening: openingBalances,
+    latestRecord: records[records.length - 1],
+    txnError: txnError,
+    onSave: saveTxn,
+    onDelete: deleteTxn,
+    onReconcile: reconcileAccount,
+    onSetOpening: setOpeningFromLatest,
+    onRollup: rollupToRecord
+  }), tab === "add" && draft && /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 20
     }
