@@ -1567,6 +1567,74 @@ function SelectField({
     }
   }, hint));
 }
+// Like SelectField, but builds its options from the app's real expense
+// category list (with subcategories nested under an <optgroup>, which
+// browsers render indented and bold-labelled automatically) instead of a
+// flat, disconnected list of strings.
+function CategorySelectField({
+  label,
+  value,
+  onChange,
+  categories,
+  hint,
+  hintOnFocus,
+  disabled
+}) {
+  const [focused, setFocused] = useState(false);
+  const showHint = hint && (hintOnFocus ? focused : true);
+  const cats = (categories || []).filter(c => !c.archived);
+  const known = new Set();
+  cats.forEach(c => {
+    known.add(c.label);
+    (c.subcats || []).forEach(s => known.add(`${c.label} \u2014 ${s.label}`));
+  });
+  const isKnownOrEmpty = !value || known.has(value);
+  return /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 4,
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)"
+    }
+  }, label, /*#__PURE__*/React.createElement("select", {
+    value: value,
+    disabled: disabled,
+    onFocus: () => setFocused(true),
+    onBlur: () => setFocused(false),
+    onChange: e => onChange(e.target.value),
+    style: {
+      padding: "7px 9px",
+      background: disabled ? "var(--paper)" : "#fff",
+      color: disabled ? "var(--ink-3)" : "var(--ink-1)"
+    }
+  }, !isKnownOrEmpty && /*#__PURE__*/React.createElement("option", {
+    value: value
+  }, value), cats.map(c => {
+    const subs = c.subcats || [];
+    if (subs.length === 0) {
+      return /*#__PURE__*/React.createElement("option", {
+        key: c.key,
+        value: c.label
+      }, c.icon ? `${c.icon} ${c.label}` : c.label);
+    }
+    return /*#__PURE__*/React.createElement("optgroup", {
+      key: c.key,
+      label: c.icon ? `${c.icon} ${c.label}` : c.label
+    }, /*#__PURE__*/React.createElement("option", {
+      value: c.label
+    }, `${c.label} (general)`), subs.map(s => /*#__PURE__*/React.createElement("option", {
+      key: s.key,
+      value: `${c.label} \u2014 ${s.label}`
+    }, s.label)));
+  })), showHint && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: "var(--ink-3)"
+    }
+  }, hint));
+}
 function CheckField({
   label,
   checked,
@@ -2402,7 +2470,7 @@ function App() {
     id: uid(),
     name: "",
     provider: "",
-    category: CONTRACT_CATEGORIES[0],
+    category: (categories.expense.find(c => !c.archived) || {}).label || "",
     monthlyAmount: 0,
     renewalDate: todayISO(),
     renewalFrequency: "Annual",
@@ -4064,16 +4132,16 @@ function App() {
       onChange: v => updateContract(c.id, {
         provider: v
       })
-    }), /*#__PURE__*/React.createElement(SelectField, {
+    }), /*#__PURE__*/React.createElement(CategorySelectField, {
       label: "Category",
       value: c.category,
       disabled: locked,
-      hint: "Groups this contract for reporting, e.g. Telco, Utilities, Insurance.",
+      hint: "Pulled from your expense categories in Settings, so contracts line up with the rest of your budget.",
       hintOnFocus: true,
       onChange: v => updateContract(c.id, {
         category: v
       }),
-      options: CONTRACT_CATEGORIES
+      categories: categories.expense
     }), /*#__PURE__*/React.createElement(NumberField, {
       label: "Monthly amount",
       value: c.monthlyAmount,
