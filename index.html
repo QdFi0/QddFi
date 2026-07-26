@@ -68,6 +68,12 @@
   };
   firebase.initializeApp(firebaseConfig);
   const db = firebase.firestore();
+  // Offline cache. Without this, every page load re-reads the whole
+  // transaction collection from the server and burns daily read quota.
+  // With it, the SDK serves from local disk and syncs only what changed.
+  db.enablePersistence({ synchronizeTabs: true }).catch(function (err) {
+    console.warn("Offline cache unavailable:", err && err.code);
+  });
   // Everything is stored in one shared document so you and your partner
   // both read/write the same household data.
   const LEDGER_DOC = db.collection("households").doc("etsy");
@@ -2351,6 +2357,37 @@ const buildRegistry = accounts => {
 
 const acctByKey = (registry, key) => registry.find(a => a.key === key);
 
+// A transfer leg can point outside the tracked wallet entirely. It holds no
+// balance, so computeBalances simply finds nothing for it and only moves the
+// tracked side — money genuinely leaves or enters your tracked universe.
+const EXTERNAL_KEY = "__external__";
+const EXTERNAL_LABEL = "Outside of wallet";
+const isExternal = k => k === EXTERNAL_KEY;
+const acctLabel = (registry, key) => {
+  if (isExternal(key)) return EXTERNAL_LABEL;
+  const a = acctByKey(registry, key);
+  return a ? a.label : "";
+};
+
+// Whether an entry counts as income, expense, or neither, for totals and for
+// the monthly rollup. Transfers are always neutral. An adjustment is neutral
+// unless you classified it against a real category (e.g. an investment gain
+// booked to Interest / dividends), in which case it counts like the real thing.
+const txnEffect = (t, categories) => {
+  const NEUTRAL = { kind: "neutral", amount: 0 };
+  if (!t || t.voided) return NEUTRAL;
+  if (t.type === "income") return { kind: "income", amount: Number(t.amount) || 0 };
+  if (t.type === "expense") return { kind: "expense", amount: Number(t.amount) || 0 };
+  if (t.type === "adjustment") {
+    const cat = t.category;
+    if (!cat || cat === "balanceAdjustment") return NEUTRAL;
+    const mag = Math.abs(Number(t.storedDelta) || 0);
+    if ((categories.income || []).some(c => c.key === cat)) return { kind: "income", amount: mag };
+    if ((categories.expense || []).some(c => c.key === cat)) return { kind: "expense", amount: mag };
+  }
+  return NEUTRAL;
+};
+
 // dir: +1 = money flows INTO this account, -1 = money flows OUT of it.
 // For an asset, an inflow raises the stored number. For a liability the
 // stored number is the magnitude of what's owed, so an inflow (a card
@@ -2424,15 +2461,13 @@ const downloadBlob = (content, filename, mime) => {
 const EXPORT_HEADERS = ["Date","Type","Amount","Account","To account","Category","Sub-category","Who","Payee","Note"];
 
 const txnToRow = (t, registry, catLookup) => {
-  const from = acctByKey(registry, t.account);
-  const to = acctByKey(registry, t.toAccount);
   const c = catLookup(t.category, t.subcat);
   return [
     t.date || "",
     t.type === "adjustment" ? "Balance adjustment" : (t.type || ""),
     t.type === "adjustment" ? (Number(t.storedDelta) || 0) : (Number(t.amount) || 0),
-    from ? from.label : (t.account || ""),
-    to ? to.label : "",
+    acctLabel(registry, t.account),
+    acctLabel(registry, t.toAccount),
     c.cat,
     c.sub,
     t.who || "",
@@ -2481,10 +2516,11 @@ const inputStyle = {
   background: "#fff", color: "var(--ink-1)", width: "100%"
 };
 
-function AccountSelect({ registry, value, onChange, placeholder }) {
+function AccountSelect({ registry, value, onChange, placeholder, allowExternal }) {
   const groups = ["liquidCash", "investments", "cpfEt", "cpfSy", "property"];
   return rc("select", { value: value || "", onChange: e => onChange(e.target.value), style: inputStyle },
     rc("option", { value: "" }, placeholder || "Select account…"),
+    allowExternal && rc("option", { value: EXTERNAL_KEY }, "\u27F6 " + EXTERNAL_LABEL),
     groups.map(g => {
       const items = registry.filter(a => a.group === g);
       if (!items.length) return null;
@@ -2521,11 +2557,16 @@ function LedgerCategorySelect({ cats, value, subValue, onChange }) {
 
 /* ───────────── reconcile dialog ───────────── */
 
-function ReconcileDialog({ account, computed, onCancel, onConfirm }) {
+function ReconcileDialog({ account, computed, onCancel, onConfirm, categories }) {
   const [actual, setActual] = useState(computed);
   const [note, setNote] = useState("");
   const [date, setDate] = useState(todayISO());
+  const [counterCat, setCounterCat] = useState("");
   const diff = (Number(actual) || 0) - computed;
+  // Which way the difference points decides which side of the books it
+  // belongs on: an asset that grew, or a liability that shrank, is a gain.
+  const favourable = account.kind === "liability" ? diff < 0 : diff > 0;
+  const pool = ((favourable ? categories.income : categories.expense) || []).filter(c => !c.archived);
   return rc("div", {
     onClick: onCancel,
     style: {
@@ -2567,6 +2608,16 @@ function ReconcileDialog({ account, computed, onCancel, onConfirm }) {
         onChange: e => setNote(e.target.value), style: inputStyle
       })
     ),
+    Math.abs(diff) >= 0.005 && rc("div", { style: { marginBottom: 16 } },
+      rc(LedgerLabel, null, "Book the difference as"),
+      rc("select", { value: counterCat, onChange: e => setCounterCat(e.target.value), style: inputStyle },
+        rc("option", { value: "" }, "Unexplained \u2014 don't count it as income or spending"),
+        rc("optgroup", { label: favourable ? "Count as income" : "Count as expense" },
+          pool.map(c => rc("option", { key: c.key, value: c.key }, (c.icon ? c.icon + " " : "") + c.label)))),
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", marginTop: 4 } },
+        favourable
+          ? "Use this for investment gains, CPF interest or cashback so they show up as income."
+          : "Use this for market losses or fees so they show up as spending.")),
     rc("div", {
       style: {
         background: Math.abs(diff) < 0.005 ? "#F3F2EE" : "#FBF3E6",
@@ -2581,7 +2632,7 @@ function ReconcileDialog({ account, computed, onCancel, onConfirm }) {
       rc("button", {
         className: "btn-primary",
         disabled: Math.abs(diff) < 0.005,
-        onClick: () => onConfirm({ storedDelta: diff, note, date })
+        onClick: () => onConfirm({ storedDelta: diff, note, date, category: counterCat || "balanceAdjustment" })
       }, "Record adjustment")
     )
   ));
@@ -2620,8 +2671,11 @@ function TransactionsTab({
     return { cat: c.label, sub: s ? s.label : "" };
   };
 
+  const bothExternal = isExternal(form.account) && isExternal(form.toAccount);
   const canSave = form.amount !== "" && Number(form.amount) > 0 && form.account &&
-    (isTransfer ? form.toAccount && form.toAccount !== form.account : !!form.category);
+    (isTransfer
+      ? form.toAccount && form.toAccount !== form.account && !bothExternal
+      : !isExternal(form.account) && !!form.category);
 
   const submit = () => {
     if (!canSave) return;
@@ -2654,11 +2708,11 @@ function TransactionsTab({
   }).sort((a, b) => b.date.localeCompare(a.date) || (b.createdAt || "").localeCompare(a.createdAt || ""));
 
   const totals = inRange.reduce((acc, t) => {
-    if (t.type === "income") acc.income += Number(t.amount) || 0;
-    if (t.type === "expense") acc.expense += Number(t.amount) || 0;
-    if (t.type === "adjustment") acc.adjust += Number(t.storedDelta) || 0;
+    const e = txnEffect(t, categories);
+    if (e.kind === "income") acc.income += e.amount;
+    if (e.kind === "expense") acc.expense += e.amount;
     return acc;
-  }, { income: 0, expense: 0, adjust: 0 });
+  }, { income: 0, expense: 0 });
 
   const byDay = [];
   inRange.forEach(t => {
@@ -2715,11 +2769,11 @@ function TransactionsTab({
             style: { ...inputStyle, fontFamily: "var(--mono)" }
           })),
         rc("div", null, rc(LedgerLabel, null, isTransfer ? "From account" : "Account"),
-          rc(AccountSelect, { registry, value: form.account, onChange: v => set({ account: v }) })),
+          rc(AccountSelect, { registry, value: form.account, onChange: v => set({ account: v }), allowExternal: isTransfer })),
         rc("div", null,
           rc(LedgerLabel, null, isTransfer ? "To account" : "Who"),
           isTransfer
-            ? rc(AccountSelect, { registry, value: form.toAccount, onChange: v => set({ toAccount: v }), placeholder: "Destination…" })
+            ? rc(AccountSelect, { registry, value: form.toAccount, onChange: v => set({ toAccount: v }), placeholder: "Destination…", allowExternal: true })
             : rc("select", { value: form.who, onChange: e => set({ who: e.target.value }), style: inputStyle },
                 (familyMembers || ["ET", "SY"]).map(m => rc("option", { key: m, value: m }, m)),
                 rc("option", { value: "Joint" }, "Joint")))
@@ -2754,7 +2808,7 @@ function TransactionsTab({
           form.id ? "Update entry" : "Add entry"),
         rc("span", { style: { fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)" } },
           isTransfer
-            ? "Transfers move money between your own accounts — they don't count as income or expense."
+            ? "Transfers never count as income or expense. Pick Outside of wallet on either side to move money in or out of the accounts you track."
             : "Press Enter from the amount or note field to save quickly.")
       )
     ),
@@ -2842,8 +2896,10 @@ function TransactionsTab({
         ? rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-3)", padding: "20px 0", textAlign: "center" } },
             "No transactions in this range yet.")
         : byDay.map(day => {
-            const dayNet = day.items.reduce((a, t) =>
-              a + (t.type === "income" ? Number(t.amount) || 0 : t.type === "expense" ? -(Number(t.amount) || 0) : 0), 0);
+            const dayNet = day.items.reduce((a, t) => {
+              const e = txnEffect(t, categories);
+              return a + (e.kind === "income" ? e.amount : e.kind === "expense" ? -e.amount : 0);
+            }, 0);
             return rc("div", { key: day.date, style: { marginBottom: 16 } },
               rc("div", {
                 style: {
@@ -2856,8 +2912,8 @@ function TransactionsTab({
                  rc("span", { style: { fontFamily: "var(--mono)", textTransform: "none" } }, fmt(dayNet, 2))),
               day.items.map(t => {
                 const c = catLookup(t.category, t.subcat);
-                const acc = acctByKey(registry, t.account);
-                const dest = acctByKey(registry, t.toAccount);
+                const accName = acctLabel(registry, t.account);
+                const destName = acctLabel(registry, t.toAccount);
                 const isAdj = t.type === "adjustment";
                 const amt = isAdj ? Number(t.storedDelta) || 0 : Number(t.amount) || 0;
                 const colour = isAdj ? "var(--ink-3)"
@@ -2872,15 +2928,17 @@ function TransactionsTab({
                 },
                   rc("div", { style: { flex: "1 1 auto", minWidth: 0 } },
                     rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-1)" } },
-                      isAdj ? "Balance adjustment"
-                        : t.type === "transfer" ? `Transfer → ${dest ? dest.label : "?"}`
+                      isAdj ? (t.category && t.category !== "balanceAdjustment"
+                          ? c.cat + (c.sub ? " — " + c.sub : "") + "  (adjustment)"
+                          : "Balance adjustment")
+                        : t.type === "transfer" ? `Transfer → ${destName || "?"}`
                         : c.cat + (c.sub ? " — " + c.sub : "")),
                     rc("div", {
                       style: {
                         fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)",
                         whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis"
                       }
-                    }, [acc ? acc.label : "?", t.payee, t.note, t.who].filter(Boolean).join("  ·  "))),
+                    }, [accName || "?", t.payee, t.note, t.who].filter(Boolean).join("  ·  "))),
                   rc("div", {
                     style: {
                       fontFamily: "var(--mono)", fontSize: 13.5, color: colour,
@@ -2905,10 +2963,11 @@ function TransactionsTab({
 
     reconciling && rc(ReconcileDialog, {
       account: reconciling,
+      categories: categories,
       computed: balances[reconciling.key] || 0,
       onCancel: () => setReconciling(null),
-      onConfirm: ({ storedDelta: sd, note, date }) => {
-        onReconcile(reconciling, sd, note, date);
+      onConfirm: ({ storedDelta: sd, note, date, category }) => {
+        onReconcile(reconciling, sd, note, date, category);
         setReconciling(null);
       }
     }),
@@ -3161,11 +3220,11 @@ function App() {
     try { await TXN_COL.doc(id).delete(); }
     catch (err) { console.error(err); setTxnError("Could not delete that entry."); }
   };
-  const reconcileAccount = (account, sd, note, date) => saveTxn({
+  const reconcileAccount = (account, sd, note, date, category) => saveTxn({
     id: uid(), date, type: "adjustment",
     storedDelta: sd, amount: Math.abs(sd),
     account: account.key, toAccount: null,
-    category: "balanceAdjustment", subcat: null,
+    category: category || "balanceAdjustment", subcat: null,
     payee: "", note: note || "", who: "",
     createdAt: new Date().toISOString()
   });
@@ -3205,11 +3264,11 @@ function App() {
       } else bucket[catKey] += amt;
     };
     inR.forEach(t => {
-      const amt = Number(t.amount) || 0;
-      if (t.type === "income") add(income, t.category, t.subcat, amt);
-      else if (t.type === "expense") {
+      const e = txnEffect(t, categories);
+      if (e.kind === "income") add(income, t.category, t.subcat, e.amount);
+      else if (e.kind === "expense") {
         const c = activeExpense.find(x => x.key === t.category);
-        if (c) add(expenses[c.group], t.category, t.subcat, amt);
+        if (c) add(expenses[c.group], t.category, t.subcat, e.amount);
       }
     });
     const balances = JSON.parse(JSON.stringify(BLANK_BALANCES));
