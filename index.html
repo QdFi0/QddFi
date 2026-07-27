@@ -132,6 +132,10 @@ const sumByOwner = (balancesObj, accountDefs) => {
   });
   return result;
 };
+// A category value is a plain number when the category has no sub-categories
+// and an object of sub-totals when it does. Several call sites assumed the
+// scalar form and silently produced NaN once a sub-category was added.
+const catTotal = v => (v && typeof v === "object") ? sum(v) : (Number(v) || 0);
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const daysUntil = iso => Math.ceil((new Date(iso) - new Date(todayISO())) / 86400000);
 // Projects a stored renewal/anchor date forward by its cadence until it lands
@@ -655,10 +659,10 @@ function computeDerived(record, assumptions, accounts) {
   const totalFixedNonFinancial = sum(record.expenses.fixedNonFinancial);
   const totalFixedFinancial = sum(record.expenses.fixedFinancial);
   const totalVariableGross = sum(record.expenses.variable);
-  const totalVariableExclBigTicket = totalVariableGross - (record.expenses.variable.bigTicket || 0);
+  const totalVariableExclBigTicket = totalVariableGross - catTotal(record.expenses.variable.bigTicket);
   const totalExpenses = totalFixedNonFinancial + totalFixedFinancial + totalVariableGross;
   const netCashflow = totalIncome - totalExpenses;
-  const monthlyTakeHome = record.income.payrollEt;
+  const monthlyTakeHome = catTotal(record.income.payrollEt);
   const monthlySavings = monthlyTakeHome - totalExpenses;
   const annualTakeHome = monthlyTakeHome * 12;
   const base = {
@@ -2363,6 +2367,13 @@ const buildRegistry = accounts => {
 
 const acctByKey = (registry, key) => registry.find(a => a.key === key);
 
+// Entries pointing at an account that no longer exists. They are excluded from
+// both balances and totals, so they need surfacing rather than silent dropping.
+const orphanTxns = (registry, txns) => {
+  const known = new Set((registry || []).map(a => a.key));
+  return (txns || []).filter(t => !t.voided && t.account && !known.has(t.account));
+};
+
 // A transfer leg can point outside the tracked wallet entirely. It holds no
 // balance, so computeBalances simply finds nothing for it and only moves the
 // tracked side — money genuinely leaves or enters your tracked universe.
@@ -2401,11 +2412,15 @@ const txnEffect = (t, categories) => {
 const storedDelta = (kind, dir, amount) =>
   (kind === "liability" ? -1 : 1) * dir * (Number(amount) || 0);
 
-const computeBalances = (registry, opening, txns) => {
+// asOf (inclusive ISO date) folds only transactions up to that date, so a
+// month-end closing position can be derived instead of only "right now".
+// Without it every historical rollup was stamped with today's balances.
+const computeBalances = (registry, opening, txns, asOf) => {
   const bal = {};
   registry.forEach(a => { bal[a.key] = Number((opening || {})[a.key]) || 0; });
   (txns || []).forEach(t => {
     if (t.voided) return;
+    if (asOf && t.date > asOf) return;
     if (t.type === "adjustment") {
       if (bal[t.account] !== undefined) bal[t.account] += Number(t.storedDelta) || 0;
       return;
@@ -2444,6 +2459,20 @@ const monthSortKey = label => {
   if (mi < 0 || isNaN(y)) return Number.MAX_SAFE_INTEGER;
   return (y - 2026) * 12 + mi;
 };
+const monthLabelFromSortKey = k =>
+  `${MONTH_ABBR[((k % 12) + 12) % 12]} ${2026 + Math.floor(k / 12)}`;
+const monthStartISO = label => {
+  const k = monthSortKey(label);
+  if (k === Number.MAX_SAFE_INTEGER) return null;
+  const y = 2026 + Math.floor(k / 12), mi = ((k % 12) + 12) % 12;
+  return new Date(Date.UTC(y, mi, 1)).toISOString().slice(0, 10);
+};
+const monthEndISO = label => {
+  const k = monthSortKey(label);
+  if (k === Number.MAX_SAFE_INTEGER) return null;
+  const y = 2026 + Math.floor(k / 12), mi = ((k % 12) + 12) % 12;
+  return new Date(Date.UTC(y, mi + 1, 0)).toISOString().slice(0, 10);
+};
 const isoToMonthLabel = iso => {
   const [y, m] = (iso || "").split("-");
   return m ? `${MONTH_ABBR[parseInt(m, 10) - 1]} ${y}` : "";
@@ -2459,6 +2488,55 @@ const monthsAgoISO = n => {
   const d = new Date(todayISO() + "T00:00:00Z");
   d.setUTCMonth(d.getUTCMonth() - n);
   return d.toISOString().slice(0, 10);
+};
+
+// Builds the monthly record shape the dashboard/budgets/forecast already read,
+// entirely from the ledger. Income and expenses come from transactions dated
+// inside the month; balances come from the position as at month-end. Nothing
+// here is stored — it is recomputed from transactions on every render, so it
+// can never drift from the ledger the way a hand-saved record could.
+const deriveRecord = (monthLabel, registry, opening, txns, categories) => {
+  const start = monthStartISO(monthLabel), end = monthEndISO(monthLabel);
+  const activeExpense = (categories.expense || []).filter(c => !c.archived);
+  const activeIncome = (categories.income || []).filter(c => !c.archived);
+  const blank = cats => Object.fromEntries(cats.map(c => [c.key,
+    c.subcats && c.subcats.length ? Object.fromEntries(c.subcats.map(s => [s.key, 0])) : 0]));
+  const income = blank(activeIncome);
+  const expenses = {
+    fixedNonFinancial: blank(activeExpense.filter(c => c.group === "fixedNonFinancial")),
+    fixedFinancial: blank(activeExpense.filter(c => c.group === "fixedFinancial")),
+    variable: blank(activeExpense.filter(c => c.group === "variable"))
+  };
+  const add = (bucket, catKey, subKey, amt) => {
+    if (!bucket || bucket[catKey] === undefined) return;
+    if (bucket[catKey] && typeof bucket[catKey] === "object") {
+      if (subKey && bucket[catKey][subKey] !== undefined) bucket[catKey][subKey] += amt;
+      else {
+        const first = Object.keys(bucket[catKey])[0];
+        if (first) bucket[catKey][first] += amt;
+      }
+    } else bucket[catKey] += amt;
+  };
+  const known = new Set(registry.map(a => a.key));
+  (txns || []).forEach(t => {
+    if (t.voided || !t.date || t.date < start || t.date > end) return;
+    // If the account was deleted the balance side is already dropped, so the
+    // P&L side must be dropped too or the two statements disagree.
+    if (!known.has(t.account)) return;
+    const e = txnEffect(t, categories);
+    if (e.kind === "income") add(income, t.category, t.subcat, e.amount);
+    else if (e.kind === "expense") {
+      const c = activeExpense.find(x => x.key === t.category);
+      if (c) add(expenses[c.group], t.category, t.subcat, e.amount);
+    }
+  });
+  const closing = computeBalances(registry, opening, txns, end);
+  const balances = JSON.parse(JSON.stringify(BLANK_BALANCES));
+  registry.forEach(a => {
+    if (!balances[a.group]) balances[a.group] = {};
+    balances[a.group][a.ref] = Math.round((closing[a.key] || 0) * 100) / 100;
+  });
+  return { month: monthLabel, income, expenses, balances, derived: true };
 };
 
 const downloadBlob = (content, filename, mime) => {
@@ -2658,7 +2736,7 @@ function ReconcileDialog({ account, computed, onCancel, onConfirm, categories })
 function TransactionsTab({
   registry, balances, txns, categories, familyMembers,
   onSave, onDelete, onReconcile, opening, onSetOpening,
-  latestRecord, onRollup, txnError
+  latestRecord, txnError, orphans
 }) {
   const blank = {
     id: null, date: todayISO(), type: "expense", amount: "",
@@ -2748,6 +2826,10 @@ function TransactionsTab({
 
     txnError && rc(Card, { style: { marginBottom: 14, borderColor: "#A6402B", background: "#FBEAF0" } },
       rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "#A6402B" } }, txnError)),
+
+    (orphans || []).length > 0 && rc(Card, { style: { marginBottom: 14, background: "#FBF3E6" } },
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", lineHeight: 1.5 } },
+        `${orphans.length} entr${orphans.length === 1 ? "y is" : "ies are"} pointing at an account that no longer exists. They are excluded from balances and from monthly totals. Re-create the account in Settings, or edit each entry onto a live account.`)),
 
     needsOpening && rc(Card, { style: { marginBottom: 14, background: "#FBF3E6" } },
       rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13.5, color: "var(--ink-1)", marginBottom: 6 } },
@@ -2901,7 +2983,6 @@ function TransactionsTab({
         rc("div", { style: { flex: 1 } }),
         rc(IconBtn, { onClick: () => exportCsv(rows(), fname) }, "Export CSV"),
         rc(IconBtn, { onClick: () => exportXlsx(rows(), fname) }, "Export Excel"),
-        rc(IconBtn, { onClick: () => onRollup(from, to) }, "Push to monthly record")
       )
     ),
 
@@ -3003,10 +3084,33 @@ function TransactionsTab({
   );
 }
 
-// Kept in sync with the allowlist in the Firestore rules — used only to
-// show a clear "you're not on the list" message client-side. The rules are
-// still what actually enforce this; this is just a better error message.
+// Kept in sync with the allowlist in the Firestore rules. The rules are what
+// actually enforce access; this exists only to give a clear message instead of
+// a silent permission failure.
 const ALLOWED_EMAILS = ["eng.teck.93@gmail.com", "siruchew@gmail.com"];
+const normEmail = e => String(e || "").trim().toLowerCase();
+const isAllowedEmail = e => ALLOWED_EMAILS.map(normEmail).indexOf(normEmail(e)) !== -1;
+
+// Codes where a popup can't work but a full-page redirect still can: blocked
+// popups, in-app browsers, strict privacy settings, COOP headers.
+const POPUP_FALLBACK_CODES = [
+  "auth/popup-blocked", "auth/cancelled-popup-request", "auth/internal-error",
+  "auth/operation-not-supported-in-this-environment", "auth/web-storage-unsupported"
+];
+
+const describeAuthError = e => {
+  if (!e || !e.code) return "";
+  if (e.code === "auth/popup-closed-by-user") return "";
+  if (e.code === "auth/popup-blocked")
+    return "Your browser blocked the sign-in popup. Use the no-popup option below.";
+  if (e.code === "auth/unauthorized-domain")
+    return "This site's address isn't on Firebase's authorised domains list. Add the hostname shown below under Authentication \u2192 Settings \u2192 Authorised domains.";
+  if (e.code === "auth/operation-not-allowed")
+    return "Google sign-in isn't enabled in Firebase under Authentication \u2192 Sign-in method.";
+  if (e.code === "auth/network-request-failed")
+    return "Network problem reaching Google. Check your connection and retry.";
+  return "Sign-in failed (" + e.code + ")";
+};
 
 function LoginGate({ children }) {
   const [user, setUser] = useState(undefined); // undefined = still checking
@@ -3014,30 +3118,39 @@ function LoginGate({ children }) {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
+    // Completes a redirect-based sign-in and surfaces anything that failed
+    // during it. Without this a failed redirect just looks like nothing happened.
+    auth.getRedirectResult().catch(e => setErr(describeAuthError(e)));
     const unsub = auth.onAuthStateChanged(u => setUser(u || null));
     return () => unsub();
   }, []);
 
-  const signIn = () => {
-    setErr("");
-    setBusy(true);
-    const provider = new firebase.auth.GoogleAuthProvider();
-    auth.signInWithPopup(provider)
-      .catch(e => setErr(
-        e.code === "auth/popup-closed-by-user" ? ""
-          : e.code === "auth/popup-blocked" ? "Your browser blocked the sign-in popup \u2014 allow popups for this site and try again."
-          : "Couldn't sign in \u2014 " + (e.message || e.code)
-      ))
-      .finally(() => setBusy(false));
+  const notAllowed = !!user && !isAllowedEmail(user.email);
+
+  const makeProvider = () => {
+    const p = new firebase.auth.GoogleAuthProvider();
+    p.setCustomParameters({ prompt: "select_account" });
+    return p;
   };
 
-  const notAllowed = user && !ALLOWED_EMAILS.includes(user.email);
+  const signInPopup = () => {
+    setErr(""); setBusy(true);
+    auth.signInWithPopup(makeProvider())
+      .then(() => setBusy(false))
+      .catch(e => {
+        if (POPUP_FALLBACK_CODES.indexOf(e.code) !== -1) {
+          return auth.signInWithRedirect(makeProvider());
+        }
+        setErr(describeAuthError(e));
+        setBusy(false);
+      });
+  };
 
-  useEffect(() => {
-    if (!notAllowed) return;
-    const t = setTimeout(() => auth.signOut(), 1200);
-    return () => clearTimeout(t);
-  }, [notAllowed]);
+  const signInRedirect = () => {
+    setErr(""); setBusy(true);
+    auth.signInWithRedirect(makeProvider())
+      .catch(e => { setErr(describeAuthError(e)); setBusy(false); });
+  };
 
   if (user === undefined) {
     return /*#__PURE__*/React.createElement("div", {
@@ -3046,39 +3159,52 @@ function LoginGate({ children }) {
   }
 
   if (user === null || notAllowed) {
+    const cardStyle = { background: "#fff", borderRadius: 10, padding: 28, width: 340, maxWidth: "90vw", boxShadow: "0 1px 3px rgba(0,0,0,0.12)", textAlign: "center" };
     return /*#__PURE__*/React.createElement("div", {
-      style: {
-        minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
-        background: "#F1F1EC", fontFamily: "sans-serif"
-      }
-    }, /*#__PURE__*/React.createElement("div", {
-      style: { background: "#fff", borderRadius: 10, padding: 28, width: 320, maxWidth: "90vw", boxShadow: "0 1px 3px rgba(0,0,0,0.12)", textAlign: "center" }
-    },
+      style: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#F1F1EC", fontFamily: "sans-serif" }
+    }, /*#__PURE__*/React.createElement("div", { style: cardStyle },
       /*#__PURE__*/React.createElement("div", { style: { fontSize: 18, fontWeight: 600, color: "#1B2430", marginBottom: 6 } }, "Household Ledger"),
-      /*#__PURE__*/React.createElement("div", { style: { fontSize: 12.5, color: "#8A8F97", marginBottom: 18 } }, "Sign in with your Google account"),
 
-      notAllowed && /*#__PURE__*/React.createElement("div", {
-        style: { background: "#FBEAF0", border: "1px solid #A6402B", color: "#A6402B", borderRadius: 8, padding: 10, fontSize: 12.5, marginBottom: 14, textAlign: "left" }
-      }, `${user.email} isn't on this household's list. Signing out\u2026`),
-
-      err && /*#__PURE__*/React.createElement("div", { style: { color: "#A6402B", fontSize: 12.5, marginBottom: 10 } }, err),
-
-      !notAllowed && /*#__PURE__*/React.createElement("button", {
-        onClick: signIn, disabled: busy,
-        style: {
-          width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
-          padding: "10px 0", borderRadius: 7, border: "1px solid #D8D4CB",
-          background: busy ? "#F1F1EC" : "#fff", color: "#3D4552", fontWeight: 600, fontSize: 14,
-          cursor: busy ? "default" : "pointer"
-        }
-      },
-        /*#__PURE__*/React.createElement("svg", { width: 18, height: 18, viewBox: "0 0 18 18" },
-          /*#__PURE__*/React.createElement("path", { fill: "#4285F4", d: "M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.9c1.7-1.56 2.68-3.87 2.68-6.62z" }),
-          /*#__PURE__*/React.createElement("path", { fill: "#34A853", d: "M9 18c2.43 0 4.47-.8 5.96-2.18l-2.9-2.26c-.8.54-1.84.86-3.06.86-2.35 0-4.34-1.59-5.05-3.72H.96v2.33A9 9 0 0 0 9 18z" }),
-          /*#__PURE__*/React.createElement("path", { fill: "#FBBC05", d: "M3.95 10.7A5.4 5.4 0 0 1 3.67 9c0-.59.1-1.16.28-1.7V4.97H.96A9 9 0 0 0 0 9c0 1.45.35 2.83.96 4.03l2.99-2.33z" }),
-          /*#__PURE__*/React.createElement("path", { fill: "#EA4335", d: "M9 3.58c1.32 0 2.51.46 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0A9 9 0 0 0 .96 4.97l2.99 2.33C4.66 5.17 6.65 3.58 9 3.58z" })
-        ),
-        busy ? "Signing in\u2026" : "Sign in with Google")
+      notAllowed
+        ? /*#__PURE__*/React.createElement(React.Fragment, null,
+            /*#__PURE__*/React.createElement("div", {
+              style: { background: "#FBEAF0", border: "1px solid #A6402B", color: "#A6402B", borderRadius: 8, padding: 12, fontSize: 12.5, margin: "14px 0", textAlign: "left", lineHeight: 1.5 }
+            },
+              /*#__PURE__*/React.createElement("div", { style: { fontWeight: 600, marginBottom: 4 } }, "This account isn't on the household list."),
+              /*#__PURE__*/React.createElement("div", { style: { fontFamily: "monospace", wordBreak: "break-all", marginBottom: 6 } }, user.email || "(no email on this account)"),
+              /*#__PURE__*/React.createElement("div", null, "Allowed: " + ALLOWED_EMAILS.join(", "))),
+            /*#__PURE__*/React.createElement("button", {
+              onClick: () => auth.signOut(),
+              style: { width: "100%", padding: "9px 0", borderRadius: 7, border: "1px solid #D8D4CB", background: "#fff", color: "#3D4552", fontWeight: 600, fontSize: 13.5, cursor: "pointer" }
+            }, "Use a different account"))
+        : /*#__PURE__*/React.createElement(React.Fragment, null,
+            /*#__PURE__*/React.createElement("div", { style: { fontSize: 12.5, color: "#8A8F97", marginBottom: 18 } }, "Sign in with your Google account"),
+            err && /*#__PURE__*/React.createElement("div", {
+              style: { background: "#FBEAF0", border: "1px solid #A6402B", color: "#A6402B", borderRadius: 8, padding: 10, fontSize: 12.5, marginBottom: 12, textAlign: "left", lineHeight: 1.5 }
+            }, err),
+            /*#__PURE__*/React.createElement("button", {
+              onClick: signInPopup, disabled: busy,
+              style: {
+                width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+                padding: "10px 0", borderRadius: 7, border: "1px solid #D8D4CB",
+                background: busy ? "#F1F1EC" : "#fff", color: "#3D4552", fontWeight: 600, fontSize: 14,
+                cursor: busy ? "default" : "pointer"
+              }
+            },
+              /*#__PURE__*/React.createElement("svg", { width: 18, height: 18, viewBox: "0 0 18 18" },
+                /*#__PURE__*/React.createElement("path", { fill: "#4285F4", d: "M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.9c1.7-1.56 2.68-3.87 2.68-6.62z" }),
+                /*#__PURE__*/React.createElement("path", { fill: "#34A853", d: "M9 18c2.43 0 4.47-.8 5.96-2.18l-2.9-2.26c-.8.54-1.84.86-3.06.86-2.35 0-4.34-1.59-5.05-3.72H.96v2.33A9 9 0 0 0 9 18z" }),
+                /*#__PURE__*/React.createElement("path", { fill: "#FBBC05", d: "M3.95 10.7A5.4 5.4 0 0 1 3.67 9c0-.59.1-1.16.28-1.7V4.97H.96A9 9 0 0 0 0 9c0 1.45.35 2.83.96 4.03l2.99-2.33z" }),
+                /*#__PURE__*/React.createElement("path", { fill: "#EA4335", d: "M9 3.58c1.32 0 2.51.46 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0A9 9 0 0 0 .96 4.97l2.99 2.33C4.66 5.17 6.65 3.58 9 3.58z" })
+              ),
+              busy ? "Signing in\u2026" : "Sign in with Google"),
+            /*#__PURE__*/React.createElement("button", {
+              onClick: signInRedirect, disabled: busy,
+              style: { marginTop: 10, background: "transparent", border: "none", color: "#8A8F97", fontSize: 11.5, textDecoration: "underline", cursor: "pointer" }
+            }, "Popup not working? Sign in without a popup"),
+            /*#__PURE__*/React.createElement("div", {
+              style: { marginTop: 16, paddingTop: 12, borderTop: "1px solid #EDEBE5", fontSize: 10.5, color: "#B0AEA8", fontFamily: "monospace", wordBreak: "break-all" }
+            }, "domain: " + (typeof location !== "undefined" ? location.hostname || "(local file)" : "?")))
     ));
   }
 
@@ -3097,7 +3223,11 @@ function LoginGate({ children }) {
 }
 
 function App() {
-  const [records, setRecords] = useState(null);
+  const [sealedRecords, setSealedRecords] = useState(null);
+  // First day of the first month the ledger is authoritative for. Months
+  // before it stay as sealed imported records; months from it onward are
+  // derived from transactions and cannot be hand-edited.
+  const [ledgerStart, setLedgerStart] = useState(null);
   const [assumptions, setAssumptions] = useState(DEFAULT_ASSUMPTIONS);
   const [budgets, setBudgets] = useState({});
   const [contracts, setContracts] = useState([]);
@@ -3179,7 +3309,8 @@ function App() {
         const snap = await LEDGER_DOC.get();
         if (snap.exists) {
           const p = snap.data();
-          setRecords(p.records || INITIAL_RECORDS);
+          setSealedRecords(p.records || INITIAL_RECORDS);
+          if (p.ledgerStart) setLedgerStart(p.ledgerStart);
           setAssumptions({
             ...DEFAULT_ASSUMPTIONS,
             ...(p.assumptions || {})
@@ -3208,10 +3339,13 @@ function App() {
           if (p.carLoan) setCarLoan(p.carLoan);
           if (p.cpfSettings) setCpfSettings(p.cpfSettings);
           if (p.taxSettings) setTaxSettings(p.taxSettings);
+          // Once the ledger is live the newest month is the current one, which
+          // is derived rather than stored — opening on the last SAVED record
+          // would land the dashboard on stale history.
           const loaded = (p.records && p.records.length) ? p.records : INITIAL_RECORDS;
-          setSelectedMonth(loaded[loaded.length - 1].month);
+          setSelectedMonth(p.ledgerStart ? isoToMonthLabel(todayISO()) : loaded[loaded.length - 1].month);
         } else {
-          setRecords(INITIAL_RECORDS);
+          setSealedRecords(INITIAL_RECORDS);
           await LEDGER_DOC.set({
             records: INITIAL_RECORDS,
             assumptions: DEFAULT_ASSUMPTIONS,
@@ -3232,7 +3366,7 @@ function App() {
       } catch (err) {
         console.error(err);
         setSyncError("Could not connect to shared storage — check your Firestore security rules. Showing local data only for now.");
-        setRecords(INITIAL_RECORDS);
+        setSealedRecords(INITIAL_RECORDS);
       }
       setLoading(false);
     })();
@@ -3241,7 +3375,8 @@ function App() {
   /* ─── Firestore save (replaces window.storage.set) ─── */
   const persistAll = async patch => {
     const next = {
-      records: patch.records ?? records,
+      records: patch.records ?? sealedRecords,
+      ledgerStart: patch.ledgerStart ?? ledgerStart,
       assumptions: patch.assumptions ?? assumptions,
       budgets: patch.budgets ?? budgets,
       contracts: patch.contracts ?? contracts,
@@ -3257,7 +3392,8 @@ function App() {
       cpfSettings: patch.cpfSettings ?? cpfSettings,
       taxSettings: patch.taxSettings ?? taxSettings
     };
-    if (patch.records) setRecords(patch.records);
+    if (patch.records) setSealedRecords(patch.records);
+    if (patch.ledgerStart) setLedgerStart(patch.ledgerStart);
     if (patch.assumptions) setAssumptions(patch.assumptions);
     if (patch.budgets) setBudgets(patch.budgets);
     if (patch.contracts) setContracts(patch.contracts);
@@ -3280,6 +3416,36 @@ function App() {
       setSyncError("Could not save to shared storage — check your Firestore security rules.");
     }
   };
+  const registry = useMemo(() => buildRegistry(accounts), [accounts]);
+  const liveBalances = useMemo(
+    () => computeBalances(registry, openingBalances, txns),
+    [registry, openingBalances, txns]
+  );
+
+  // Sealed history + ledger-derived months, merged into the single list every
+  // read path already expects. A sealed record for a month the ledger covers is
+  // deliberately ignored rather than merged — surfaced via shadowedMonths.
+  const records = useMemo(() => {
+    if (!sealedRecords) return null;
+    if (!ledgerStart) return sealedRecords;
+    const startKey = monthSortKey(isoToMonthLabel(ledgerStart));
+    const endKey = monthSortKey(isoToMonthLabel(todayISO()));
+    if (startKey === Number.MAX_SAFE_INTEGER || endKey === Number.MAX_SAFE_INTEGER) return sealedRecords;
+    const out = sealedRecords.filter(r => monthSortKey(r.month) < startKey);
+    for (let k = startKey; k <= endKey; k++) {
+      out.push(deriveRecord(monthLabelFromSortKey(k), registry, openingBalances, txns, categories));
+    }
+    return out.sort((a, b) => monthSortKey(a.month) - monthSortKey(b.month));
+  }, [sealedRecords, ledgerStart, registry, openingBalances, txns, categories]);
+
+  const shadowedMonths = useMemo(() => {
+    if (!sealedRecords || !ledgerStart) return [];
+    const startKey = monthSortKey(isoToMonthLabel(ledgerStart));
+    return sealedRecords.filter(r => monthSortKey(r.month) >= startKey).map(r => r.month);
+  }, [sealedRecords, ledgerStart]);
+
+  const currentMonthLabel = isoToMonthLabel(todayISO());
+
   const derivedByMonth = useMemo(() => {
     if (!records) return {};
     const map = {};
@@ -3307,8 +3473,7 @@ function App() {
   }, [records, derivedByMonth]);
   const nextMonthName = useMemo(() => {
     if (!records) return "Jul 2026";
-    const idx = MONTH_ORDER.indexOf(records[records.length - 1].month);
-    return MONTH_ORDER[idx + 1] || "New month";
+    return monthLabelFromSortKey(monthSortKey(records[records.length - 1].month) + 1);
   }, [records]);
   /* ─── Transaction ledger ─── */
   // Live listener on the subcollection: each transaction is its own document,
@@ -3321,12 +3486,6 @@ function App() {
     );
     return () => unsub();
   }, []);
-
-  const registry = useMemo(() => buildRegistry(accounts), [accounts]);
-  const liveBalances = useMemo(
-    () => computeBalances(registry, openingBalances, txns),
-    [registry, openingBalances, txns]
-  );
 
   const saveTxn = async t => {
     try { await TXN_COL.doc(t.id).set(t); setTxnError(""); }
@@ -3345,61 +3504,16 @@ function App() {
     createdAt: new Date().toISOString()
   });
   const setOpeningFromLatest = () => {
-    const last = records[records.length - 1];
+    const list = sealedRecords || [];
+    const last = list[list.length - 1];
     if (!last) return;
-    persistAll({ openingBalances: openingFromRecord(last, registry) });
-    setSaveMsg("Opening balances set");
+    // The ledger takes over from the month AFTER the last sealed record, so
+    // sealed and derived months never overlap and never disagree.
+    const start = monthStartISO(monthLabelFromSortKey(monthSortKey(last.month) + 1));
+    persistAll({ openingBalances: openingFromRecord(last, registry), ledgerStart: start });
+    setSelectedMonth(isoToMonthLabel(todayISO()));
+    setSaveMsg("Opening balances set — ledger is live from " + isoToMonthLabel(start));
     setTimeout(() => setSaveMsg(""), 3000);
-  };
-
-  // Rolls a date range of transactions up into the monthly record shape the
-  // dashboard, budgets and forecast tabs already read, so the ledger feeds
-  // the rest of the app instead of sitting beside it.
-  const rollupToRecord = (fromISO, toISO) => {
-    const monthLabel = isoToMonthLabel(toISO);
-    if (!monthLabel) return;
-    const inR = txns.filter(t => t.date >= fromISO && t.date <= toISO && !t.voided);
-    const activeExpense = categories.expense.filter(c => !c.archived);
-    const activeIncome = categories.income.filter(c => !c.archived);
-    const blank = cats => Object.fromEntries(cats.map(c => [c.key,
-      c.subcats && c.subcats.length ? Object.fromEntries(c.subcats.map(s => [s.key, 0])) : 0]));
-    const income = blank(activeIncome);
-    const expenses = {
-      fixedNonFinancial: blank(activeExpense.filter(c => c.group === "fixedNonFinancial")),
-      fixedFinancial: blank(activeExpense.filter(c => c.group === "fixedFinancial")),
-      variable: blank(activeExpense.filter(c => c.group === "variable"))
-    };
-    const add = (bucket, catKey, subKey, amt) => {
-      if (!bucket || bucket[catKey] === undefined) return;
-      if (bucket[catKey] && typeof bucket[catKey] === "object") {
-        if (subKey && bucket[catKey][subKey] !== undefined) bucket[catKey][subKey] += amt;
-        else {
-          const first = Object.keys(bucket[catKey])[0];
-          if (first) bucket[catKey][first] += amt;
-        }
-      } else bucket[catKey] += amt;
-    };
-    inR.forEach(t => {
-      const e = txnEffect(t, categories);
-      if (e.kind === "income") add(income, t.category, t.subcat, e.amount);
-      else if (e.kind === "expense") {
-        const c = activeExpense.find(x => x.key === t.category);
-        if (c) add(expenses[c.group], t.category, t.subcat, e.amount);
-      }
-    });
-    const balances = JSON.parse(JSON.stringify(BLANK_BALANCES));
-    registry.forEach(a => {
-      if (!balances[a.group]) balances[a.group] = {};
-      balances[a.group][a.ref] = Math.round((liveBalances[a.key] || 0) * 100) / 100;
-    });
-    const rec = { month: monthLabel, income, expenses, balances };
-    const idx = records.findIndex(r => r.month === monthLabel);
-    const nextRecords = idx >= 0 ? records.map((r, i) => i === idx ? rec : r) : [...records, rec];
-    nextRecords.sort((a, b) => monthSortKey(a.month) - monthSortKey(b.month));
-    persistAll({ records: nextRecords });
-    setSelectedMonth(monthLabel);
-    setSaveMsg(`${monthLabel} ${idx >= 0 ? "updated" : "created"} from transactions`);
-    setTimeout(() => setSaveMsg(""), 4000);
   };
 
   const blankFromCats = cats => Object.fromEntries(cats.map(c => [c.key, c.subcats && c.subcats.length ? Object.fromEntries(c.subcats.map(s => [s.key, 0])) : 0]));
@@ -3442,7 +3556,14 @@ function App() {
   };
 
   const startDraft = () => {
-    const last = records[records.length - 1];
+    if (ledgerStart && monthSortKey(nextMonthName) >= monthSortKey(isoToMonthLabel(ledgerStart))) {
+      setSaveMsg(`${nextMonthName} is derived from the ledger — add entries in Daily ledger instead.`);
+      setTimeout(() => setSaveMsg(""), 5000);
+      return;
+    }
+    const list = sealedRecords || [];
+    const last = list[list.length - 1];
+    if (!last) return;
     const balances = JSON.parse(JSON.stringify(last.balances || BLANK_BALANCES));
     const ensureAccountKeys = (obj, list) => {
       const out = { ...obj };
@@ -3484,7 +3605,7 @@ function App() {
   const saveDraft = async () => {
     if (!draft) return;
     await persistAll({
-      records: [...records, draft]
+      records: [...sealedRecords, draft]
     });
     setSelectedMonth(draft.month);
     setDraft(null);
@@ -3857,16 +3978,25 @@ function App() {
   const activeLoanKey = loanSub === "housing" ? "housingLoan" : "carLoan";
   const forecast = useMemo(() => {
     if (!records || records.length === 0) return [];
-    const last3 = records.slice(-3);
-    const avgIncome = last3.reduce((a, r) => a + r.income.payrollEt + r.income.piano + r.income.interestDividends, 0) / last3.length;
-    const avgExpense = last3.reduce((a, r) => a + computeDerived(r, assumptions, accounts).totalExpenses - (r.expenses.variable.bigTicket || 0), 0) / last3.length;
+    // The in-progress month is only partly logged, so averaging it in drags
+    // the baseline down for the whole 12-month projection. Complete months only,
+    // falling back to whatever exists if the ledger has just started.
+    const complete = records.filter(r => r.month !== currentMonthLabel);
+    const baseline = complete.length ? complete.slice(-3) : records.slice(-3);
+    // Was hardcoded to payrollEt + piano + interestDividends, which silently
+    // produced NaN if any of those were renamed and ignored any category added.
+    const avgIncome = baseline.reduce((a, r) =>
+      a + computeDerived(r, assumptions, accounts).totalIncome, 0) / baseline.length;
+    const avgExpense = baseline.reduce((a, r) =>
+      a + computeDerived(r, assumptions, accounts).totalExpenses
+        - catTotal(r.expenses.variable.bigTicket), 0) / baseline.length;
     const lastRec = records[records.length - 1];
     const lastDerived = derivedByMonth[lastRec.month];
     let cumNetWorth = lastDerived.hasBalances ? lastDerived.netWorth : 0;
-    const startIdx = MONTH_ORDER.indexOf(lastRec.month) + 1;
+    const startKey = monthSortKey(lastRec.month) + 1;
     const rows = [];
     for (let i = 0; i < 12; i++) {
-      const monthName = MONTH_ORDER[startIdx + i] || `Month +${i + 1}`;
+      const monthName = monthLabelFromSortKey(startKey + i);
       const calendarMonth = new Date(`${monthName.split(" ")[0]} 1, 2026`).getMonth() + 1;
       let recurExpense = 0,
         recurIncome = 0;
@@ -4003,7 +4133,19 @@ function App() {
       borderRadius: 8,
       padding: "10px 14px"
     }
-  }, syncError), /*#__PURE__*/React.createElement("div", {
+  }, syncError), shadowedMonths.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 16,
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)",
+      background: "#FBF3E6",
+      border: "1px solid var(--hair-strong)",
+      borderRadius: 8,
+      padding: "10px 14px",
+      lineHeight: 1.5
+    }
+  }, `${shadowedMonths.join(", ")} ${shadowedMonths.length === 1 ? "has a saved record but is" : "have saved records but are"} now derived from the ledger. The saved figures are ignored — what you see comes from your transactions.`), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       justifyContent: "space-between",
@@ -4749,7 +4891,7 @@ function App() {
     onDelete: deleteTxn,
     onReconcile: reconcileAccount,
     onSetOpening: setOpeningFromLatest,
-    onRollup: rollupToRecord
+    orphans: orphanTxns(registry, txns)
   }), tab === "add" && draft && /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 20
