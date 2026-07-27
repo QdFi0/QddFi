@@ -20,6 +20,7 @@
      <script> tag loading in some environments. v8 has no such internals. -->
 <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
 <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
+<script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-auth.js"></script>
 
 <style>
   html, body { margin: 0; padding: 0; background: #F1F1EC; }
@@ -77,6 +78,11 @@
   // Everything is stored in one shared document so you and your partner
   // both read/write the same household data.
   const LEDGER_DOC = db.collection("households").doc("etsy");
+  const auth = firebase.auth();
+  // Keeps you signed in across visits/refreshes, same browser only.
+  auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(function (err) {
+    console.warn("Auth persistence unavailable:", err && err.code);
+  });
 </script>
 
 <!-- App code — pre-compiled from JSX to plain JavaScript ahead of time,
@@ -2979,6 +2985,84 @@ function TransactionsTab({
       onConfirm: () => { onDelete(confirmDelete.id); setConfirmDelete(null); },
       onCancel: () => setConfirmDelete(null)
     })
+  );
+}
+
+function LoginGate({ children }) {
+  const [user, setUser] = useState(undefined); // undefined = still checking
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const unsub = auth.onAuthStateChanged(u => setUser(u || null));
+    return () => unsub();
+  }, []);
+
+  const submit = () => {
+    setErr("");
+    setBusy(true);
+    auth.signInWithEmailAndPassword(email.trim(), password)
+      .catch(e => setErr(
+        e.code === "auth/invalid-credential" || e.code === "auth/wrong-password" || e.code === "auth/user-not-found"
+          ? "Wrong email or password."
+          : "Couldn't sign in \u2014 " + (e.message || e.code)
+      ))
+      .finally(() => setBusy(false));
+  };
+
+  if (user === undefined) {
+    return /*#__PURE__*/React.createElement("div", {
+      style: { fontFamily: "sans-serif", padding: 40, color: "#3D4552" }
+    }, "Checking sign-in\u2026");
+  }
+
+  if (user === null) {
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+        background: "#F1F1EC", fontFamily: "sans-serif"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: { background: "#fff", borderRadius: 10, padding: 28, width: 320, maxWidth: "90vw", boxShadow: "0 1px 3px rgba(0,0,0,0.12)" }
+    },
+      /*#__PURE__*/React.createElement("div", { style: { fontSize: 18, fontWeight: 600, color: "#1B2430", marginBottom: 16 } }, "Household Ledger"),
+      /*#__PURE__*/React.createElement("input", {
+        type: "email", placeholder: "Email", value: email,
+        onChange: e => setEmail(e.target.value),
+        onKeyDown: e => { if (e.key === "Enter") submit(); },
+        style: { width: "100%", padding: "9px 10px", marginBottom: 10, borderRadius: 6, border: "1px solid #D8D4CB", fontSize: 14, boxSizing: "border-box" }
+      }),
+      /*#__PURE__*/React.createElement("input", {
+        type: "password", placeholder: "Password", value: password,
+        onChange: e => setPassword(e.target.value),
+        onKeyDown: e => { if (e.key === "Enter") submit(); },
+        style: { width: "100%", padding: "9px 10px", marginBottom: 14, borderRadius: 6, border: "1px solid #D8D4CB", fontSize: 14, boxSizing: "border-box" }
+      }),
+      err && /*#__PURE__*/React.createElement("div", { style: { color: "#A6402B", fontSize: 12.5, marginBottom: 10 } }, err),
+      /*#__PURE__*/React.createElement("button", {
+        onClick: submit, disabled: busy || !email || !password,
+        style: {
+          width: "100%", padding: "9px 0", borderRadius: 7, border: "1px solid #3D4552",
+          background: busy ? "#8A8F97" : "#3D4552", color: "#fff", fontWeight: 600, fontSize: 14,
+          cursor: busy ? "default" : "pointer"
+        }
+      }, busy ? "Signing in\u2026" : "Sign in")
+    ));
+  }
+
+  return /*#__PURE__*/React.createElement(React.Fragment, null,
+    /*#__PURE__*/React.createElement("button", {
+      onClick: () => auth.signOut(),
+      title: "Sign out",
+      style: {
+        position: "fixed", top: 10, right: 12, zIndex: 999,
+        fontFamily: "sans-serif", fontSize: 11, color: "#8A8F97",
+        background: "transparent", border: "none", cursor: "pointer", padding: 4
+      }
+    }, "Sign out (" + (user.email || "") + ")"),
+    children
   );
 }
 
@@ -6755,7 +6839,7 @@ function App() {
     }
   }));
 }
-ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
+ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(LoginGate, null, /*#__PURE__*/React.createElement(App, null)));
 </script>
 </body>
 </html>
