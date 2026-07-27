@@ -2435,6 +2435,15 @@ const openingFromRecord = (record, registry) => {
 };
 
 const MONTH_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+// MONTH_ORDER is a fixed 2026-2029 list, so indexOf breaks outside it.
+// This derives the same ordinal arithmetically and keeps working forever.
+const monthSortKey = label => {
+  const parts = String(label || "").split(" ");
+  const mi = MONTH_ABBR.indexOf(parts[0]);
+  const y = parseInt(parts[1], 10);
+  if (mi < 0 || isNaN(y)) return Number.MAX_SAFE_INTEGER;
+  return (y - 2026) * 12 + mi;
+};
 const isoToMonthLabel = iso => {
   const [y, m] = (iso || "").split("-");
   return m ? `${MONTH_ABBR[parseInt(m, 10) - 1]} ${y}` : "";
@@ -2568,7 +2577,7 @@ function ReconcileDialog({ account, computed, onCancel, onConfirm, categories })
   const [note, setNote] = useState("");
   const [date, setDate] = useState(todayISO());
   const [counterCat, setCounterCat] = useState("");
-  const diff = (Number(actual) || 0) - computed;
+  const diff = Math.round(((Number(actual) || 0) - computed) * 100) / 100;
   // Which way the difference points decides which side of the books it
   // belongs on: an asset that grew, or a liability that shrank, is a gain.
   const favourable = account.kind === "liability" ? diff < 0 : diff > 0;
@@ -2686,7 +2695,7 @@ function TransactionsTab({
   const submit = () => {
     if (!canSave) return;
     onSave({
-      id: form.id || uid(),
+      id: form.id || (Date.now().toString(36) + uid()),
       date: form.date,
       type: form.type,
       amount: Math.abs(Number(form.amount)) || 0,
@@ -2697,7 +2706,7 @@ function TransactionsTab({
       payee: form.payee || "",
       note: form.note || "",
       who: form.who || "",
-      createdAt: new Date().toISOString()
+      createdAt: form.createdAt || new Date().toISOString()
     });
     setForm({ ...blank, date: form.date, type: form.type, account: form.account, who: form.who });
   };
@@ -2922,9 +2931,14 @@ function TransactionsTab({
                 const destName = acctLabel(registry, t.toAccount);
                 const isAdj = t.type === "adjustment";
                 const amt = isAdj ? Number(t.storedDelta) || 0 : Number(t.amount) || 0;
-                const colour = isAdj ? "var(--ink-3)"
+                const colour = isAdj ? (amt >= 0 ? "#2F6B4F" : "#A6402B")
                   : t.type === "income" ? "#2F6B4F"
                   : t.type === "transfer" ? "var(--ink-3)" : "var(--ink-1)";
+                const signed = isAdj
+                  ? (amt >= 0 ? "+" : "−") + fmt(Math.abs(amt), 2)
+                  : t.type === "income" ? "+" + fmt(amt, 2)
+                  : t.type === "expense" ? "−" + fmt(amt, 2)
+                  : fmt(amt, 2);
                 return rc("div", {
                   key: t.id,
                   style: {
@@ -2950,14 +2964,15 @@ function TransactionsTab({
                       fontFamily: "var(--mono)", fontSize: 13.5, color: colour,
                       whiteSpace: "nowrap"
                     }
-                  }, (t.type === "income" ? "+" : t.type === "expense" ? "−" : "") + fmt(Math.abs(amt), 2).replace("-", "")),
+                  }, signed),
                   rc("div", { style: { display: "flex", gap: 4 } },
                     !isAdj && rc(IconBtn, {
                       onClick: () => setForm({
                         id: t.id, date: t.date, type: t.type, amount: t.amount,
                         account: t.account, toAccount: t.toAccount || "",
                         category: t.category || "", subcat: t.subcat || "",
-                        payee: t.payee || "", note: t.note || "", who: t.who || "ET"
+                        payee: t.payee || "", note: t.note || "", who: t.who || "ET",
+                        createdAt: t.createdAt || null
                       })
                     }, "Edit"),
                     rc(IconBtn, { onClick: () => setConfirmDelete(t) }, "Delete"))
@@ -2988,10 +3003,13 @@ function TransactionsTab({
   );
 }
 
+// Kept in sync with the allowlist in the Firestore rules — used only to
+// show a clear "you're not on the list" message client-side. The rules are
+// still what actually enforce this; this is just a better error message.
+const ALLOWED_EMAILS = ["eng.teck.93@gmail.com", "siruchew@gmail.com"];
+
 function LoginGate({ children }) {
   const [user, setUser] = useState(undefined); // undefined = still checking
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -3000,17 +3018,26 @@ function LoginGate({ children }) {
     return () => unsub();
   }, []);
 
-  const submit = () => {
+  const signIn = () => {
     setErr("");
     setBusy(true);
-    auth.signInWithEmailAndPassword(email.trim(), password)
+    const provider = new firebase.auth.GoogleAuthProvider();
+    auth.signInWithPopup(provider)
       .catch(e => setErr(
-        e.code === "auth/invalid-credential" || e.code === "auth/wrong-password" || e.code === "auth/user-not-found"
-          ? "Wrong email or password."
+        e.code === "auth/popup-closed-by-user" ? ""
+          : e.code === "auth/popup-blocked" ? "Your browser blocked the sign-in popup \u2014 allow popups for this site and try again."
           : "Couldn't sign in \u2014 " + (e.message || e.code)
       ))
       .finally(() => setBusy(false));
   };
+
+  const notAllowed = user && !ALLOWED_EMAILS.includes(user.email);
+
+  useEffect(() => {
+    if (!notAllowed) return;
+    const t = setTimeout(() => auth.signOut(), 1200);
+    return () => clearTimeout(t);
+  }, [notAllowed]);
 
   if (user === undefined) {
     return /*#__PURE__*/React.createElement("div", {
@@ -3018,37 +3045,40 @@ function LoginGate({ children }) {
     }, "Checking sign-in\u2026");
   }
 
-  if (user === null) {
+  if (user === null || notAllowed) {
     return /*#__PURE__*/React.createElement("div", {
       style: {
         minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
         background: "#F1F1EC", fontFamily: "sans-serif"
       }
     }, /*#__PURE__*/React.createElement("div", {
-      style: { background: "#fff", borderRadius: 10, padding: 28, width: 320, maxWidth: "90vw", boxShadow: "0 1px 3px rgba(0,0,0,0.12)" }
+      style: { background: "#fff", borderRadius: 10, padding: 28, width: 320, maxWidth: "90vw", boxShadow: "0 1px 3px rgba(0,0,0,0.12)", textAlign: "center" }
     },
-      /*#__PURE__*/React.createElement("div", { style: { fontSize: 18, fontWeight: 600, color: "#1B2430", marginBottom: 16 } }, "Household Ledger"),
-      /*#__PURE__*/React.createElement("input", {
-        type: "email", placeholder: "Email", value: email,
-        onChange: e => setEmail(e.target.value),
-        onKeyDown: e => { if (e.key === "Enter") submit(); },
-        style: { width: "100%", padding: "9px 10px", marginBottom: 10, borderRadius: 6, border: "1px solid #D8D4CB", fontSize: 14, boxSizing: "border-box" }
-      }),
-      /*#__PURE__*/React.createElement("input", {
-        type: "password", placeholder: "Password", value: password,
-        onChange: e => setPassword(e.target.value),
-        onKeyDown: e => { if (e.key === "Enter") submit(); },
-        style: { width: "100%", padding: "9px 10px", marginBottom: 14, borderRadius: 6, border: "1px solid #D8D4CB", fontSize: 14, boxSizing: "border-box" }
-      }),
+      /*#__PURE__*/React.createElement("div", { style: { fontSize: 18, fontWeight: 600, color: "#1B2430", marginBottom: 6 } }, "Household Ledger"),
+      /*#__PURE__*/React.createElement("div", { style: { fontSize: 12.5, color: "#8A8F97", marginBottom: 18 } }, "Sign in with your Google account"),
+
+      notAllowed && /*#__PURE__*/React.createElement("div", {
+        style: { background: "#FBEAF0", border: "1px solid #A6402B", color: "#A6402B", borderRadius: 8, padding: 10, fontSize: 12.5, marginBottom: 14, textAlign: "left" }
+      }, `${user.email} isn't on this household's list. Signing out\u2026`),
+
       err && /*#__PURE__*/React.createElement("div", { style: { color: "#A6402B", fontSize: 12.5, marginBottom: 10 } }, err),
-      /*#__PURE__*/React.createElement("button", {
-        onClick: submit, disabled: busy || !email || !password,
+
+      !notAllowed && /*#__PURE__*/React.createElement("button", {
+        onClick: signIn, disabled: busy,
         style: {
-          width: "100%", padding: "9px 0", borderRadius: 7, border: "1px solid #3D4552",
-          background: busy ? "#8A8F97" : "#3D4552", color: "#fff", fontWeight: 600, fontSize: 14,
+          width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
+          padding: "10px 0", borderRadius: 7, border: "1px solid #D8D4CB",
+          background: busy ? "#F1F1EC" : "#fff", color: "#3D4552", fontWeight: 600, fontSize: 14,
           cursor: busy ? "default" : "pointer"
         }
-      }, busy ? "Signing in\u2026" : "Sign in")
+      },
+        /*#__PURE__*/React.createElement("svg", { width: 18, height: 18, viewBox: "0 0 18 18" },
+          /*#__PURE__*/React.createElement("path", { fill: "#4285F4", d: "M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.9c1.7-1.56 2.68-3.87 2.68-6.62z" }),
+          /*#__PURE__*/React.createElement("path", { fill: "#34A853", d: "M9 18c2.43 0 4.47-.8 5.96-2.18l-2.9-2.26c-.8.54-1.84.86-3.06.86-2.35 0-4.34-1.59-5.05-3.72H.96v2.33A9 9 0 0 0 9 18z" }),
+          /*#__PURE__*/React.createElement("path", { fill: "#FBBC05", d: "M3.95 10.7A5.4 5.4 0 0 1 3.67 9c0-.59.1-1.16.28-1.7V4.97H.96A9 9 0 0 0 0 9c0 1.45.35 2.83.96 4.03l2.99-2.33z" }),
+          /*#__PURE__*/React.createElement("path", { fill: "#EA4335", d: "M9 3.58c1.32 0 2.51.46 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0A9 9 0 0 0 .96 4.97l2.99 2.33C4.66 5.17 6.65 3.58 9 3.58z" })
+        ),
+        busy ? "Signing in\u2026" : "Sign in with Google")
     ));
   }
 
@@ -3178,7 +3208,8 @@ function App() {
           if (p.carLoan) setCarLoan(p.carLoan);
           if (p.cpfSettings) setCpfSettings(p.cpfSettings);
           if (p.taxSettings) setTaxSettings(p.taxSettings);
-          setSelectedMonth((p.records || INITIAL_RECORDS)[(p.records || INITIAL_RECORDS).length - 1].month);
+          const loaded = (p.records && p.records.length) ? p.records : INITIAL_RECORDS;
+          setSelectedMonth(loaded[loaded.length - 1].month);
         } else {
           setRecords(INITIAL_RECORDS);
           await LEDGER_DOC.set({
@@ -3194,6 +3225,7 @@ function App() {
               income: seedIncomeCategories()
             },
             accounts: seedAccounts(),
+            openingBalances: {},
             dismissedHints: {}
           });
         }
@@ -3305,7 +3337,7 @@ function App() {
     catch (err) { console.error(err); setTxnError("Could not delete that entry."); }
   };
   const reconcileAccount = (account, sd, note, date, category) => saveTxn({
-    id: uid(), date, type: "adjustment",
+    id: Date.now().toString(36) + uid(), date, type: "adjustment",
     storedDelta: sd, amount: Math.abs(sd),
     account: account.key, toAccount: null,
     category: category || "balanceAdjustment", subcat: null,
@@ -3363,7 +3395,7 @@ function App() {
     const rec = { month: monthLabel, income, expenses, balances };
     const idx = records.findIndex(r => r.month === monthLabel);
     const nextRecords = idx >= 0 ? records.map((r, i) => i === idx ? rec : r) : [...records, rec];
-    nextRecords.sort((a, b) => MONTH_ORDER.indexOf(a.month) - MONTH_ORDER.indexOf(b.month));
+    nextRecords.sort((a, b) => monthSortKey(a.month) - monthSortKey(b.month));
     persistAll({ records: nextRecords });
     setSelectedMonth(monthLabel);
     setSaveMsg(`${monthLabel} ${idx >= 0 ? "updated" : "created"} from transactions`);
@@ -3371,6 +3403,44 @@ function App() {
   };
 
   const blankFromCats = cats => Object.fromEntries(cats.map(c => [c.key, c.subcats && c.subcats.length ? Object.fromEntries(c.subcats.map(s => [s.key, 0])) : 0]));
+  // Re-shapes an in-progress draft to match the current category list.
+  // Values already typed are preserved: a category that gained sub-categories
+  // moves its old total into the first sub-category, and one that lost them
+  // has its sub-values summed back into a single figure.
+  const syncDraftShape = d => {
+    if (!d) return d;
+    const merge = (existing, cats) => {
+      const out = {};
+      cats.forEach(c => {
+        const subs = (c.subcats || []);
+        const prev = existing ? existing[c.key] : undefined;
+        const prevIsObj = prev && typeof prev === "object";
+        if (subs.length) {
+          const o = {};
+          subs.forEach((s, i) => {
+            if (prevIsObj) o[s.key] = Number(prev[s.key]) || 0;
+            else o[s.key] = (i === 0) ? (Number(prev) || 0) : 0;
+          });
+          out[c.key] = o;
+        } else {
+          out[c.key] = prevIsObj ? sum(prev) : (Number(prev) || 0);
+        }
+      });
+      return out;
+    };
+    const activeExpense = categories.expense.filter(c => !c.archived);
+    const activeIncome = categories.income.filter(c => !c.archived);
+    const ex = d.expenses || {};
+    return Object.assign({}, d, {
+      income: merge(d.income, activeIncome),
+      expenses: {
+        fixedNonFinancial: merge(ex.fixedNonFinancial, activeExpense.filter(c => c.group === "fixedNonFinancial")),
+        fixedFinancial: merge(ex.fixedFinancial, activeExpense.filter(c => c.group === "fixedFinancial")),
+        variable: merge(ex.variable, activeExpense.filter(c => c.group === "variable"))
+      }
+    });
+  };
+
   const startDraft = () => {
     const last = records[records.length - 1];
     const balances = JSON.parse(JSON.stringify(last.balances || BLANK_BALANCES));
@@ -3971,7 +4041,10 @@ function App() {
     key: id,
     className: `tab-btn ${tab === id ? "active" : ""}`,
     onClick: () => {
-      if (id === "add" && !draft) startDraft();else setTab(id);
+      if (id === "add") {
+        if (!draft) startDraft();
+        else { setDraft(syncDraftShape(draft)); setTab("add"); }
+      } else setTab(id);
     }
   }, label)), /*#__PURE__*/React.createElement("div", {
     style: {
