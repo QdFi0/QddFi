@@ -771,6 +771,25 @@ const seedAccounts = () => ({
     owner: "Joint"
   }]
 });
+// The shape a household document starts from — used both when a brand-new
+// household name is first seen, and when resetting an existing one back to blank.
+const blankHouseholdDoc = () => ({
+  records: [],
+  ledgerStart: monthStartISO(isoToMonthLabel(todayISO())),
+  assumptions: DEFAULT_ASSUMPTIONS,
+  budgets: {},
+  contracts: [],
+  policies: [],
+  recurring: [],
+  familyMembers: ["Person 1", "Person 2"],
+  categories: {
+    expense: seedExpenseCategories(),
+    income: seedIncomeCategories()
+  },
+  accounts: seedAccounts(),
+  openingBalances: {},
+  dismissedHints: {}
+});
 const INSURANCE_TYPES = ["Death/TPD", "CI/ECI", "Personal Accident", "Hospitalisation", "Endowment"];
 const FREQUENCIES = ["Monthly", "Quarterly", "Semi-Annual", "Annual"];
 const PAYMENT_METHODS = ["GIRO", "Credit card", "PayNow", "Cheque", "Other"];
@@ -3011,6 +3030,26 @@ function App() {
     location.reload();
   };
   const [householdSwitchInput, setHouseholdSwitchInput] = useState("");
+  const [confirmResetHousehold, setConfirmResetHousehold] = useState(false);
+  const [resetError, setResetError] = useState("");
+  // Wipes every transaction doc plus the household doc itself back to blank,
+  // then reloads — simplest way to guarantee every piece of in-memory state
+  // (there are a few dozen useState calls below) reflects the reset cleanly.
+  const resetHousehold = async () => {
+    try {
+      const snap = await TXN_COL.get();
+      if (snap.docs.length) {
+        const batch = db.batch();
+        snap.docs.forEach(d => batch.delete(d.ref));
+        await batch.commit();
+      }
+      await LEDGER_DOC.set(blankHouseholdDoc());
+      location.reload();
+    } catch (err) {
+      console.error(err);
+      setResetError("Could not reset this household — check your Firestore security rules.");
+    }
+  };
   const [sealedRecords, setSealedRecords] = useState(null);
   // First day of the first month the ledger is authoritative for. Months
   // before it stay as sealed imported records; months from it onward are
@@ -3127,27 +3166,11 @@ function App() {
         } else {
           // Brand-new household: no sealed history to import, so start the
           // ledger live from today rather than seeding any placeholder data.
-          const freshStart = monthStartISO(isoToMonthLabel(todayISO()));
+          const blank = blankHouseholdDoc();
           setSealedRecords([]);
-          setLedgerStart(freshStart);
+          setLedgerStart(blank.ledgerStart);
           setSelectedMonth(isoToMonthLabel(todayISO()));
-          await LEDGER_DOC.set({
-            records: [],
-            ledgerStart: freshStart,
-            assumptions: DEFAULT_ASSUMPTIONS,
-            budgets: {},
-            contracts: [],
-            policies: [],
-            recurring: [],
-            familyMembers: ["Person 1", "Person 2"],
-            categories: {
-              expense: seedExpenseCategories(),
-              income: seedIncomeCategories()
-            },
-            accounts: seedAccounts(),
-            openingBalances: {},
-            dismissedHints: {}
-          });
+          await LEDGER_DOC.set(blank);
         }
       } catch (err) {
         console.error(err);
@@ -6800,7 +6823,21 @@ function App() {
         className: "btn-secondary",
         disabled: !normalizeHouseholdName(householdSwitchInput) || normalizeHouseholdName(householdSwitchInput) === householdName,
         onClick: () => switchHousehold(householdSwitchInput)
-      }, "Switch"))));
+      }, "Switch"))), /*#__PURE__*/React.createElement(Card, { style: { marginTop: 16, borderColor: "#E8B4A8" } },
+      /*#__PURE__*/React.createElement("div", {
+        style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13, color: "var(--ink-1)", marginBottom: 4 }
+      }, "Reset this household"),
+      /*#__PURE__*/React.createElement("div", {
+        style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 12, lineHeight: 1.5 }
+      }, "Permanently erases every transaction, balance, and setting for \"", householdName, "\" and starts it blank again, as if newly created. This cannot be undone."),
+      resetError && /*#__PURE__*/React.createElement("div", {
+        style: { background: "#FBEAF0", border: "1px solid #A6402B", color: "#A6402B", borderRadius: 8, padding: 10, fontSize: 12.5, marginBottom: 12 }
+      }, resetError),
+      /*#__PURE__*/React.createElement("button", {
+        className: "btn-secondary",
+        style: { color: "#A6402B", borderColor: "#A6402B" },
+        onClick: () => setConfirmResetHousehold(true)
+      }, "Reset household data")));
     }
     if (settingsView === "categories") {
       return /*#__PURE__*/React.createElement(Section, {
@@ -7019,6 +7056,15 @@ function App() {
     onConfirm: () => {
       removePolicy(confirmRemovePolicyId);
       setConfirmRemovePolicyId(null);
+    }
+  }), confirmResetHousehold && /*#__PURE__*/React.createElement(ConfirmDialog, {
+    title: "Reset \"" + householdName + "\"?",
+    message: "Every transaction, balance, and setting for this household is permanently erased and it starts blank again. This cannot be undone.",
+    confirmLabel: "Reset household data",
+    onCancel: () => setConfirmResetHousehold(false),
+    onConfirm: () => {
+      setConfirmResetHousehold(false);
+      resetHousehold();
     }
   }));
 }
