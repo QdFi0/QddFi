@@ -75,13 +75,23 @@
   db.enablePersistence({ synchronizeTabs: true }).catch(function (err) {
     console.warn("Offline cache unavailable:", err && err.code);
   });
-  // Each household picks its own name (see HouseholdChooser below), which
-  // becomes the Firestore doc ID everyone in that household reads/writes.
-  // Resolved once the household name is known — null until then.
+  // Each household is identified by a code (see HouseholdChooser below),
+  // which becomes the Firestore doc ID everyone in that household reads/
+  // writes. Resolved once the code is known — null until then.
   let LEDGER_DOC = null;
   let TXN_COL = null;
   const normalizeHouseholdName = raw =>
     String(raw || "").trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  // Auto-generated on "Create a new household" — random, not user-chosen, so
+  // two unrelated households can never collide the way typed names could.
+  // Excludes visually ambiguous characters (0/o, 1/l/i).
+  const HOUSEHOLD_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+  const generateHouseholdCode = () => {
+    const part = () => Array.from({ length: 4 }, () =>
+      HOUSEHOLD_CODE_ALPHABET[Math.floor(Math.random() * HOUSEHOLD_CODE_ALPHABET.length)]
+    ).join("");
+    return `${part()}-${part()}`;
+  };
   function resolveHousehold(name) {
     LEDGER_DOC = db.collection("households").doc(name);
     TXN_COL = LEDGER_DOC.collection("transactions");
@@ -2981,33 +2991,75 @@ function LoginGate({ children }) {
 }
 
 function HouseholdChooser({ onChoose }) {
-  const [value, setValue] = useState("");
-  const submit = () => { if (normalizeHouseholdName(value)) onChoose(value); };
-  const cardStyle = { background: "#fff", borderRadius: 10, padding: 28, width: 340, maxWidth: "90vw", boxShadow: "0 1px 3px rgba(0,0,0,0.12)", textAlign: "center" };
-  return /*#__PURE__*/React.createElement("div", {
+  const [step, setStep] = useState("choose"); // choose | created | join
+  const [code, setCode] = useState("");
+  const [joinValue, setJoinValue] = useState("");
+  const [copied, setCopied] = useState(false);
+  const submitJoin = () => { if (normalizeHouseholdName(joinValue)) onChoose(joinValue); };
+  const startCreate = () => { setCode(generateHouseholdCode()); setStep("created"); };
+  const copyCode = () => {
+    (navigator.clipboard ? navigator.clipboard.writeText(code) : Promise.reject())
+      .then(() => setCopied(true)).catch(() => {});
+  };
+  const cardStyle = { background: "#fff", borderRadius: 10, padding: 28, width: 360, maxWidth: "90vw", boxShadow: "0 1px 3px rgba(0,0,0,0.12)", textAlign: "center" };
+  const primaryBtn = (label, onClick, disabled) => /*#__PURE__*/React.createElement("button", {
+    onClick, disabled,
+    style: {
+      width: "100%", padding: "10px 0", borderRadius: 7, border: "none",
+      background: disabled ? "#D8D4CB" : "#1B2430", color: "#fff",
+      fontWeight: 600, fontSize: 14, cursor: disabled ? "default" : "pointer"
+    }
+  }, label);
+  const wrap = children => /*#__PURE__*/React.createElement("div", {
     style: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#F1F1EC", fontFamily: "sans-serif" }
-  }, /*#__PURE__*/React.createElement("div", { style: cardStyle },
-    /*#__PURE__*/React.createElement("div", { style: { fontSize: 18, fontWeight: 600, color: "#1B2430", marginBottom: 6 } }, "Name your household"),
-    /*#__PURE__*/React.createElement("div", { style: { fontSize: 12.5, color: "#8A8F97", marginBottom: 18, lineHeight: 1.5 } },
-      "Pick any name — a new one starts a blank household, an existing one joins it. Share the same name with whoever you're tracking finances with."),
-    /*#__PURE__*/React.createElement("input", {
-      type: "text",
-      value,
-      placeholder: "e.g. smith-family",
-      onChange: e => setValue(e.target.value),
-      onKeyDown: e => { if (e.key === "Enter") submit(); },
-      style: { width: "100%", padding: "9px 10px", borderRadius: 7, border: "1px solid #D8D4CB", fontSize: 14, marginBottom: 12, boxSizing: "border-box" }
-    }),
+  }, /*#__PURE__*/React.createElement("div", { style: cardStyle }, ...children));
+
+  if (step === "created") {
+    return wrap([
+      /*#__PURE__*/React.createElement("div", { key: "t", style: { fontSize: 18, fontWeight: 600, color: "#1B2430", marginBottom: 6 } }, "Your household code"),
+      /*#__PURE__*/React.createElement("div", { key: "s", style: { fontSize: 12.5, color: "#8A8F97", marginBottom: 16, lineHeight: 1.5 } },
+        "Save this and share it with whoever you're tracking finances with — they'll enter it to join this same household. You can also find it later in Settings."),
+      /*#__PURE__*/React.createElement("input", {
+        key: "code", readOnly: true, value: code, onFocus: e => e.target.select(),
+        style: { width: "100%", padding: "10px", borderRadius: 7, border: "1px solid #D8D4CB", fontSize: 18, fontFamily: "monospace", textAlign: "center", marginBottom: 10, boxSizing: "border-box" }
+      }),
+      /*#__PURE__*/React.createElement("button", {
+        key: "copy", onClick: copyCode, className: "btn-secondary",
+        style: { width: "100%", padding: "8px 0", borderRadius: 7, marginBottom: 14, cursor: "pointer" }
+      }, copied ? "Copied ✓" : "Copy code"),
+      primaryBtn("Continue", () => onChoose(code), false)
+    ]);
+  }
+
+  if (step === "join") {
+    return wrap([
+      /*#__PURE__*/React.createElement("div", { key: "t", style: { fontSize: 18, fontWeight: 600, color: "#1B2430", marginBottom: 6 } }, "Join a household"),
+      /*#__PURE__*/React.createElement("div", { key: "s", style: { fontSize: 12.5, color: "#8A8F97", marginBottom: 18, lineHeight: 1.5 } },
+        "Enter the code whoever set up the household shared with you."),
+      /*#__PURE__*/React.createElement("input", {
+        key: "input", type: "text", value: joinValue, placeholder: "e.g. x7k2-p9qz",
+        onChange: e => setJoinValue(e.target.value),
+        onKeyDown: e => { if (e.key === "Enter") submitJoin(); },
+        style: { width: "100%", padding: "9px 10px", borderRadius: 7, border: "1px solid #D8D4CB", fontSize: 14, marginBottom: 12, boxSizing: "border-box" }
+      }),
+      primaryBtn("Join", submitJoin, !normalizeHouseholdName(joinValue)),
+      /*#__PURE__*/React.createElement("button", {
+        key: "back", onClick: () => setStep("choose"),
+        style: { marginTop: 12, background: "transparent", border: "none", color: "#8A8F97", fontSize: 11.5, textDecoration: "underline", cursor: "pointer" }
+      }, "← Back")
+    ]);
+  }
+
+  return wrap([
+    /*#__PURE__*/React.createElement("div", { key: "t", style: { fontSize: 18, fontWeight: 600, color: "#1B2430", marginBottom: 6 } }, "Set up your household"),
+    /*#__PURE__*/React.createElement("div", { key: "s", style: { fontSize: 12.5, color: "#8A8F97", marginBottom: 18, lineHeight: 1.5 } },
+      "Starting fresh? Create a new household. Already have a code from your partner? Join theirs instead."),
+    /*#__PURE__*/React.createElement("div", { key: "create", style: { marginBottom: 10 } }, primaryBtn("Create a new household", startCreate, false)),
     /*#__PURE__*/React.createElement("button", {
-      onClick: submit,
-      disabled: !normalizeHouseholdName(value),
-      style: {
-        width: "100%", padding: "10px 0", borderRadius: 7, border: "none",
-        background: normalizeHouseholdName(value) ? "#1B2430" : "#D8D4CB", color: "#fff",
-        fontWeight: 600, fontSize: 14, cursor: normalizeHouseholdName(value) ? "pointer" : "default"
-      }
-    }, "Continue")
-  ));
+      key: "join", onClick: () => setStep("join"), className: "btn-secondary",
+      style: { width: "100%", padding: "10px 0", borderRadius: 7, cursor: "pointer" }
+    }, "Join an existing household")
+  ]);
 }
 
 function App() {
@@ -3030,6 +3082,11 @@ function App() {
     location.reload();
   };
   const [householdSwitchInput, setHouseholdSwitchInput] = useState("");
+  const [householdCodeCopied, setHouseholdCodeCopied] = useState(false);
+  const copyHouseholdCode = () => {
+    (navigator.clipboard ? navigator.clipboard.writeText(householdName) : Promise.reject())
+      .then(() => setHouseholdCodeCopied(true)).catch(() => {});
+  };
   const [confirmResetHousehold, setConfirmResetHousehold] = useState(false);
   const [resetError, setResetError] = useState("");
   // Wipes every transaction doc plus the household doc itself back to blank,
@@ -6806,13 +6863,30 @@ function App() {
           onClick: () => setSettingsView("menu")
         }, "← Back to Settings")
       }, /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
-        style: { fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-3)", marginBottom: 12 }
-      }, "You're currently in household ", /*#__PURE__*/React.createElement("strong", { style: { color: "var(--ink-1)" } }, householdName), ". Switching joins a different household by name — it doesn't rename or move this one's data."),
+        style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13, color: "var(--ink-1)", marginBottom: 4 }
+      }, "Your household code"),
+      /*#__PURE__*/React.createElement("div", {
+        style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 12, lineHeight: 1.5 }
+      }, "Share this with whoever you're tracking finances with so they can join this same household."),
+      /*#__PURE__*/React.createElement("div", {
+        style: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 18 }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "monospace", fontSize: 15, padding: "7px 12px",
+          border: "1px solid var(--hair)", borderRadius: 6, background: "#F6F5F1", flex: "1 1 160px"
+        }
+      }, householdName), /*#__PURE__*/React.createElement("button", {
+        className: "btn-secondary",
+        onClick: copyHouseholdCode
+      }, householdCodeCopied ? "Copied ✓" : "Copy")),
+      /*#__PURE__*/React.createElement("div", {
+        style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13, color: "var(--ink-1)", marginBottom: 4 }
+      }, "Join a different household"),
       /*#__PURE__*/React.createElement("div", {
         style: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }
       }, /*#__PURE__*/React.createElement("input", {
         type: "text",
-        placeholder: "Switch to household…",
+        placeholder: "Enter a household code…",
         value: householdSwitchInput,
         onChange: e => setHouseholdSwitchInput(e.target.value),
         style: {
