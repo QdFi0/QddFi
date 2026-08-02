@@ -1454,145 +1454,6 @@ function CheckField({
     onChange: e => onChange(e.target.checked)
   }), " ", label);
 }
-function FieldGrid({
-  title,
-  obj,
-  onChange,
-  cols = 3
-}) {
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginBottom: 18
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 12,
-      fontFamily: "var(--sans)",
-      fontWeight: 600,
-      color: "var(--ink-2)",
-      marginBottom: 8,
-      textTransform: "uppercase",
-      letterSpacing: "0.04em"
-    }
-  }, title), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: `repeat(${cols}, minmax(0,1fr))`,
-      gap: 10
-    }
-  }, Object.entries(obj).map(([k, v]) => /*#__PURE__*/React.createElement(NumberField, {
-    key: k,
-    label: LABELS[k] || k,
-    value: v,
-    onChange: val => onChange(k, val)
-  }))));
-}
-function AccountFieldGrid({
-  title,
-  accounts,
-  obj,
-  onChange,
-  cols = 3
-}) {
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginBottom: 18
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 12,
-      fontFamily: "var(--sans)",
-      fontWeight: 600,
-      color: "var(--ink-2)",
-      marginBottom: 8,
-      textTransform: "uppercase",
-      letterSpacing: "0.04em"
-    }
-  }, title), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: `repeat(${cols}, minmax(0,1fr))`,
-      gap: 10
-    }
-  }, accounts.map(a => /*#__PURE__*/React.createElement(NumberField, {
-    key: a.key,
-    label: a.label,
-    value: obj[a.key] || 0,
-    onChange: val => onChange(a.key, val)
-  }))));
-}
-function CategoryFieldGrid({
-  title,
-  cats,
-  obj,
-  onChange,
-  cols = 3
-}) {
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginBottom: 18
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 12,
-      fontFamily: "var(--sans)",
-      fontWeight: 600,
-      color: "var(--ink-2)",
-      marginBottom: 8,
-      textTransform: "uppercase",
-      letterSpacing: "0.04em"
-    }
-  }, title), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: `repeat(${cols}, minmax(0,1fr))`,
-      gap: 10
-    }
-  }, cats.map(c => {
-    const hasSubs = c.subcats && c.subcats.length > 0;
-    if (!hasSubs) {
-      const v = obj[c.key];
-      return /*#__PURE__*/React.createElement(NumberField, {
-        key: c.key,
-        label: c.icon ? `${c.icon} ${c.label}` : c.label,
-        value: v && typeof v === "object" ? sum(v) : v || 0,
-        onChange: val => onChange(c.key, val)
-      });
-    }
-    const subVals = obj[c.key] && typeof obj[c.key] === "object" ? obj[c.key] : {};
-    return /*#__PURE__*/React.createElement("div", {
-      key: c.key,
-      style: {
-        gridColumn: `span ${cols}`,
-        border: "1px solid var(--hair)",
-        borderRadius: 8,
-        padding: 8
-      }
-    }, /*#__PURE__*/React.createElement("div", {
-      style: {
-        fontFamily: "var(--sans)",
-        fontSize: 11.5,
-        fontWeight: 600,
-        color: "var(--ink-2)",
-        marginBottom: 6
-      }
-    }, c.icon ? `${c.icon} ${c.label}` : c.label, " \u2014 total ", fmt(sum(subVals))), /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "grid",
-        gridTemplateColumns: "repeat(3, minmax(0,1fr))",
-        gap: 8
-      }
-    }, c.subcats.map(s => /*#__PURE__*/React.createElement(NumberField, {
-      key: s.key,
-      label: s.label,
-      value: subVals[s.key] || 0,
-      onChange: val => onChange(c.key, {
-        ...subVals,
-        [s.key]: val
-      })
-    }))));
-  })));
-}
 function AccountSettingsList({
   group,
   list,
@@ -3140,18 +3001,14 @@ function App() {
     age: 0,
     adhoc: []
   });
-  const [pendingCpfBump, setPendingCpfBump] = useState(null);
-  const [pendingCpfBumpPerson2, setPendingCpfBumpPerson2] = useState(null);
   const [tab, setTab] = useState("dashboard");
   const [loanSub, setLoanSub] = useState("housing");
   const [expenseView, setExpenseView] = useState("month");
   const [selectedMonth, setSelectedMonth] = useState(isoToMonthLabel(todayISO()));
   const [loading, setLoading] = useState(true);
-  const [showAssumptions, setShowAssumptions] = useState(false);
   const [showBufferDetail, setShowBufferDetail] = useState(false);
   const [ratioHint, setRatioHint] = useState(null);
   const [ownerSplitOpen, setOwnerSplitOpen] = useState(null);
-  const [draft, setDraft] = useState(null);
   const [saveMsg, setSaveMsg] = useState("");
   const [showMonthlySchedule, setShowMonthlySchedule] = useState(false);
   const [syncError, setSyncError] = useState("");
@@ -3338,10 +3195,6 @@ function App() {
       };
     });
   }, [records, derivedByMonth]);
-  const nextMonthName = useMemo(() => {
-    if (!records || !records.length) return isoToMonthLabel(todayISO());
-    return monthLabelFromSortKey(monthSortKey(records[records.length - 1].month) + 1);
-  }, [records]);
   /* ─── Transaction ledger ─── */
   // Live listener on the subcollection: each transaction is its own document,
   // so two people writing at once can't overwrite each other the way the
@@ -3384,109 +3237,6 @@ function App() {
     setTimeout(() => setSaveMsg(""), 3000);
   };
 
-  const blankFromCats = cats => Object.fromEntries(cats.map(c => [c.key, c.subcats && c.subcats.length ? Object.fromEntries(c.subcats.map(s => [s.key, 0])) : 0]));
-  // Re-shapes an in-progress draft to match the current category list.
-  // Values already typed are preserved: a category that gained sub-categories
-  // moves its old total into the first sub-category, and one that lost them
-  // has its sub-values summed back into a single figure.
-  const syncDraftShape = d => {
-    if (!d) return d;
-    const merge = (existing, cats) => {
-      const out = {};
-      cats.forEach(c => {
-        const subs = (c.subcats || []);
-        const prev = existing ? existing[c.key] : undefined;
-        const prevIsObj = prev && typeof prev === "object";
-        if (subs.length) {
-          const o = {};
-          subs.forEach((s, i) => {
-            if (prevIsObj) o[s.key] = Number(prev[s.key]) || 0;
-            else o[s.key] = (i === 0) ? (Number(prev) || 0) : 0;
-          });
-          out[c.key] = o;
-        } else {
-          out[c.key] = prevIsObj ? sum(prev) : (Number(prev) || 0);
-        }
-      });
-      return out;
-    };
-    const activeExpense = categories.expense.filter(c => !c.archived);
-    const activeIncome = categories.income.filter(c => !c.archived);
-    const ex = d.expenses || {};
-    return Object.assign({}, d, {
-      income: merge(d.income, activeIncome),
-      expenses: {
-        fixedNonFinancial: merge(ex.fixedNonFinancial, activeExpense.filter(c => c.group === "fixedNonFinancial")),
-        fixedFinancial: merge(ex.fixedFinancial, activeExpense.filter(c => c.group === "fixedFinancial")),
-        variable: merge(ex.variable, activeExpense.filter(c => c.group === "variable"))
-      }
-    });
-  };
-
-  const startDraft = () => {
-    if (ledgerStart && monthSortKey(nextMonthName) >= monthSortKey(isoToMonthLabel(ledgerStart))) {
-      setSaveMsg(`${nextMonthName} is derived from the ledger — add entries in Daily ledger instead.`);
-      setTimeout(() => setSaveMsg(""), 5000);
-      return;
-    }
-    const list = sealedRecords || [];
-    const last = list[list.length - 1];
-    if (!last) return;
-    const balances = JSON.parse(JSON.stringify(last.balances || BLANK_BALANCES));
-    const ensureAccountKeys = (obj, list) => {
-      const out = { ...obj };
-      list.forEach(a => {
-        if (out[a.key] === undefined) out[a.key] = 0;
-      });
-      return out;
-    };
-    balances.liquidCash = ensureAccountKeys(balances.liquidCash || {}, accounts.liquidCash);
-    balances.investments = ensureAccountKeys(balances.investments || {}, accounts.investments);
-    balances.property = ensureAccountKeys(balances.property || {}, accounts.property);
-    if (pendingCpfBump) {
-      balances.cpfPerson1.oa += pendingCpfBump.oaAmt;
-      balances.cpfPerson1.sa += pendingCpfBump.saAmt;
-      balances.cpfPerson1.ma += pendingCpfBump.maAmt;
-    }
-    if (pendingCpfBumpPerson2) {
-      balances.cpfPerson2.oa += pendingCpfBumpPerson2.oaAmt;
-      balances.cpfPerson2.sa += pendingCpfBumpPerson2.saAmt;
-      balances.cpfPerson2.ma += pendingCpfBumpPerson2.maAmt;
-    }
-    const activeExpense = categories.expense.filter(c => !c.archived);
-    const activeIncome = categories.income.filter(c => !c.archived);
-    setDraft({
-      month: nextMonthName,
-      income: blankFromCats(activeIncome),
-      expenses: {
-        fixedNonFinancial: blankFromCats(activeExpense.filter(c => c.group === "fixedNonFinancial")),
-        fixedFinancial: blankFromCats(activeExpense.filter(c => c.group === "fixedFinancial")),
-        variable: blankFromCats(activeExpense.filter(c => c.group === "variable"))
-      },
-      balances
-    });
-    setPendingCpfBump(null);
-    setPendingCpfBumpPerson2(null);
-    setTab("add");
-  };
-  const updateDraftField = (section, sub, key, value) => {
-    setDraft(prev => {
-      const next = JSON.parse(JSON.stringify(prev));
-      if (sub) next[section][sub][key] = value;else next[section][key] = value;
-      return next;
-    });
-  };
-  const saveDraft = async () => {
-    if (!draft) return;
-    await persistAll({
-      records: [...sealedRecords, draft]
-    });
-    setSelectedMonth(draft.month);
-    setDraft(null);
-    setTab("dashboard");
-    setSaveMsg(`${draft.month} saved`);
-    setTimeout(() => setSaveMsg(""), 3000);
-  };
   const addContract = () => setContracts([...contracts, {
     id: uid(),
     name: "",
@@ -4063,15 +3813,10 @@ function App() {
       flexWrap: "wrap",
       alignItems: "center"
     }
-  }, [["dashboard", "Dashboard"], ["daily", "Daily ledger"], ["add", "Add month"], ["budgets", "Budgets"], ["contracts", "Contracts"], ["insurance", "Insurance"], ["recurring", "Recurring"], ["loans", "Loans"], ["cpf", "CPF"], ["tax", "Tax"], ["forecast", "Forecast"], ["history", "History"], ["settings", "Settings"]].map(([id, label]) => /*#__PURE__*/React.createElement("button", {
+  }, [["dashboard", "Dashboard"], ["daily", "Daily ledger"], ["budgets", "Budgets"], ["contracts", "Contracts"], ["insurance", "Insurance"], ["recurring", "Recurring"], ["loans", "Loans"], ["cpf", "CPF"], ["tax", "Tax"], ["forecast", "Forecast"], ["history", "History"], ["settings", "Settings"]].map(([id, label]) => /*#__PURE__*/React.createElement("button", {
     key: id,
     className: `tab-btn ${tab === id ? "active" : ""}`,
-    onClick: () => {
-      if (id === "add") {
-        if (!draft) startDraft();
-        else { setDraft(syncDraftShape(draft)); setTab("add"); }
-      } else setTab(id);
-    }
+    onClick: () => setTab(id)
   }, label)), /*#__PURE__*/React.createElement("div", {
     style: {
       flex: 1
@@ -4775,195 +4520,7 @@ function App() {
     onReconcile: reconcileAccount,
     onSetOpening: setOpeningFromLatest,
     orphans: orphanTxns(registry, txns)
-  }), tab === "add" && draft && /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 20
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center",
-      marginBottom: 8
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--serif)",
-      fontSize: 20,
-      color: "var(--ink-1)"
-    }
-  }, "New entry \u2014 ", draft.month), /*#__PURE__*/React.createElement("button", {
-    className: "btn-secondary",
-    onClick: () => setShowAssumptions(s => !s)
-  }, showAssumptions ? "Hide" : "Edit", " assumptions")), showAssumptions && /*#__PURE__*/React.createElement(Card, {
-    style: {
-      marginBottom: 20
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "repeat(3, minmax(0,1fr))",
-      gap: 10
-    }
-  }, /*#__PURE__*/React.createElement(NumberField, {
-    label: "Emergency buffer target",
-    value: assumptions.emergencyBufferTarget,
-    onChange: v => persistAll({
-      assumptions: {
-        ...assumptions,
-        emergencyBufferTarget: v
-      }
-    })
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Monthly gross income (OW)",
-    value: assumptions.monthlyGrossIncome,
-    onChange: v => persistAll({
-      assumptions: {
-        ...assumptions,
-        monthlyGrossIncome: v
-      }
-    })
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Car loan repayment / mth",
-    value: assumptions.carLoanRepayment,
-    onChange: v => persistAll({
-      assumptions: {
-        ...assumptions,
-        carLoanRepayment: v
-      }
-    })
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Annual insurance premiums",
-    value: assumptions.annualInsurancePremiums,
-    onChange: v => persistAll({
-      assumptions: {
-        ...assumptions,
-        annualInsurancePremiums: v
-      }
-    })
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Annual ins. excl. endowments",
-    value: assumptions.annualInsurancePremiumsExclEndowments,
-    onChange: v => persistAll({
-      assumptions: {
-        ...assumptions,
-        annualInsurancePremiumsExclEndowments: v
-      }
-    })
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Policy 1 legacy / life cover",
-    value: assumptions.person1LegacyCover,
-    onChange: v => persistAll({
-      assumptions: {
-        ...assumptions,
-        person1LegacyCover: v
-      }
-    })
-  }))), /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontWeight: 600,
-      fontSize: 14,
-      color: "var(--ink-1)",
-      marginBottom: 10
-    }
-  }, "Balances"), /*#__PURE__*/React.createElement(AccountFieldGrid, {
-    title: "Liquid cash",
-    accounts: accounts.liquidCash,
-    obj: draft.balances.liquidCash,
-    onChange: (k, v) => updateDraftField("balances", "liquidCash", k, v)
-  }), /*#__PURE__*/React.createElement(AccountFieldGrid, {
-    title: "Investments",
-    accounts: accounts.investments,
-    obj: draft.balances.investments,
-    onChange: (k, v) => updateDraftField("balances", "investments", k, v)
-  }), /*#__PURE__*/React.createElement(FieldGrid, {
-    title: `CPF \u2014 ${familyMembers[0] || "Person 1"}`,
-    obj: draft.balances.cpfPerson1,
-    onChange: (k, v) => updateDraftField("balances", "cpfPerson1", k, v)
-  }), /*#__PURE__*/React.createElement(FieldGrid, {
-    title: `CPF \u2014 ${familyMembers[1] || "Person 2"}`,
-    obj: draft.balances.cpfPerson2,
-    onChange: (k, v) => updateDraftField("balances", "cpfPerson2", k, v)
-  }), /*#__PURE__*/React.createElement(AccountFieldGrid, {
-    title: "Property and loans",
-    accounts: accounts.property,
-    obj: draft.balances.property,
-    onChange: (k, v) => updateDraftField("balances", "property", k, v)
-  })), /*#__PURE__*/React.createElement(Card, {
-    style: {
-      marginTop: 14
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontWeight: 600,
-      fontSize: 14,
-      color: "var(--ink-1)",
-      marginBottom: 10
-    }
-  }, "Income and expenses"), /*#__PURE__*/React.createElement(CategoryFieldGrid, {
-    title: "Income",
-    cats: categories.income.filter(c => !c.archived),
-    obj: draft.income,
-    onChange: (k, v) => updateDraftField("income", null, k, v)
-  }), /*#__PURE__*/React.createElement(CategoryFieldGrid, {
-    title: "Fixed expenses (non-financial)",
-    cats: categories.expense.filter(c => !c.archived && c.group === "fixedNonFinancial"),
-    obj: draft.expenses.fixedNonFinancial,
-    onChange: (k, v) => updateDraftField("expenses", "fixedNonFinancial", k, v)
-  }), /*#__PURE__*/React.createElement(CategoryFieldGrid, {
-    title: "Fixed expenses (financial)",
-    cats: categories.expense.filter(c => !c.archived && c.group === "fixedFinancial"),
-    obj: draft.expenses.fixedFinancial,
-    onChange: (k, v) => updateDraftField("expenses", "fixedFinancial", k, v)
-  }), /*#__PURE__*/React.createElement(CategoryFieldGrid, {
-    title: "Variable expenses",
-    cats: categories.expense.filter(c => !c.archived && c.group === "variable"),
-    obj: draft.expenses.variable,
-    onChange: (k, v) => updateDraftField("expenses", "variable", k, v)
-  })), (() => {
-    const preview = computeDerived(draft, assumptions, accounts);
-    return /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        gap: 12,
-        flexWrap: "wrap",
-        marginTop: 14
-      }
-    }, /*#__PURE__*/React.createElement(KpiCard, {
-      label: "Total income",
-      value: fmt(preview.totalIncome)
-    }), /*#__PURE__*/React.createElement(KpiCard, {
-      label: "Total expenses",
-      value: fmt(preview.totalExpenses)
-    }), /*#__PURE__*/React.createElement(KpiCard, {
-      label: "Net cashflow",
-      value: fmt(preview.netCashflow)
-    }), /*#__PURE__*/React.createElement(KpiCard, {
-      label: "Net worth",
-      value: fmt(preview.netWorth)
-    }), /*#__PURE__*/React.createElement(KpiCard, {
-      label: "Emergency buffer",
-      value: fmtPct(preview.bufferProgress),
-      sub: `Gap ${fmt(preview.bufferGap)}`
-    }));
-  })(), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 10,
-      marginTop: 18
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    className: "btn-primary",
-    onClick: saveDraft
-  }, "Save ", draft.month), /*#__PURE__*/React.createElement("button", {
-    className: "btn-secondary",
-    onClick: () => {
-      setDraft(null);
-      setTab("dashboard");
-    }
-  }, "Cancel"))), tab === "budgets" && (() => {
+  }), tab === "budgets" && (() => {
     const budgetedKeys = Object.keys(budgets);
     const unbudgetedCats = categories.expense.filter(c => !c.archived && !budgetedKeys.includes(c.key));
     const statsFor = key => {
@@ -6200,25 +5757,7 @@ function App() {
         person1ManualMA: v
       }
     })
-  }))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 16
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    className: "btn-primary",
-    onClick: () => {
-      setPendingCpfBump(cpfFinal);
-      setSaveMsg(`Queued for ${nextMonthName}`);
-      setTimeout(() => setSaveMsg(""), 4000);
-    }
-  }, "Apply to ", nextMonthName, " balances"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 11.5,
-      color: "var(--ink-3)",
-      marginTop: 6
-    }
-  }, `Adds these amounts to ${familyMembers[0] || "Person 1"}\u2019s CPF balances when you next open Add month.`))), /*#__PURE__*/React.createElement("div", {
+  })))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 12,
@@ -6375,25 +5914,7 @@ function App() {
         person2ManualMA: v
       }
     })
-  }))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 16
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    className: "btn-primary",
-    onClick: () => {
-      setPendingCpfBumpPerson2(cpfFinalPerson2);
-      setSaveMsg(`Queued for ${nextMonthName}`);
-      setTimeout(() => setSaveMsg(""), 4000);
-    }
-  }, "Apply to ", nextMonthName, " balances"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 11.5,
-      color: "var(--ink-3)",
-      marginTop: 6
-    }
-  }, `Adds these amounts to ${familyMembers[1] || "Person 2"}\u2019s CPF balances when you next open Add month.`)))), tab === "tax" && /*#__PURE__*/React.createElement(Section, {
+  }))))), tab === "tax" && /*#__PURE__*/React.createElement(Section, {
     title: "Income tax estimate",
     eyebrow: "IRAS resident rates, YA2024 onwards"
   }, /*#__PURE__*/React.createElement("div", {
@@ -6853,7 +6374,61 @@ function App() {
           fontSize: 12,
           color: "var(--ink-3)"
         }
-      }, "Current household name, and switching to a different one."))));
+      }, "Current household name, and switching to a different one."))), /*#__PURE__*/React.createElement("button", {
+        className: "btn-secondary",
+        style: {
+          textAlign: "left",
+          padding: 16
+        },
+        onClick: () => setSettingsView("assumptions")
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontWeight: 600,
+          fontSize: 14,
+          color: "var(--ink-1)",
+          marginBottom: 4
+        }
+      }, "Assumptions"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 12,
+          color: "var(--ink-3)"
+        }
+      }, "Income, insurance and legacy-cover inputs used across ratios and CPF/tax.")));
+    }
+    if (settingsView === "assumptions") {
+      return /*#__PURE__*/React.createElement(Section, {
+        title: "Assumptions",
+        eyebrow: "Settings",
+        right: /*#__PURE__*/React.createElement(IconBtn, {
+          onClick: () => setSettingsView("menu")
+        }, "← Back to Settings")
+      }, /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
+        style: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 10 }
+      }, /*#__PURE__*/React.createElement(NumberField, {
+        label: "Monthly gross income (OW)",
+        value: assumptions.monthlyGrossIncome,
+        onChange: v => persistAll({ assumptions: { ...assumptions, monthlyGrossIncome: v } })
+      }), /*#__PURE__*/React.createElement(NumberField, {
+        label: "Car loan repayment / mth",
+        value: assumptions.carLoanRepayment,
+        onChange: v => persistAll({ assumptions: { ...assumptions, carLoanRepayment: v } })
+      }), /*#__PURE__*/React.createElement(NumberField, {
+        label: "Annual insurance premiums",
+        value: assumptions.annualInsurancePremiums,
+        onChange: v => persistAll({ assumptions: { ...assumptions, annualInsurancePremiums: v } })
+      }), /*#__PURE__*/React.createElement(NumberField, {
+        label: "Annual ins. excl. endowments",
+        value: assumptions.annualInsurancePremiumsExclEndowments,
+        onChange: v => persistAll({ assumptions: { ...assumptions, annualInsurancePremiumsExclEndowments: v } })
+      }), /*#__PURE__*/React.createElement(NumberField, {
+        label: "Policy 1 legacy / life cover",
+        value: assumptions.person1LegacyCover,
+        onChange: v => persistAll({ assumptions: { ...assumptions, person1LegacyCover: v } })
+      })), /*#__PURE__*/React.createElement("div", {
+        style: { fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)", marginTop: 10 }
+      }, "Emergency buffer target and months of cover are edited from the Dashboard's Emergency buffer detail instead, since that view can recalculate the target from your actual spending.")));
     }
     if (settingsView === "household") {
       return /*#__PURE__*/React.createElement(Section, {
