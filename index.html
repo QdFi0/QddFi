@@ -2380,10 +2380,29 @@ function TransactionsTab({
   const [reconciling, setReconciling] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [showAccounts, setShowAccounts] = useState(true);
+  const [showMoreAccounts, setShowMoreAccounts] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
 
   const set = patch => setForm(f => ({ ...f, ...patch }));
   const isTransfer = form.type === "transfer";
   const catList = form.type === "income" ? categories.income : categories.expense;
+  // The handful of accounts someone actually pays out of day to day — the rest
+  // (investments, CPF, property loans) stay one tap away behind "More accounts"
+  // instead of cluttering the default row.
+  const quickAccounts = registry.filter(a => a.group === "liquidCash" || (a.group === "property" && a.shortTermLiability));
+  const pressKey = k => {
+    let cur = form.amount === "" ? "" : String(form.amount);
+    if (k === "⌫") cur = cur.slice(0, -1);
+    else if (k === ".") { if (!cur.includes(".")) cur = cur + "."; }
+    else cur = cur + k;
+    set({ amount: cur });
+  };
+  const chip = (label, active, onClick, key) => rc("button", {
+    key: key || label,
+    onClick,
+    className: active ? "btn-primary" : "btn-secondary",
+    style: { padding: "6px 12px", fontSize: 12.5, borderRadius: 999 }
+  }, label);
 
   const catLookup = (catKey, subKey) => {
     const all = [...(categories.income || []), ...(categories.expense || [])];
@@ -2416,6 +2435,7 @@ function TransactionsTab({
       createdAt: form.createdAt || new Date().toISOString()
     });
     setForm({ ...blank, date: form.date, type: form.type, account: form.account, who: form.who });
+    setShowDetails(false);
   };
 
   const inRange = (txns || []).filter(t => {
@@ -2474,7 +2494,7 @@ function TransactionsTab({
           form.id ? "Edit entry" : "New entry"),
         form.id && rc(IconBtn, { onClick: () => setForm(blank) }, "Cancel edit")),
 
-      rc("div", { style: { display: "flex", gap: 6, marginBottom: 12 } },
+      rc("div", { style: { display: "flex", gap: 6, marginBottom: 14 } },
         [["expense", "Expense"], ["income", "Income"], ["transfer", "Transfer"]].map(([v, l]) =>
           rc("button", {
             key: v,
@@ -2483,34 +2503,74 @@ function TransactionsTab({
             style: { padding: "6px 14px", fontSize: 12.5 }
           }, l))),
 
-      rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: 10, marginBottom: 10 } },
+      /* account + who, moved above the amount so the fast path is: pick who
+         paid from where, punch the amount, tap a category. */
+      rc("div", { style: { display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 14 } },
+        rc("div", { style: { flex: "1 1 220px" } },
+          rc(LedgerLabel, null, isTransfer ? "From account" : "Account"),
+          !showMoreAccounts && quickAccounts.length > 0
+            ? rc("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" } },
+                quickAccounts.map(a => chip(a.label, form.account === a.key, () => set({ account: a.key }), a.key)),
+                chip("More…", false, () => setShowMoreAccounts(true), "__more"))
+            : rc("div", { style: { display: "flex", gap: 6, alignItems: "center" } },
+                rc(AccountSelect, { registry, value: form.account, onChange: v => set({ account: v }), allowExternal: isTransfer }),
+                quickAccounts.length > 0 && rc(IconBtn, { onClick: () => setShowMoreAccounts(false) }, "Fewer"))),
+        isTransfer
+          ? rc("div", { style: { flex: "1 1 220px" } },
+              rc(LedgerLabel, null, "To account"),
+              rc(AccountSelect, { registry, value: form.toAccount, onChange: v => set({ toAccount: v }), placeholder: "Destination…", allowExternal: true }))
+          : rc("div", { style: { flex: "1 1 220px" } },
+              rc(LedgerLabel, null, "Who"),
+              rc("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" } },
+                [...(familyMembers || ["Person 1", "Person 2"]), "Joint"].map(m =>
+                  chip(m, form.who === m, () => set({ who: m }), m))))
+      ),
+
+      rc("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10, alignItems: "end" } },
         rc("div", null, rc(LedgerLabel, null, "Date"),
           rc("input", { type: "date", value: form.date, onChange: e => set({ date: e.target.value }), style: inputStyle })),
         rc("div", null, rc(LedgerLabel, null, "Amount"),
           rc("input", {
-            type: "number", step: "0.01", value: form.amount, placeholder: "0.00",
+            type: "text", inputMode: "decimal", value: form.amount, placeholder: "0.00",
             onFocus: e => e.target.select(),
             onKeyDown: e => { if (e.key === "Enter") submit(); },
-            onChange: e => set({ amount: e.target.value }),
-            style: { ...inputStyle, fontFamily: "var(--mono)" }
-          })),
-        rc("div", null, rc(LedgerLabel, null, isTransfer ? "From account" : "Account"),
-          rc(AccountSelect, { registry, value: form.account, onChange: v => set({ account: v }), allowExternal: isTransfer })),
-        rc("div", null,
-          rc(LedgerLabel, null, isTransfer ? "To account" : "Who"),
-          isTransfer
-            ? rc(AccountSelect, { registry, value: form.toAccount, onChange: v => set({ toAccount: v }), placeholder: "Destination…", allowExternal: true })
-            : rc("select", { value: form.who, onChange: e => set({ who: e.target.value }), style: inputStyle },
-                (familyMembers || ["Person 1", "Person 2"]).map(m => rc("option", { key: m, value: m }, m)),
-                rc("option", { value: "Joint" }, "Joint")))
+            onChange: e => set({ amount: e.target.value.replace(/[^0-9.]/g, "") }),
+            style: { ...inputStyle, fontFamily: "var(--mono)", fontSize: 20, textAlign: "right" }
+          }))
       ),
 
-      !isTransfer && rc("div", { style: { display: "grid", gridTemplateColumns: "2fr 1fr 2fr", gap: 10, marginBottom: 12 } },
-        rc("div", null, rc(LedgerLabel, null, "Category"),
-          rc(LedgerCategorySelect, {
-            cats: catList, value: form.category, subValue: form.subcat,
-            onChange: (c, s) => set({ category: c, subcat: s })
-          })),
+      rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(6, minmax(0,1fr))", gap: 6, marginBottom: 14 } },
+        ["1", "2", "3", "4", "5", "⌫", "6", "7", "8", "9", "0", "."].map((k, i) =>
+          rc("button", {
+            key: i, onClick: () => pressKey(k), className: "btn-secondary",
+            style: { padding: "8px 0", fontSize: 15, fontFamily: "var(--mono)" }
+          }, k))),
+
+      !isTransfer && rc("div", { style: { marginBottom: 12 } },
+        rc(LedgerLabel, null, "Category"),
+        rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: 8 } },
+          catList.filter(c => !c.archived).map(c =>
+            rc("button", {
+              key: c.key,
+              onClick: () => set({ category: c.key, subcat: "" }),
+              className: form.category === c.key ? "btn-primary" : "btn-secondary",
+              style: { display: "flex", flexDirection: "column", alignItems: "center", gap: 4, padding: "10px 4px", fontSize: 11 }
+            }, rc("span", { style: { fontSize: 18 } }, c.icon || "🏷️"), c.label))),
+        (() => {
+          const selected = catList.find(c => c.key === form.category);
+          const subs = (selected && selected.subcats) || [];
+          if (!subs.length) return null;
+          return rc("div", { style: { display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 } },
+            chip("All", !form.subcat, () => set({ subcat: "" }), "__allsub"),
+            subs.map(s => chip(s.label, form.subcat === s.key, () => set({ subcat: s.key }), s.key)));
+        })()),
+
+      !isTransfer && !showDetails && rc("button", {
+        onClick: () => setShowDetails(true),
+        style: { background: "transparent", border: "none", color: "var(--accent)", fontSize: 12.5, padding: "0 0 12px", cursor: "pointer" }
+      }, "+ Add payee or note"),
+
+      !isTransfer && showDetails && rc("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 } },
         rc("div", null, rc(LedgerLabel, null, "Payee"),
           rc("input", { type: "text", value: form.payee, placeholder: "optional", onChange: e => set({ payee: e.target.value }), style: inputStyle })),
         rc("div", null, rc(LedgerLabel, null, "Note"),
@@ -2518,8 +2578,7 @@ function TransactionsTab({
             type: "text", value: form.note, placeholder: "optional",
             onKeyDown: e => { if (e.key === "Enter") submit(); },
             onChange: e => set({ note: e.target.value }), style: inputStyle
-          }))
-      ),
+          }))),
 
       isTransfer && rc("div", { style: { marginBottom: 12 } },
         rc(LedgerLabel, null, "Note"),
@@ -2535,7 +2594,7 @@ function TransactionsTab({
         rc("span", { style: { fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)" } },
           isTransfer
             ? "Transfers never count as income or expense. Pick Outside of wallet on either side to move money in or out of the accounts you track."
-            : "Press Enter from the amount or note field to save quickly.")
+            : "Tap a category tile, or press Enter from the amount field to save quickly.")
       )
     ),
 
