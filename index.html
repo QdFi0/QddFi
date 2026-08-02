@@ -130,7 +130,7 @@ const fmtRatio = n => (n || 0).toFixed(2) + "x";
 // cannot clean up on their own (n || 0 only catches NaN, not Infinity).
 const safeDiv = (a, b) => (b ? a / b : 0);
 const uid = () => Math.random().toString(36).slice(2, 10);
-const sum = obj => Object.values(obj).reduce((a, b) => a + (b && typeof b === "object" ? sum(b) : Number(b) || 0), 0);
+const sum = obj => Object.values(obj || {}).reduce((a, b) => a + (b && typeof b === "object" ? sum(b) : Number(b) || 0), 0);
 const sumByOwner = (balancesObj, accountDefs) => {
   const result = {
     Joint: 0
