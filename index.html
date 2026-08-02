@@ -1653,7 +1653,11 @@ function CategorySettingsList({
   }, EXPENSE_GROUPS.map(g => /*#__PURE__*/React.createElement("option", {
     key: g.key,
     value: g.key
-  }, g.label))), type === "income" && /*#__PURE__*/React.createElement(IconBtn, {
+  }, g.label))), /*#__PURE__*/React.createElement(IconBtn, {
+    onClick: () => onUpdate(c.key, {
+      pinned: !c.pinned
+    })
+  }, c.pinned ? "Pinned to top" : "Pin to top"), type === "income" && /*#__PURE__*/React.createElement(IconBtn, {
     onClick: () => runOrExplain("cpfLinked", () => onUpdate(c.key, {
       cpfLinked: !c.cpfLinked
     }))
@@ -2363,33 +2367,31 @@ function ReconcileDialog({ account, computed, onCancel, onConfirm, categories })
 /* ───────────── main tab ───────────── */
 
 function TransactionsTab({
-  registry, balances, txns, categories, familyMembers,
-  onSave, onDelete, onReconcile, opening, onSetOpening,
+  registry, txns, categories, familyMembers,
+  onSave, onDelete, opening, onSetOpening,
   latestRecord, txnError, orphans
 }) {
   const blank = {
     id: null, date: todayISO(), type: "expense", amount: "",
     account: "", toAccount: "", category: "", subcat: "",
-    payee: "", note: "", who: (familyMembers || ["Person 1"])[0] || "Person 1"
+    payee: "", note: "", who: "Joint"
   };
   const [form, setForm] = useState(blank);
   const [from, setFrom] = useState(monthsAgoISO(1));
   const [to, setTo] = useState(todayISO());
   const [filterAccount, setFilterAccount] = useState("");
   const [search, setSearch] = useState("");
-  const [reconciling, setReconciling] = useState(null);
+  const [showFilters, setShowFilters] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
-  const [showAccounts, setShowAccounts] = useState(true);
-  const [showMoreAccounts, setShowMoreAccounts] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
 
   const set = patch => setForm(f => ({ ...f, ...patch }));
   const isTransfer = form.type === "transfer";
   const catList = form.type === "income" ? categories.income : categories.expense;
-  // The handful of accounts someone actually pays out of day to day — the rest
-  // (investments, CPF, property loans) stay one tap away behind "More accounts"
-  // instead of cluttering the default row.
-  const quickAccounts = registry.filter(a => a.group === "liquidCash" || (a.group === "property" && a.shortTermLiability));
+  // Pinned categories (set in Settings) surface first so the ones this
+  // household uses most stay within thumb's reach of the top of the grid.
+  const sortedCatList = [...catList.filter(c => !c.archived)]
+    .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
   const pressKey = k => {
     let cur = form.amount === "" ? "" : String(form.amount);
     if (k === "⌫") cur = cur.slice(0, -1);
@@ -2466,9 +2468,6 @@ function TransactionsTab({
   const rows = () => inRange.map(t => txnToRow(t, registry, catLookup));
   const fname = `transactions_${from}_to_${to}`;
 
-  const netWorth = registry.reduce((a, acc) =>
-    a + (acc.kind === "liability" ? -1 : 1) * (balances[acc.key] || 0), 0);
-
   const needsOpening = !opening || Object.keys(opening).length === 0;
 
   return rc("div", { style: { marginTop: 20 } },
@@ -2498,32 +2497,30 @@ function TransactionsTab({
         [["expense", "Expense"], ["income", "Income"], ["transfer", "Transfer"]].map(([v, l]) =>
           rc("button", {
             key: v,
-            onClick: () => set({ type: v, category: "", subcat: "", toAccount: "" }),
+            onClick: () => set({ type: v, category: "", subcat: "", toAccount: "", who: v === "income" ? form.who : "Joint" }),
             className: form.type === v ? "btn-primary" : "btn-secondary",
             style: { padding: "6px 14px", fontSize: 12.5 }
           }, l))),
 
       /* account + who, moved above the amount so the fast path is: pick who
-         paid from where, punch the amount, tap a category. */
+         paid from where, punch the amount, tap a category. Account is always
+         a plain dropdown to keep the row compact; who only matters for income
+         (CPF/tax attribution) and silently defaults to Joint otherwise. */
       rc("div", { style: { display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 14 } },
         rc("div", { style: { flex: "1 1 220px" } },
           rc(LedgerLabel, null, isTransfer ? "From account" : "Account"),
-          !showMoreAccounts && quickAccounts.length > 0
-            ? rc("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" } },
-                quickAccounts.map(a => chip(a.label, form.account === a.key, () => set({ account: a.key }), a.key)),
-                chip("More…", false, () => setShowMoreAccounts(true), "__more"))
-            : rc("div", { style: { display: "flex", gap: 6, alignItems: "center" } },
-                rc(AccountSelect, { registry, value: form.account, onChange: v => set({ account: v }), allowExternal: isTransfer }),
-                quickAccounts.length > 0 && rc(IconBtn, { onClick: () => setShowMoreAccounts(false) }, "Fewer"))),
+          rc(AccountSelect, { registry, value: form.account, onChange: v => set({ account: v }), allowExternal: isTransfer })),
         isTransfer
           ? rc("div", { style: { flex: "1 1 220px" } },
               rc(LedgerLabel, null, "To account"),
               rc(AccountSelect, { registry, value: form.toAccount, onChange: v => set({ toAccount: v }), placeholder: "Destination…", allowExternal: true }))
-          : rc("div", { style: { flex: "1 1 220px" } },
+          : form.type === "income"
+          ? rc("div", { style: { flex: "1 1 220px" } },
               rc(LedgerLabel, null, "Who"),
               rc("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" } },
                 [...(familyMembers || ["Person 1", "Person 2"]), "Joint"].map(m =>
                   chip(m, form.who === m, () => set({ who: m }), m))))
+          : null
       ),
 
       rc("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10, alignItems: "end" } },
@@ -2539,7 +2536,10 @@ function TransactionsTab({
           }))
       ),
 
-      rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(6, minmax(0,1fr))", gap: 6, marginBottom: 14 } },
+      /* Tap keypad is for the mobile app / touch screens — on desktop the
+         Amount field above takes the keyboard directly, so this is hidden
+         via the .qty-keypad media query rather than removed outright. */
+      rc("div", { className: "qty-keypad", style: { gridTemplateColumns: "repeat(6, minmax(0,1fr))", gap: 6, marginBottom: 14 } },
         ["1", "2", "3", "4", "5", "⌫", "6", "7", "8", "9", "0", "."].map((k, i) =>
           rc("button", {
             key: i, onClick: () => pressKey(k), className: "btn-secondary",
@@ -2549,7 +2549,7 @@ function TransactionsTab({
       !isTransfer && rc("div", { style: { marginBottom: 12 } },
         rc(LedgerLabel, null, "Category"),
         rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(4, minmax(0,1fr))", gap: 8 } },
-          catList.filter(c => !c.archived).map(c =>
+          sortedCatList.map(c =>
             rc("button", {
               key: c.key,
               onClick: () => set({ category: c.key, subcat: "" }),
@@ -2598,47 +2598,16 @@ function TransactionsTab({
       )
     ),
 
-    /* ── account balances ── */
-    rc(Card, { style: { marginTop: 14 } },
-      rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: showAccounts ? 12 : 0 } },
-        rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 14, color: "var(--ink-1)" } },
-          "Live balances  ·  net ", fmt(netWorth)),
-        rc(IconBtn, { onClick: () => setShowAccounts(s => !s) }, showAccounts ? "Hide" : "Show")),
-      showAccounts && ["liquidCash", "investments", "cpfPerson1", "cpfPerson2", "property"].map(g => {
-        const items = registry.filter(a => a.group === g);
-        if (!items.length) return null;
-        return rc("div", { key: g, style: { marginBottom: 14 } },
-          rc(LedgerLabel, null, ACCOUNT_GROUP_LABELS[g]),
-          rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 8 } },
-            items.map(a => rc("div", {
-              key: a.key,
-              style: {
-                border: "1px solid var(--hair)", borderRadius: 8, padding: "8px 10px",
-                display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8
-              }
-            },
-              rc("div", { style: { minWidth: 0 } },
-                rc("div", {
-                  style: {
-                    fontFamily: "var(--sans)", fontSize: 12, color: "var(--ink-2)",
-                    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis"
-                  }
-                }, a.label),
-                rc("div", {
-                  style: {
-                    fontFamily: "var(--mono)", fontSize: 14,
-                    color: a.kind === "liability" ? "#A6402B" : "var(--ink-1)"
-                  }
-                }, fmt(balances[a.key] || 0, 2))),
-              rc(IconBtn, { onClick: () => setReconciling(a) }, "Adjust")
-            )))
-        );
-      })
-    ),
-
     /* ── filters + export ── */
     rc(Card, { style: { marginTop: 14 } },
-      rc("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1.4fr 1.4fr", gap: 10, marginBottom: 12 } },
+      rc("div", { style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: showFilters ? 12 : 0 } },
+        chip(`🔎 Filters${filterAccount || search ? " •" : ""}`, showFilters, () => setShowFilters(s => !s), "__filters-toggle"),
+        [["This month", () => { setFrom(startOfMonthISO()); setTo(todayISO()); }],
+         ["Last 3 months", () => { setFrom(monthsAgoISO(3)); setTo(todayISO()); }],
+         ["Last 12 months", () => { setFrom(monthsAgoISO(12)); setTo(todayISO()); }],
+         ["Year to date", () => { setFrom(todayISO().slice(0, 4) + "-01-01"); setTo(todayISO()); }]
+        ].map(([l, fn]) => rc(IconBtn, { key: l, onClick: fn }, l))),
+      showFilters && rc("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1.4fr 1.4fr", gap: 10, marginBottom: 12 } },
         rc("div", null, rc(LedgerLabel, null, "From"),
           rc("input", { type: "date", value: from, onChange: e => setFrom(e.target.value), style: inputStyle })),
         rc("div", null, rc(LedgerLabel, null, "To"),
@@ -2648,12 +2617,6 @@ function TransactionsTab({
         rc("div", null, rc(LedgerLabel, null, "Search"),
           rc("input", { type: "text", value: search, placeholder: "payee, note, category", onChange: e => setSearch(e.target.value), style: inputStyle }))
       ),
-      rc("div", { style: { display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 } },
-        [["This month", () => { setFrom(startOfMonthISO()); setTo(todayISO()); }],
-         ["Last 3 months", () => { setFrom(monthsAgoISO(3)); setTo(todayISO()); }],
-         ["Last 12 months", () => { setFrom(monthsAgoISO(12)); setTo(todayISO()); }],
-         ["Year to date", () => { setFrom(todayISO().slice(0, 4) + "-01-01"); setTo(todayISO()); }]
-        ].map(([l, fn]) => rc(IconBtn, { key: l, onClick: fn }, l))),
       rc("div", {
         style: {
           display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center",
@@ -2740,7 +2703,7 @@ function TransactionsTab({
                         id: t.id, date: t.date, type: t.type, amount: t.amount,
                         account: t.account, toAccount: t.toAccount || "",
                         category: t.category || "", subcat: t.subcat || "",
-                        payee: t.payee || "", note: t.note || "", who: t.who || "Person 1",
+                        payee: t.payee || "", note: t.note || "", who: t.who || "Joint",
                         createdAt: t.createdAt || null
                       })
                     }, "Edit"),
@@ -2750,17 +2713,6 @@ function TransactionsTab({
             );
           })
     ),
-
-    reconciling && rc(ReconcileDialog, {
-      account: reconciling,
-      categories: categories,
-      computed: balances[reconciling.key] || 0,
-      onCancel: () => setReconciling(null),
-      onConfirm: ({ storedDelta: sd, note, date, category }) => {
-        onReconcile(reconciling, sd, note, date, category);
-        setReconciling(null);
-      }
-    }),
 
     confirmDelete && rc(ConfirmDialog, {
       title: "Delete entry",
@@ -2982,6 +2934,9 @@ function HouseholdChooser({ onChoose }) {
   ]);
 }
 
+const PRIMARY_TABS = [["dashboard", "Dashboard"], ["daily", "Daily ledger"]];
+const OTHER_TABS = [["budgets", "Budgets"], ["contracts", "Contracts"], ["insurance", "Insurance"], ["recurring", "Recurring"], ["loans", "Loans"], ["cpf", "CPF"], ["tax", "Tax"], ["forecast", "Forecast"], ["history", "History"], ["settings", "Settings"]];
+
 function App() {
   const [householdName, setHouseholdName] = useState(() => localStorage.getItem("householdName") || "");
   if (householdName && !LEDGER_DOC) resolveHousehold(householdName);
@@ -3061,6 +3016,9 @@ function App() {
     adhoc: []
   });
   const [tab, setTab] = useState("dashboard");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [showLiveBalances, setShowLiveBalances] = useState(false);
+  const [reconcileTarget, setReconcileTarget] = useState(null);
   const [loanSub, setLoanSub] = useState("housing");
   const [expenseView, setExpenseView] = useState("month");
   const [selectedMonth, setSelectedMonth] = useState(isoToMonthLabel(todayISO()));
@@ -3204,6 +3162,8 @@ function App() {
     () => computeBalances(registry, openingBalances, txns),
     [registry, openingBalances, txns]
   );
+  const liveNetWorth = registry.reduce((a, acc) =>
+    a + (acc.kind === "liability" ? -1 : 1) * (liveBalances[acc.key] || 0), 0);
 
   // Sealed history + ledger-derived months, merged into the single list every
   // read path already expects. A sealed record for a month the ledger covers is
@@ -3815,6 +3775,8 @@ function App() {
         .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
         .btn-secondary { font-family: var(--sans); font-size: 13px; font-weight: 500; padding: 9px 16px; border-radius: 7px; border: 1px solid var(--hair-strong); background: #fff; color: var(--ink-2); cursor: pointer; }
         select, input[type=date] { font-family: var(--sans); font-size: 13px; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--hair-strong); background: #fff; color: var(--ink-1); }
+        .qty-keypad { display: none; }
+        @media (max-width: 640px), (pointer: coarse) { .qty-keypad { display: grid; } }
       `), syncError && /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: 16,
@@ -3872,11 +3834,15 @@ function App() {
       flexWrap: "wrap",
       alignItems: "center"
     }
-  }, [["dashboard", "Dashboard"], ["daily", "Daily ledger"], ["budgets", "Budgets"], ["contracts", "Contracts"], ["insurance", "Insurance"], ["recurring", "Recurring"], ["loans", "Loans"], ["cpf", "CPF"], ["tax", "Tax"], ["forecast", "Forecast"], ["history", "History"], ["settings", "Settings"]].map(([id, label]) => /*#__PURE__*/React.createElement("button", {
+  }, PRIMARY_TABS.map(([id, label]) => /*#__PURE__*/React.createElement("button", {
     key: id,
     className: `tab-btn ${tab === id ? "active" : ""}`,
     onClick: () => setTab(id)
-  }, label)), /*#__PURE__*/React.createElement("div", {
+  }, label)), /*#__PURE__*/React.createElement("button", {
+    key: "__more",
+    className: `tab-btn ${OTHER_TABS.some(([id]) => id === tab) ? "active" : ""}`,
+    onClick: () => setSidebarOpen(true)
+  }, "☰ More"), /*#__PURE__*/React.createElement("div", {
     style: {
       flex: 1
     }
@@ -3886,12 +3852,127 @@ function App() {
       fontSize: 12.5,
       color: "var(--accent)"
     }
-  }, saveMsg)), tab === "dashboard" && current && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, saveMsg)), sidebarOpen && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    key: "__sidebar-backdrop",
+    onClick: () => setSidebarOpen(false),
+    style: {
+      position: "fixed",
+      inset: 0,
+      background: "rgba(27,36,48,0.35)",
+      zIndex: 1300
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    key: "__sidebar-panel",
+    style: {
+      position: "fixed",
+      top: 0,
+      right: 0,
+      bottom: 0,
+      width: 260,
+      maxWidth: "85vw",
+      background: "#fff",
+      zIndex: 1301,
+      boxShadow: "-4px 0 16px rgba(0,0,0,0.15)",
+      padding: "20px 16px",
+      overflowY: "auto",
+      display: "flex",
+      flexDirection: "column",
+      gap: 4
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      letterSpacing: "0.1em",
+      textTransform: "uppercase",
+      color: "var(--ink-3)",
+      fontWeight: 600
+    }
+  }, "More"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setSidebarOpen(false),
+    style: {
+      background: "none",
+      border: "none",
+      cursor: "pointer",
+      fontSize: 16,
+      color: "var(--ink-2)",
+      lineHeight: 1
+    }
+  }, "✕")), OTHER_TABS.map(([id, label]) => /*#__PURE__*/React.createElement("button", {
+    key: id,
+    className: `tab-btn ${tab === id ? "active" : ""}`,
+    onClick: () => {
+      setTab(id);
+      setSidebarOpen(false);
+    },
+    style: {
+      textAlign: "left",
+      width: "100%",
+      padding: "10px 12px"
+    }
+  }, label)))), tab === "dashboard" && current && /*#__PURE__*/React.createElement(React.Fragment, null,
+    rc("div", { style: { marginTop: 20 } },
+      rc("button", {
+        onClick: () => setShowLiveBalances(s => !s),
+        className: showLiveBalances ? "btn-primary" : "btn-secondary",
+        style: { padding: "6px 14px", fontSize: 12.5, borderRadius: 999 }
+      }, `💰 Live balances  ·  net ${fmt(liveNetWorth)}`),
+      showLiveBalances && rc(Card, { style: { marginTop: 10 } },
+        ["liquidCash", "investments", "cpfPerson1", "cpfPerson2", "property"].map(g => {
+          const items = registry.filter(a => a.group === g);
+          if (!items.length) return null;
+          return rc("div", { key: g, style: { marginBottom: 14 } },
+            rc(LedgerLabel, null, ACCOUNT_GROUP_LABELS[g]),
+            rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 8 } },
+              items.map(a => rc("div", {
+                key: a.key,
+                style: {
+                  border: "1px solid var(--hair)", borderRadius: 8, padding: "8px 10px",
+                  display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8
+                }
+              },
+                rc("div", { style: { minWidth: 0 } },
+                  rc("div", {
+                    style: {
+                      fontFamily: "var(--sans)", fontSize: 12, color: "var(--ink-2)",
+                      whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis"
+                    }
+                  }, a.label),
+                  rc("div", {
+                    style: {
+                      fontFamily: "var(--mono)", fontSize: 14,
+                      color: a.kind === "liability" ? "#A6402B" : "var(--ink-1)"
+                    }
+                  }, fmt(liveBalances[a.key] || 0, 2))),
+                rc(IconBtn, { onClick: () => setReconcileTarget(a) }, "Adjust")
+              )))
+          );
+        })
+      ),
+      reconcileTarget && rc(ReconcileDialog, {
+        account: reconcileTarget,
+        categories: categories,
+        computed: liveBalances[reconcileTarget.key] || 0,
+        onCancel: () => setReconcileTarget(null),
+        onConfirm: ({ storedDelta: sd, note, date, category }) => {
+          reconcileAccount(reconcileTarget, sd, note, date, category);
+          setReconcileTarget(null);
+        }
+      })
+    ),
+    /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 12,
       flexWrap: "wrap",
-      marginTop: 20
+      marginTop: 14
     }
   }, /*#__PURE__*/React.createElement(KpiCard, {
     label: "Liquid cash",
@@ -4567,7 +4648,6 @@ function App() {
     }, "Got it"));
   })()))), tab === "daily" && rc(TransactionsTab, {
     registry: registry,
-    balances: liveBalances,
     txns: txns,
     categories: categories,
     familyMembers: familyMembers,
@@ -4576,7 +4656,6 @@ function App() {
     txnError: txnError,
     onSave: saveTxn,
     onDelete: deleteTxn,
-    onReconcile: reconcileAccount,
     onSetOpening: setOpeningFromLatest,
     orphans: orphanTxns(registry, txns)
   }), tab === "budgets" && (() => {
