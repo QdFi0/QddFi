@@ -1,4 +1,4 @@
-<!-- BUILD: no month dropdown on dashboard, dashboard-only sections fixed, ET/SY/Joint split for liquid cash/investments/property -->
+<!-- BUILD: no month dropdown on dashboard, dashboard-only sections fixed, per-person/Joint split for liquid cash/investments/property -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -75,9 +75,17 @@
   db.enablePersistence({ synchronizeTabs: true }).catch(function (err) {
     console.warn("Offline cache unavailable:", err && err.code);
   });
-  // Everything is stored in one shared document so you and your partner
-  // both read/write the same household data.
-  const LEDGER_DOC = db.collection("households").doc("etsy");
+  // Each household picks its own name (see HouseholdChooser below), which
+  // becomes the Firestore doc ID everyone in that household reads/writes.
+  // Resolved once the household name is known — null until then.
+  let LEDGER_DOC = null;
+  let TXN_COL = null;
+  const normalizeHouseholdName = raw =>
+    String(raw || "").trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  function resolveHousehold(name) {
+    LEDGER_DOC = db.collection("households").doc(name);
+    TXN_COL = LEDGER_DOC.collection("transactions");
+  }
   const auth = firebase.auth();
   // Keeps you signed in across visits/refreshes, same browser only.
   auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(function (err) {
@@ -286,26 +294,26 @@ const normalizeBudget = b => {
 };
 const BLANK_BALANCES = {
   liquidCash: {
-    uob: 0,
-    dbsEtsy: 0,
-    dbsEt: 0,
-    syReserve: 0,
+    bankAccount1: 0,
+    bankAccount2: 0,
+    bankAccount3: 0,
+    bankAccount4: 0,
     cash: 0
   },
   investments: {
-    endowusEt: 0,
-    endowusSy: 0,
-    moomooEt: 0,
-    moomooSy: 0,
+    investmentAccount1: 0,
+    investmentAccount2: 0,
+    investmentAccount3: 0,
+    investmentAccount4: 0,
     cdp: 0,
     other: 0
   },
-  cpfEt: {
+  cpfPerson1: {
     oa: 0,
     sa: 0,
     ma: 0
   },
-  cpfSy: {
+  cpfPerson2: {
     oa: 0,
     sa: 0,
     ma: 0
@@ -318,8 +326,8 @@ const BLANK_BALANCES = {
   }
 };
 const BLANK_INCOME = {
-  payrollEt: 0,
-  piano: 0,
+  primaryIncome: 0,
+  secondaryIncome: 0,
   interestDividends: 0,
   others: 0
 };
@@ -355,7 +363,7 @@ const DEFAULT_ASSUMPTIONS = {
   carLoanRepayment: 0,
   annualInsurancePremiums: 0,
   annualInsurancePremiumsExclEndowments: 0,
-  etLegacyCover: 0,
+  person1LegacyCover: 0,
   savingsRateTarget: 0.28
 };
 // Two employed CPF profiles, one per household member. Kept as a named
@@ -363,14 +371,14 @@ const DEFAULT_ASSUMPTIONS = {
 // saved before the second profile existed can be merged up to this shape
 // on load instead of silently losing the new fields to `undefined`.
 const DEFAULT_CPF_SETTINGS = {
-  etAge: 0,
-  monthlyOW: 0,
-  bonusThisMonth: 0,
-  annualOwToDate: 0,
-  manualOverride: false,
-  manualOA: 0,
-  manualSA: 0,
-  manualMA: 0,
+  person1Age: 0,
+  person1Salary: 0,
+  person1BonusThisMonth: 0,
+  person1AnnualOwToDate: 0,
+  person1ManualOverride: false,
+  person1ManualOA: 0,
+  person1ManualSA: 0,
+  person1ManualMA: 0,
   person2Age: 0,
   person2Salary: 0,
   person2BonusThisMonth: 0,
@@ -389,7 +397,7 @@ function computeDerived(record, assumptions, accounts) {
   const totalVariableExclBigTicket = totalVariableGross - catTotal(record.expenses.variable.bigTicket);
   const totalExpenses = totalFixedNonFinancial + totalFixedFinancial + totalVariableGross;
   const netCashflow = totalIncome - totalExpenses;
-  const monthlyTakeHome = catTotal(record.income.payrollEt);
+  const monthlyTakeHome = catTotal(record.income.primaryIncome);
   const monthlySavings = monthlyTakeHome - totalExpenses;
   const annualTakeHome = monthlyTakeHome * 12;
   const base = {
@@ -411,9 +419,9 @@ function computeDerived(record, assumptions, accounts) {
   const totalInvestments = sum(b.investments);
   const liquidCashByOwner = sumByOwner(b.liquidCash, accounts && accounts.liquidCash);
   const investmentsByOwner = sumByOwner(b.investments, accounts && accounts.investments);
-  const etCpfTotal = sum(b.cpfEt);
-  const syCpfTotal = sum(b.cpfSy);
-  const combinedCpf = etCpfTotal + syCpfTotal;
+  const person1CpfTotal = sum(b.cpfPerson1);
+  const person2CpfTotal = sum(b.cpfPerson2);
+  const combinedCpf = person1CpfTotal + person2CpfTotal;
   const propAccounts = accounts && accounts.property && accounts.property.length ? accounts.property : [{
     key: "hdbValue",
     type: "asset"
@@ -461,7 +469,7 @@ function computeDerived(record, assumptions, accounts) {
     insPremiumLoad: safeDiv(assumptions.annualInsurancePremiums, annualTakeHome),
     insPremiumLoadExclEnd: safeDiv(assumptions.annualInsurancePremiumsExclEndowments, annualTakeHome),
     netInvestToNetWorth: safeDiv(totalInvestments, netWorth),
-    coverageToIncome: safeDiv(assumptions.etLegacyCover, annualTakeHome)
+    coverageToIncome: safeDiv(assumptions.person1LegacyCover, annualTakeHome)
   };
   return {
     ...base,
@@ -469,8 +477,8 @@ function computeDerived(record, assumptions, accounts) {
     totalInvestments,
     liquidCashByOwner,
     investmentsByOwner,
-    etCpfTotal,
-    syCpfTotal,
+    person1CpfTotal,
+    person2CpfTotal,
     combinedCpf,
     totalLiabilities,
     propertyEquity,
@@ -572,15 +580,15 @@ const RATIO_GROUPS = [{
   label: "Wealth mix"
 }];
 const LABELS = {
-  uob: "Bank Account 1",
-  dbsEtsy: "Bank Account 2",
-  dbsEt: "Bank Account 3",
-  syReserve: "Bank Account 4",
+  bankAccount1: "Bank Account 1",
+  bankAccount2: "Bank Account 2",
+  bankAccount3: "Bank Account 3",
+  bankAccount4: "Bank Account 4",
   cash: "Cash",
-  endowusEt: "Investment Account 1",
-  endowusSy: "Investment Account 2",
-  moomooEt: "Investment Account 3",
-  moomooSy: "Investment Account 4",
+  investmentAccount1: "Investment Account 1",
+  investmentAccount2: "Investment Account 2",
+  investmentAccount3: "Investment Account 3",
+  investmentAccount4: "Investment Account 4",
   cdp: "CDP",
   other: "Other",
   oa: "OA",
@@ -590,8 +598,8 @@ const LABELS = {
   hdbLoan: "HDB loan outstanding",
   carLoan: "Car loan outstanding",
   creditCard: "Credit Card 1",
-  payrollEt: "Primary income (take-home)",
-  piano: "Piano",
+  primaryIncome: "Primary income (take-home)",
+  secondaryIncome: "Secondary income",
   interestDividends: "Interest / dividends",
   others: "Others",
   housingUtilities: "Housing utilities / maint.",
@@ -653,8 +661,8 @@ const seedIncomeCategories = () => Object.keys(BLANK_INCOME).map((k, i) => ({
   subcats: [],
   archived: false,
   core: true,
-  protected: k === "payrollEt",
-  cpfLinked: k === "payrollEt"
+  protected: k === "primaryIncome",
+  cpfLinked: k === "primaryIncome"
 }));
 const ORIGINAL_EXPENSE_KEYS = EXPENSE_CATS.map(c => c.key);
 const OLD_DEFAULT_EXPENSE_LABELS = {
@@ -693,20 +701,20 @@ const EXPENSE_GROUPS = [{
 }];
 const seedAccounts = () => ({
   liquidCash: [{
-    key: "uob",
-    label: LABELS.uob,
+    key: "bankAccount1",
+    label: LABELS.bankAccount1,
     owner: "Joint"
   }, {
-    key: "dbsEtsy",
-    label: LABELS.dbsEtsy,
+    key: "bankAccount2",
+    label: LABELS.bankAccount2,
     owner: "Joint"
   }, {
-    key: "dbsEt",
-    label: LABELS.dbsEt,
+    key: "bankAccount3",
+    label: LABELS.bankAccount3,
     owner: "Joint"
   }, {
-    key: "syReserve",
-    label: LABELS.syReserve,
+    key: "bankAccount4",
+    label: LABELS.bankAccount4,
     owner: "Joint"
   }, {
     key: "cash",
@@ -714,20 +722,20 @@ const seedAccounts = () => ({
     owner: "Joint"
   }],
   investments: [{
-    key: "endowusEt",
-    label: LABELS.endowusEt,
+    key: "investmentAccount1",
+    label: LABELS.investmentAccount1,
     owner: "Joint"
   }, {
-    key: "endowusSy",
-    label: LABELS.endowusSy,
+    key: "investmentAccount2",
+    label: LABELS.investmentAccount2,
     owner: "Joint"
   }, {
-    key: "moomooEt",
-    label: LABELS.moomooEt,
+    key: "investmentAccount3",
+    label: LABELS.investmentAccount3,
     owner: "Joint"
   }, {
-    key: "moomooSy",
-    label: LABELS.moomooSy,
+    key: "investmentAccount4",
+    label: LABELS.investmentAccount4,
     owner: "Joint"
   }, {
     key: "cdp",
@@ -1657,7 +1665,7 @@ function CategorySettingsList({
 }) {
   const [pendingHint, setPendingHint] = React.useState(null);
   const [dontShowAgain, setDontShowAgain] = React.useState(false);
-  const isFixedCat = c => type === "income" ? c.key === "payrollEt" : CORE_EXPENSE_KEYS.includes(c.key);
+  const isFixedCat = c => type === "income" ? c.key === "primaryIncome" : CORE_EXPENSE_KEYS.includes(c.key);
   const sortedList = [...list].sort((a, b) => {
     const af = isFixedCat(a),
       bf = isFixedCat(b);
@@ -2050,14 +2058,13 @@ function Row({
    whole-document overwrite in persistAll clobbering each other.
    ══════════════════════════════════════════════════════════════════ */
 
-const TXN_COL = LEDGER_DOC.collection("transactions");
 const rc = React.createElement;
 
 const ACCOUNT_GROUP_LABELS = {
   liquidCash: "Liquid cash",
   investments: "Investments",
-  cpfEt: "CPF",
-  cpfSy: "CPF",
+  cpfPerson1: "CPF",
+  cpfPerson2: "CPF",
   property: "Property & loans"
 };
 
@@ -2080,7 +2087,7 @@ const buildRegistry = (accounts, familyMembers) => {
   });
   (accounts.liquidCash || []).forEach(a => push("liquidCash", a, "asset"));
   (accounts.investments || []).forEach(a => push("investments", a, "asset"));
-  [["cpfEt", (familyMembers && familyMembers[0]) || "Person 1"], ["cpfSy", (familyMembers && familyMembers[1]) || "Person 2"]].forEach(([g, who]) =>
+  [["cpfPerson1", (familyMembers && familyMembers[0]) || "Person 1"], ["cpfPerson2", (familyMembers && familyMembers[1]) || "Person 2"]].forEach(([g, who]) =>
     ["oa", "sa", "ma"].forEach(s => out.push({
       key: `${g}.${s}`,
       group: g,
@@ -2342,7 +2349,7 @@ const inputStyle = {
 };
 
 function AccountSelect({ registry, value, onChange, placeholder, allowExternal }) {
-  const groups = ["liquidCash", "investments", "cpfEt", "cpfSy", "property"];
+  const groups = ["liquidCash", "investments", "cpfPerson1", "cpfPerson2", "property"];
   return rc("select", { value: value || "", onChange: e => onChange(e.target.value), style: inputStyle },
     rc("option", { value: "" }, placeholder || "Select account…"),
     allowExternal && rc("option", { value: EXTERNAL_KEY }, "\u27F6 " + EXTERNAL_LABEL),
@@ -2648,7 +2655,7 @@ function TransactionsTab({
         rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 14, color: "var(--ink-1)" } },
           "Live balances  ·  net ", fmt(netWorth)),
         rc(IconBtn, { onClick: () => setShowAccounts(s => !s) }, showAccounts ? "Hide" : "Show")),
-      showAccounts && ["liquidCash", "investments", "cpfEt", "cpfSy", "property"].map(g => {
+      showAccounts && ["liquidCash", "investments", "cpfPerson1", "cpfPerson2", "property"].map(g => {
         const items = registry.filter(a => a.group === g);
         if (!items.length) return null;
         return rc("div", { key: g, style: { marginBottom: 14 } },
@@ -2954,7 +2961,56 @@ function LoginGate({ children }) {
   );
 }
 
+function HouseholdChooser({ onChoose }) {
+  const [value, setValue] = useState("");
+  const submit = () => { if (normalizeHouseholdName(value)) onChoose(value); };
+  const cardStyle = { background: "#fff", borderRadius: 10, padding: 28, width: 340, maxWidth: "90vw", boxShadow: "0 1px 3px rgba(0,0,0,0.12)", textAlign: "center" };
+  return /*#__PURE__*/React.createElement("div", {
+    style: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#F1F1EC", fontFamily: "sans-serif" }
+  }, /*#__PURE__*/React.createElement("div", { style: cardStyle },
+    /*#__PURE__*/React.createElement("div", { style: { fontSize: 18, fontWeight: 600, color: "#1B2430", marginBottom: 6 } }, "Name your household"),
+    /*#__PURE__*/React.createElement("div", { style: { fontSize: 12.5, color: "#8A8F97", marginBottom: 18, lineHeight: 1.5 } },
+      "Pick any name — a new one starts a blank household, an existing one joins it. Share the same name with whoever you're tracking finances with."),
+    /*#__PURE__*/React.createElement("input", {
+      type: "text",
+      value,
+      placeholder: "e.g. smith-family",
+      onChange: e => setValue(e.target.value),
+      onKeyDown: e => { if (e.key === "Enter") submit(); },
+      style: { width: "100%", padding: "9px 10px", borderRadius: 7, border: "1px solid #D8D4CB", fontSize: 14, marginBottom: 12, boxSizing: "border-box" }
+    }),
+    /*#__PURE__*/React.createElement("button", {
+      onClick: submit,
+      disabled: !normalizeHouseholdName(value),
+      style: {
+        width: "100%", padding: "10px 0", borderRadius: 7, border: "none",
+        background: normalizeHouseholdName(value) ? "#1B2430" : "#D8D4CB", color: "#fff",
+        fontWeight: 600, fontSize: 14, cursor: normalizeHouseholdName(value) ? "pointer" : "default"
+      }
+    }, "Continue")
+  ));
+}
+
 function App() {
+  const [householdName, setHouseholdName] = useState(() => localStorage.getItem("householdName") || "");
+  if (householdName && !LEDGER_DOC) resolveHousehold(householdName);
+  const chooseHousehold = raw => {
+    const name = normalizeHouseholdName(raw);
+    if (!name) return;
+    localStorage.setItem("householdName", name);
+    resolveHousehold(name);
+    setHouseholdName(name);
+  };
+  // Switching households needs a fresh subscription to a different Firestore
+  // doc/subcollection, so a full reload is simpler and safer than trying to
+  // unwind every bit of in-memory state tied to the old household.
+  const switchHousehold = raw => {
+    const name = normalizeHouseholdName(raw);
+    if (!name || name === householdName) return;
+    localStorage.setItem("householdName", name);
+    location.reload();
+  };
+  const [householdSwitchInput, setHouseholdSwitchInput] = useState("");
   const [sealedRecords, setSealedRecords] = useState(null);
   // First day of the first month the ledger is authoritative for. Months
   // before it stay as sealed imported records; months from it onward are
@@ -3027,6 +3083,7 @@ function App() {
 
   /* ─── Firestore load (replaces window.storage.get) ─── */
   useEffect(() => {
+    if (!householdName) return;
     (async () => {
       try {
         const snap = await LEDGER_DOC.get();
@@ -3100,7 +3157,7 @@ function App() {
       }
       setLoading(false);
     })();
-  }, []);
+  }, [householdName]);
 
   /* ─── Firestore save (replaces window.storage.set) ─── */
   const persistAll = async patch => {
@@ -3210,12 +3267,13 @@ function App() {
   // so two people writing at once can't overwrite each other the way the
   // single-document persistAll does, and both see entries appear immediately.
   useEffect(() => {
+    if (!householdName) return;
     const unsub = TXN_COL.onSnapshot(
       snap => { setTxns(snap.docs.map(d => d.data())); setTxnError(""); },
       err => { console.error(err); setTxnError("Could not read transactions \u2014 check your Firestore rules allow the 'transactions' subcollection."); }
     );
     return () => unsub();
-  }, []);
+  }, [householdName]);
 
   const saveTxn = async t => {
     try { await TXN_COL.doc(t.id).set(t); setTxnError(""); }
@@ -3306,14 +3364,14 @@ function App() {
     balances.investments = ensureAccountKeys(balances.investments || {}, accounts.investments);
     balances.property = ensureAccountKeys(balances.property || {}, accounts.property);
     if (pendingCpfBump) {
-      balances.cpfEt.oa += pendingCpfBump.oaAmt;
-      balances.cpfEt.sa += pendingCpfBump.saAmt;
-      balances.cpfEt.ma += pendingCpfBump.maAmt;
+      balances.cpfPerson1.oa += pendingCpfBump.oaAmt;
+      balances.cpfPerson1.sa += pendingCpfBump.saAmt;
+      balances.cpfPerson1.ma += pendingCpfBump.maAmt;
     }
     if (pendingCpfBumpPerson2) {
-      balances.cpfSy.oa += pendingCpfBumpPerson2.oaAmt;
-      balances.cpfSy.sa += pendingCpfBumpPerson2.saAmt;
-      balances.cpfSy.ma += pendingCpfBumpPerson2.maAmt;
+      balances.cpfPerson2.oa += pendingCpfBumpPerson2.oaAmt;
+      balances.cpfPerson2.sa += pendingCpfBumpPerson2.saAmt;
+      balances.cpfPerson2.ma += pendingCpfBumpPerson2.maAmt;
     }
     const activeExpense = categories.expense.filter(c => !c.archived);
     const activeIncome = categories.income.filter(c => !c.archived);
@@ -3671,11 +3729,11 @@ function App() {
       adhoc: taxSettings.adhoc.filter(a => a.id !== id)
     }
   });
-  const cpfResult = useMemo(() => computeCpfContribution(cpfSettings.etAge, cpfSettings.monthlyOW, cpfSettings.bonusThisMonth, cpfSettings.annualOwToDate), [cpfSettings]);
-  const cpfFinal = cpfSettings.manualOverride ? {
-    oaAmt: cpfSettings.manualOA,
-    saAmt: cpfSettings.manualSA,
-    maAmt: cpfSettings.manualMA
+  const cpfResult = useMemo(() => computeCpfContribution(cpfSettings.person1Age, cpfSettings.person1Salary, cpfSettings.person1BonusThisMonth, cpfSettings.person1AnnualOwToDate), [cpfSettings]);
+  const cpfFinal = cpfSettings.person1ManualOverride ? {
+    oaAmt: cpfSettings.person1ManualOA,
+    saAmt: cpfSettings.person1ManualSA,
+    maAmt: cpfSettings.person1ManualMA
   } : {
     oaAmt: cpfResult.oaAmt,
     saAmt: cpfResult.saAmt,
@@ -3692,7 +3750,7 @@ function App() {
     maAmt: cpfResultPerson2.maAmt
   };
   const taxResult = useMemo(() => {
-    const cpfReliefAmt = taxSettings.includeCpfRelief ? Math.min(0.20 * Math.min(cpfSettings.monthlyOW, CPF_OW_CEILING) * 12, 37740) : 0;
+    const cpfReliefAmt = taxSettings.includeCpfRelief ? Math.min(0.20 * Math.min(cpfSettings.person1Salary, CPF_OW_CEILING) * 12, 37740) : 0;
     const childRelief = taxSettings.numChildren * taxSettings.childReliefPerChild;
     const eir = earnedIncomeRelief(taxSettings.age);
     const adhocReliefs = taxSettings.adhoc.filter(a => a.type === "relief").reduce((a, r) => a + (Number(r.amount) || 0), 0);
@@ -3728,7 +3786,7 @@ function App() {
     // falling back to whatever exists if the ledger has just started.
     const complete = records.filter(r => r.month !== currentMonthLabel);
     const baseline = complete.length ? complete.slice(-3) : records.slice(-3);
-    // Was hardcoded to payrollEt + piano + interestDividends, which silently
+    // Was hardcoded to a fixed set of income category keys, which silently
     // produced NaN if any of those were renamed and ignored any category added.
     const avgIncome = baseline.reduce((a, r) =>
       a + computeDerived(r, assumptions, accounts).totalIncome, 0) / baseline.length;
@@ -3781,6 +3839,7 @@ function App() {
     }
     return rows;
   }, [records, assumptions, recurring, policies, contracts, derivedByMonth]);
+  if (!householdName) return /*#__PURE__*/React.createElement(HouseholdChooser, { onChoose: chooseHousehold });
   if (loading || !records) return /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: "IBM Plex Sans, sans-serif",
@@ -4280,8 +4339,8 @@ function App() {
       marginTop: 10
     }
   }, [["Liquid cash", "#0F5D52", current.totalLiquidCash, current.liquidCashByOwner], ["Investments", "#378ADD", current.totalInvestments, current.investmentsByOwner], ["CPF combined", "#7F77DD", current.combinedCpf, {
-    [familyMembers[0] || "Person 1"]: current.etCpfTotal,
-    [familyMembers[1] || "Person 2"]: current.syCpfTotal
+    [familyMembers[0] || "Person 1"]: current.person1CpfTotal,
+    [familyMembers[1] || "Person 2"]: current.person2CpfTotal
   }], ["Property equity", "#35577A", current.propertyEquity, current.propertyEquityByOwner]].map(([label, color, value, splitData]) => /*#__PURE__*/React.createElement("div", {
     key: label,
     style: {
@@ -4345,8 +4404,8 @@ function App() {
     if (ownerSplitOpen === "Investments") return current.investmentsByOwner;
     if (ownerSplitOpen === "Property equity") return current.propertyEquityByOwner;
     if (ownerSplitOpen === "CPF combined") return {
-      [familyMembers[0] || "Person 1"]: current.etCpfTotal,
-      [familyMembers[1] || "Person 2"]: current.syCpfTotal
+      [familyMembers[0] || "Person 1"]: current.person1CpfTotal,
+      [familyMembers[1] || "Person 2"]: current.person2CpfTotal
     };
     return {};
   })()).filter(([, v]) => v !== 0).map(([owner, v]) => /*#__PURE__*/React.createElement("span", {
@@ -4713,11 +4772,11 @@ function App() {
     })
   }), /*#__PURE__*/React.createElement(NumberField, {
     label: "Policy 1 legacy / life cover",
-    value: assumptions.etLegacyCover,
+    value: assumptions.person1LegacyCover,
     onChange: v => persistAll({
       assumptions: {
         ...assumptions,
-        etLegacyCover: v
+        person1LegacyCover: v
       }
     })
   }))), /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
@@ -4740,12 +4799,12 @@ function App() {
     onChange: (k, v) => updateDraftField("balances", "investments", k, v)
   }), /*#__PURE__*/React.createElement(FieldGrid, {
     title: `CPF \u2014 ${familyMembers[0] || "Person 1"}`,
-    obj: draft.balances.cpfEt,
-    onChange: (k, v) => updateDraftField("balances", "cpfEt", k, v)
+    obj: draft.balances.cpfPerson1,
+    onChange: (k, v) => updateDraftField("balances", "cpfPerson1", k, v)
   }), /*#__PURE__*/React.createElement(FieldGrid, {
     title: `CPF \u2014 ${familyMembers[1] || "Person 2"}`,
-    obj: draft.balances.cpfSy,
-    onChange: (k, v) => updateDraftField("balances", "cpfSy", k, v)
+    obj: draft.balances.cpfPerson2,
+    onChange: (k, v) => updateDraftField("balances", "cpfPerson2", k, v)
   }), /*#__PURE__*/React.createElement(AccountFieldGrid, {
     title: "Property and loans",
     accounts: accounts.property,
@@ -5890,7 +5949,7 @@ function App() {
   }), /*#__PURE__*/React.createElement(KpiCard, {
     label: "Total this month",
     value: fmt(cpfFinal.oaAmt + cpfFinal.saAmt + cpfFinal.maAmt),
-    sub: cpfSettings.manualOverride ? "Manual override active" : `Auto-calculated at ${fmtPct(cpfResult.contribBand.total, 0)} of wages`
+    sub: cpfSettings.person1ManualOverride ? "Manual override active" : `Auto-calculated at ${fmtPct(cpfResult.contribBand.total, 0)} of wages`
   })), /*#__PURE__*/React.createElement(Card, {
     style: {
       marginBottom: 14
@@ -5918,41 +5977,41 @@ function App() {
     }
   }, /*#__PURE__*/React.createElement(NumberField, {
     label: "Age",
-    value: cpfSettings.etAge,
+    value: cpfSettings.person1Age,
     onChange: v => persistAll({
       cpfSettings: {
         ...cpfSettings,
-        etAge: v
+        person1Age: v
       }
     }),
     hint: `Age band: ${cpfResult.contribBand.maxAge === 55 ? "55 and below" : `up to ${cpfResult.contribBand.maxAge}`}`
   }), /*#__PURE__*/React.createElement(NumberField, {
     label: "Monthly salary",
-    value: cpfSettings.monthlyOW,
+    value: cpfSettings.person1Salary,
     onChange: v => persistAll({
       cpfSettings: {
         ...cpfSettings,
-        monthlyOW: v
+        person1Salary: v
       }
     }),
     hint: `CPF applies to first ${fmt(CPF_OW_CEILING)} only`
   }), /*#__PURE__*/React.createElement(NumberField, {
     label: "Bonus paid this month",
-    value: cpfSettings.bonusThisMonth,
+    value: cpfSettings.person1BonusThisMonth,
     onChange: v => persistAll({
       cpfSettings: {
         ...cpfSettings,
-        bonusThisMonth: v
+        person1BonusThisMonth: v
       }
     }),
     hint: "Leave at 0 in non-bonus months"
   }), /*#__PURE__*/React.createElement(NumberField, {
     label: "Salary already CPF-charged this year",
-    value: cpfSettings.annualOwToDate,
+    value: cpfSettings.person1AnnualOwToDate,
     onChange: v => persistAll({
       cpfSettings: {
         ...cpfSettings,
-        annualOwToDate: v
+        person1AnnualOwToDate: v
       }
     }),
     hint: "January to last month. Sets how much bonus is still CPF-liable."
@@ -5981,7 +6040,7 @@ function App() {
       onClick: () => persistAll({
         cpfSettings: {
           ...cpfSettings,
-          monthlyOW: cpfLinkedTotal
+          person1Salary: cpfLinkedTotal
         }
       })
     }, "Use this as monthly salary"));
@@ -5999,7 +6058,7 @@ function App() {
   }), /*#__PURE__*/React.createElement(Row, {
     label: "Employer share",
     value: fmt(cpfResult.owEmployer)
-  }), cpfSettings.bonusThisMonth > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Row, {
+  }), cpfSettings.person1BonusThisMonth > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Row, {
     label: "Bonus ceiling remaining this year",
     value: fmt(cpfResult.awCeiling)
   }), /*#__PURE__*/React.createElement(Row, {
@@ -6020,14 +6079,14 @@ function App() {
     }
   }, /*#__PURE__*/React.createElement(CheckField, {
     label: "Enter the OA / SA / MA split manually instead",
-    checked: cpfSettings.manualOverride,
+    checked: cpfSettings.person1ManualOverride,
     onChange: v => persistAll({
       cpfSettings: {
         ...cpfSettings,
-        manualOverride: v
+        person1ManualOverride: v
       }
     })
-  }), cpfSettings.manualOverride && /*#__PURE__*/React.createElement("div", {
+  }), cpfSettings.person1ManualOverride && /*#__PURE__*/React.createElement("div", {
     style: {
       display: "grid",
       gridTemplateColumns: "repeat(3, minmax(0,1fr))",
@@ -6036,29 +6095,29 @@ function App() {
     }
   }, /*#__PURE__*/React.createElement(NumberField, {
     label: "Ordinary Account",
-    value: cpfSettings.manualOA,
+    value: cpfSettings.person1ManualOA,
     onChange: v => persistAll({
       cpfSettings: {
         ...cpfSettings,
-        manualOA: v
+        person1ManualOA: v
       }
     })
   }), /*#__PURE__*/React.createElement(NumberField, {
     label: cpfResult.allocBand.saLabel === "SA" ? "Special Account" : "Retirement Account",
-    value: cpfSettings.manualSA,
+    value: cpfSettings.person1ManualSA,
     onChange: v => persistAll({
       cpfSettings: {
         ...cpfSettings,
-        manualSA: v
+        person1ManualSA: v
       }
     })
   }), /*#__PURE__*/React.createElement(NumberField, {
     label: "MediSave",
-    value: cpfSettings.manualMA,
+    value: cpfSettings.person1ManualMA,
     onChange: v => persistAll({
       cpfSettings: {
         ...cpfSettings,
-        manualMA: v
+        person1ManualMA: v
       }
     })
   }))), /*#__PURE__*/React.createElement("div", {
@@ -6322,7 +6381,7 @@ function App() {
       }
     })
   })), (() => {
-    const payrollCat = categories.income.find(c => c.key === "payrollEt");
+    const payrollCat = categories.income.find(c => c.key === "primaryIncome");
     const payrollAnnual = currentRecord && payrollCat ? incomeCatVal(currentRecord, payrollCat) * 12 : 0;
     return /*#__PURE__*/React.createElement("div", {
       style: {
@@ -6693,7 +6752,55 @@ function App() {
           fontSize: 12,
           color: "var(--ink-3)"
         }
-      }, "Income and expense categories, sub-categories, colours and icons."))));
+      }, "Income and expense categories, sub-categories, colours and icons.")), /*#__PURE__*/React.createElement("button", {
+        className: "btn-secondary",
+        style: {
+          textAlign: "left",
+          padding: 16
+        },
+        onClick: () => setSettingsView("household")
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontWeight: 600,
+          fontSize: 14,
+          color: "var(--ink-1)",
+          marginBottom: 4
+        }
+      }, "Household"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 12,
+          color: "var(--ink-3)"
+        }
+      }, "Current household name, and switching to a different one."))));
+    }
+    if (settingsView === "household") {
+      return /*#__PURE__*/React.createElement(Section, {
+        title: "Household",
+        eyebrow: "Settings",
+        right: /*#__PURE__*/React.createElement(IconBtn, {
+          onClick: () => setSettingsView("menu")
+        }, "← Back to Settings")
+      }, /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
+        style: { fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-3)", marginBottom: 12 }
+      }, "You're currently in household ", /*#__PURE__*/React.createElement("strong", { style: { color: "var(--ink-1)" } }, householdName), ". Switching joins a different household by name — it doesn't rename or move this one's data."),
+      /*#__PURE__*/React.createElement("div", {
+        style: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }
+      }, /*#__PURE__*/React.createElement("input", {
+        type: "text",
+        placeholder: "Switch to household…",
+        value: householdSwitchInput,
+        onChange: e => setHouseholdSwitchInput(e.target.value),
+        style: {
+          fontFamily: "var(--sans)", fontSize: 13, padding: "7px 10px",
+          border: "1px solid var(--hair)", borderRadius: 6, flex: "1 1 220px"
+        }
+      }), /*#__PURE__*/React.createElement("button", {
+        className: "btn-secondary",
+        disabled: !normalizeHouseholdName(householdSwitchInput) || normalizeHouseholdName(householdSwitchInput) === householdName,
+        onClick: () => switchHousehold(householdSwitchInput)
+      }, "Switch"))));
     }
     if (settingsView === "categories") {
       return /*#__PURE__*/React.createElement(Section, {
