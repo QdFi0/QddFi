@@ -803,6 +803,38 @@ const blankHouseholdDoc = () => ({
 const INSURANCE_TYPES = ["Death/TPD", "CI/ECI", "Personal Accident", "Hospitalisation", "Endowment"];
 const FREQUENCIES = ["Monthly", "Quarterly", "Semi-Annual", "Annual"];
 const PAYMENT_METHODS = ["GIRO", "Credit card", "PayNow", "Cheque", "Other"];
+const RECUR_UNITS = ["day", "week", "month", "year"];
+const RECUR_UNIT_LABELS = { day: "day(s)", week: "week(s)", month: "month(s)", year: "year(s)" };
+// Recurring items now post real transactions on their due date, so every item
+// needs an account (and category, unless it's a transfer) to be postable.
+// Old items only ever had {direction, frequency, dueMonth} and never touched
+// the ledger — reconciled into the new shape but left `active: false` unless
+// they already carry the fields a real posting needs, so nothing old starts
+// silently posting transactions the moment this ships.
+const reconcileRecurring = list => (list || []).map(r => {
+  const type = r.type || r.direction || "expense";
+  const unit = RECUR_UNITS.includes(r.unit) ? r.unit : "month";
+  const interval = Math.max(1, Math.round(Number(r.interval)) ||
+    (r.frequency === "Quarterly" ? 3 : r.frequency === "Semi-Annual" ? 6 : r.frequency === "Annual" ? 12 : 1));
+  const canPost = !!r.account && (type === "transfer" ? !!r.toAccount : !!r.category);
+  return {
+    id: r.id,
+    name: r.name || "",
+    type,
+    amount: Number(r.amount) || 0,
+    account: r.account || "",
+    toAccount: r.toAccount || "",
+    category: r.category || "",
+    subcat: r.subcat || "",
+    who: r.who || "Joint",
+    notes: r.notes || "",
+    interval,
+    unit,
+    nextDueDate: r.nextDueDate || todayISO(),
+    active: typeof r.active === "boolean" ? r.active : canPost,
+    lastPostedDate: r.lastPostedDate || null
+  };
+});
 
 /* CPF Board rates effective 1 Jan 2026 (cpf.gov.sg). OW ceiling $8,000/mth, annual OW+AW ceiling $102,000. */
 const CPF_OW_CEILING = 8000;
@@ -2117,6 +2149,17 @@ const isoToDayLabel = iso => {
   return `${wd}, ${d.getUTCDate()} ${MONTH_ABBR[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
 };
 const startOfMonthISO = () => todayISO().slice(0, 8) + "01";
+// Steps an ISO date forward by `interval` units (day/week/month/year), using
+// UTC setters so local timezone offsets never shift the calendar date.
+const addIntervalISO = (dateISO, interval, unit) => {
+  const d = new Date((dateISO || todayISO()) + "T00:00:00Z");
+  const n = Math.max(1, Math.round(Number(interval)) || 1);
+  if (unit === "day") d.setUTCDate(d.getUTCDate() + n);
+  else if (unit === "week") d.setUTCDate(d.getUTCDate() + n * 7);
+  else if (unit === "year") d.setUTCFullYear(d.getUTCFullYear() + n);
+  else d.setUTCMonth(d.getUTCMonth() + n);
+  return d.toISOString().slice(0, 10);
+};
 const monthsAgoISO = n => {
   const d = new Date(todayISO() + "T00:00:00Z");
   d.setUTCMonth(d.getUTCMonth() - n);
@@ -2362,6 +2405,100 @@ function ReconcileDialog({ account, computed, onCancel, onConfirm, categories })
       }, "Record adjustment")
     )
   ));
+}
+
+// Recurring item editor card. Account/category drive the actual transaction
+// posted when the item is due, so — unlike the old direction+frequency+
+// dueMonth register — this needs the same fields the daily ledger does
+// (account, category, who), plus a flexible "every N day/week/month/year"
+// cadence instead of a fixed frequency dropdown.
+function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate, onRemove }) {
+  const set = patch => onUpdate(item.id, patch);
+  const isTransfer = item.type === "transfer";
+  const catList = item.type === "income" ? categories.income : categories.expense;
+  const canPost = !!item.account && (isTransfer ? !!item.toAccount : !!item.category) && Number(item.amount) > 0;
+  const isPaused = item.active === false;
+  const overdue = !isPaused && canPost && item.nextDueDate <= todayISO();
+
+  const status = isPaused
+    ? { label: "Paused", bg: "#F3F2EE", color: "var(--ink-3)" }
+    : !canPost
+    ? { label: "Incomplete — won't auto-post", bg: "#FBF3E6", color: "var(--amber)" }
+    : overdue
+    ? { label: "Posting on next visit", bg: "#FBEAF0", color: "var(--warn)" }
+    : { label: `Next: ${isoToDayLabel(item.nextDueDate)}`, bg: "#E8F3EE", color: "var(--accent)" };
+
+  const chip = (label, active, onClick, key) => rc("button", {
+    key: key || label, onClick, className: active ? "btn-primary" : "btn-secondary",
+    style: { padding: "5px 11px", fontSize: 12, borderRadius: 999 }
+  }, label);
+
+  return rc(Card, null,
+    rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 8 } },
+      rc("span", {
+        style: {
+          fontFamily: "var(--sans)", fontSize: 11, fontWeight: 600,
+          padding: "3px 10px", borderRadius: 999, background: status.bg, color: status.color
+        }
+      }, status.label),
+      rc("div", { style: { display: "flex", gap: 6 } },
+        rc(IconBtn, { onClick: () => set({ active: isPaused }) }, isPaused ? "Resume" : "Pause"),
+        rc(IconBtn, { onClick: () => onRemove(item.id) }, "Remove")
+      )
+    ),
+
+    rc("div", { style: { display: "flex", gap: 6, marginBottom: 12 } },
+      [["expense", "Expense"], ["income", "Income"], ["transfer", "Transfer"]].map(([v, l]) =>
+        rc("button", {
+          key: v,
+          onClick: () => set({ type: v, category: "", subcat: "", toAccount: "", who: v === "income" ? item.who : "Joint" }),
+          className: item.type === v ? "btn-primary" : "btn-secondary",
+          style: { padding: "6px 14px", fontSize: 12.5 }
+        }, l))),
+
+    rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, minmax(0,1fr))", gap: 10, marginBottom: 10 } },
+      rc(TextField, { label: "Name", value: item.name, onChange: v => set({ name: v }) }),
+      rc(NumberField, { label: "Amount", value: item.amount, onChange: v => set({ amount: v }) })),
+
+    rc("div", { style: { display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 10 } },
+      rc("div", { style: { flex: "1 1 220px" } },
+        rc(LedgerLabel, null, isTransfer ? "From account" : "Account"),
+        rc(AccountSelect, { registry, value: item.account, onChange: v => set({ account: v }), allowExternal: isTransfer })),
+      isTransfer
+        ? rc("div", { style: { flex: "1 1 220px" } },
+            rc(LedgerLabel, null, "To account"),
+            rc(AccountSelect, { registry, value: item.toAccount, onChange: v => set({ toAccount: v }), placeholder: "Destination…", allowExternal: true }))
+        : rc("div", { style: { flex: "1 1 220px" } },
+            rc(LedgerLabel, null, "Category"),
+            rc(LedgerCategorySelect, { cats: catList, value: item.category, subValue: item.subcat, onChange: (c, s) => set({ category: c, subcat: s }) }))
+    ),
+
+    item.type === "income" && rc("div", { style: { marginBottom: 10 } },
+      rc(LedgerLabel, null, "Who"),
+      rc("div", { style: { display: "flex", gap: 6, flexWrap: "wrap" } },
+        [...(familyMembers || ["Person 1", "Person 2"]), "Joint"].map(m =>
+          chip(m, item.who === m, () => set({ who: m }), m)))),
+
+    rc("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 10 } },
+      rc("div", null, rc(LedgerLabel, null, "Every"),
+        rc("div", { style: { display: "flex", gap: 6 } },
+          rc("input", {
+            type: "number", min: 1, step: 1, value: item.interval,
+            onFocus: e => e.target.select(),
+            onChange: e => set({ interval: Math.max(1, Math.round(Number(e.target.value) || 1)) }),
+            style: { ...inputStyle, width: 64, fontFamily: "var(--mono)" }
+          }),
+          rc("select", {
+            value: item.unit, onChange: e => set({ unit: e.target.value }), style: inputStyle
+          }, RECUR_UNITS.map(u => rc("option", { key: u, value: u }, RECUR_UNIT_LABELS[u]))))),
+      rc("div", null, rc(LedgerLabel, null, "Next due date"),
+        rc("input", { type: "date", value: item.nextDueDate, onChange: e => set({ nextDueDate: e.target.value }), style: inputStyle }))
+    ),
+
+    rc("div", null,
+      rc(LedgerLabel, null, "Notes"),
+      rc("input", { type: "text", value: item.notes, placeholder: "optional", onChange: e => set({ notes: e.target.value }), style: inputStyle }))
+  );
 }
 
 /* ───────────── main tab ───────────── */
@@ -2991,7 +3128,8 @@ function App() {
   const [budgets, setBudgets] = useState({});
   const [contracts, setContracts] = useState([]);
   const [policies, setPolicies] = useState([]);
-  const [recurring, setRecurring] = useState([]);
+  const [recurringRaw, setRecurring] = useState([]);
+  const recurring = useMemo(() => reconcileRecurring(recurringRaw), [recurringRaw]);
   const [familyMembers, setFamilyMembers] = useState(["Person 1", "Person 2"]);
   const [housingLoan, setHousingLoan] = useState({
     principal: 0,
@@ -3243,6 +3381,53 @@ function App() {
     payee: "", note: note || "", who: "",
     createdAt: new Date().toISOString()
   });
+
+  // Recurring items post real transactions on their due date instead of only
+  // feeding the forecast. Self-limiting: once caught up, nextDueDate sits
+  // past "today" so the next pass over the same items posts nothing and
+  // writes nothing — no ref guard needed to stop it looping. Deterministic
+  // transaction ids (rec_<itemId>_<dueDate>) mean two household members'
+  // browsers racing to post the same occurrence just overwrite the same doc
+  // instead of creating a duplicate entry.
+  useEffect(() => {
+    if (!householdName || !recurring.length) return;
+    const today = todayISO();
+    let changed = false;
+    const nextRecurring = recurring.map(item => {
+      if (item.active === false) return item;
+      if (!item.account) return item;
+      if (item.type === "transfer" ? !item.toAccount : !item.category) return item;
+      if (!(Number(item.amount) > 0)) return item;
+      let cursor = item.nextDueDate || today;
+      let posted = false;
+      for (let guard = 0; guard < 500 && cursor <= today; guard++) {
+        saveTxn({
+          id: `rec_${item.id}_${cursor}`,
+          date: cursor,
+          type: item.type,
+          amount: Number(item.amount),
+          account: item.account,
+          toAccount: item.type === "transfer" ? item.toAccount : null,
+          category: item.type === "transfer" ? null : item.category,
+          subcat: item.type === "transfer" ? null : (item.subcat || null),
+          payee: item.name || "",
+          note: item.notes || "",
+          who: item.type === "income" ? (item.who || "Joint") : "Joint",
+          recurringId: item.id,
+          createdAt: new Date().toISOString()
+        });
+        cursor = addIntervalISO(cursor, item.interval, item.unit);
+        posted = true;
+      }
+      if (!posted) return item;
+      changed = true;
+      return { ...item, nextDueDate: cursor, lastPostedDate: today };
+    });
+    if (changed) {
+      setRecurring(nextRecurring);
+      persistAll({ recurring: nextRecurring });
+    }
+  }, [householdName, recurring]);
   const setOpeningFromLatest = () => {
     const list = sealedRecords || [];
     const last = list[list.length - 1];
@@ -3332,13 +3517,12 @@ function App() {
       policies: next
     });
   };
+  // Minimal seed — reconcileRecurring fills in every other field's default
+  // (including active: false, since a blank item has no account/category yet
+  // and so can't post) the moment this flows back through the `recurring` memo.
   const addRecurring = () => setRecurring([...recurring, {
     id: uid(),
     name: "",
-    direction: "expense",
-    amount: 0,
-    frequency: "Monthly",
-    dueMonth: 1,
     notes: ""
   }]);
   const updateRecurring = (id, patch) => {
@@ -3646,18 +3830,36 @@ function App() {
     const lastDerived = derivedByMonth[lastRec.month];
     let cumNetWorth = lastDerived.hasBalances ? lastDerived.netWorth : 0;
     const startKey = monthSortKey(lastRec.month) + 1;
+    // Which forecast months each active recurring item lands in, walking
+    // forward from its next not-yet-posted occurrence. Replaces the old fixed
+    // calendar-month/frequency check now that cadence is arbitrary (every N
+    // days/weeks/months/years) — the posting effect above keeps nextDueDate
+    // sitting at the next occurrence that hasn't hit the ledger yet, so this
+    // and the actual posting can never double up or disagree.
+    const recurByMonth = {};
+    recurring.forEach(item => {
+      if (item.active === false || item.type === "transfer") return;
+      const amt = Number(item.amount) || 0;
+      if (!amt) return;
+      let cursor = item.nextDueDate || todayISO();
+      for (let guard = 0; guard < 60; guard++) {
+        const monthKey = monthSortKey(isoToMonthLabel(cursor));
+        if (monthKey > startKey + 11) break;
+        if (monthKey >= startKey) {
+          const bucket = recurByMonth[monthKey] || { income: 0, expense: 0 };
+          if (item.type === "income") bucket.income += amt; else bucket.expense += amt;
+          recurByMonth[monthKey] = bucket;
+        }
+        cursor = addIntervalISO(cursor, item.interval, item.unit);
+      }
+    });
     const rows = [];
     for (let i = 0; i < 12; i++) {
       const monthName = monthLabelFromSortKey(startKey + i);
       const calendarMonth = new Date(`${monthName.split(" ")[0]} 1, 2026`).getMonth() + 1;
-      let recurExpense = 0,
-        recurIncome = 0;
-      recurring.forEach(item => {
-        const amt = Number(item.amount) || 0;
-        const isDue = item.frequency === "Monthly" ? true : item.frequency === "Quarterly" ? (calendarMonth - item.dueMonth) % 3 === 0 : item.frequency === "Semi-Annual" ? (calendarMonth - item.dueMonth) % 6 === 0 : calendarMonth === Number(item.dueMonth);
-        if (!isDue) return;
-        if (item.direction === "expense") recurExpense += amt;else recurIncome += amt;
-      });
+      const recurBucket = recurByMonth[startKey + i] || { income: 0, expense: 0 };
+      let recurExpense = recurBucket.expense,
+        recurIncome = recurBucket.income;
       policies.forEach(p => {
         const premium = Number(p.annualPremium) || 0;
         if (!premium) return;
@@ -5338,7 +5540,7 @@ function App() {
       color: "var(--ink-3)",
       marginBottom: 14
     }
-  }, "Use this for lumpy or annual items that don\u2019t average out well in the trailing 3-month forecast baseline, like school fees or road tax. Insurance premiums are handled automatically from the Insurance tab."), contracts.filter(c => Number(c.monthlyAmount) > 0).length > 0 && /*#__PURE__*/React.createElement("div", {
+  }, "Recurring items post a real transaction to the ledger on their due date, and project into the Forecast until then. Give each one an account and category so it has somewhere to post \u2014 items missing either stay marked \u201cIncomplete\u201d and won\u2019t post. Use Pause to stop one temporarily without losing its setup. Insurance premiums are handled automatically from the Insurance tab."), contracts.filter(c => Number(c.monthlyAmount) > 0).length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: 18
     }
@@ -5490,60 +5692,15 @@ function App() {
       flexDirection: "column",
       gap: 10
     }
-  }, recurring.map(r => /*#__PURE__*/React.createElement(Card, {
-    key: r.id
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "repeat(3, minmax(0,1fr))",
-      gap: 10,
-      marginBottom: 10
-    }
-  }, /*#__PURE__*/React.createElement(TextField, {
-    label: "Name",
-    value: r.name,
-    onChange: v => updateRecurring(r.id, {
-      name: v
-    })
-  }), /*#__PURE__*/React.createElement(SelectField, {
-    label: "Direction",
-    value: r.direction,
-    onChange: v => updateRecurring(r.id, {
-      direction: v
-    }),
-    options: ["expense", "income"]
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Amount",
-    value: r.amount,
-    onChange: v => updateRecurring(r.id, {
-      amount: v
-    })
-  }), /*#__PURE__*/React.createElement(SelectField, {
-    label: "Frequency",
-    value: r.frequency,
-    onChange: v => updateRecurring(r.id, {
-      frequency: v
-    }),
-    options: FREQUENCIES
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Due month (1 to 12)",
-    value: r.dueMonth,
-    onChange: v => updateRecurring(r.id, {
-      dueMonth: v
-    })
-  }), /*#__PURE__*/React.createElement(TextField, {
-    label: "Notes",
-    value: r.notes,
-    onChange: v => updateRecurring(r.id, {
-      notes: v
-    })
-  })), /*#__PURE__*/React.createElement("div", {
-    style: {
-      textAlign: "right"
-    }
-  }, /*#__PURE__*/React.createElement(IconBtn, {
-    onClick: () => removeRecurring(r.id)
-  }, "Remove")))), recurring.length === 0 && /*#__PURE__*/React.createElement("div", {
+  }, recurring.map(r => rc(RecurringItemCard, {
+    key: r.id,
+    item: r,
+    registry: registry,
+    categories: categories,
+    familyMembers: familyMembers,
+    onUpdate: updateRecurring,
+    onRemove: removeRecurring
+  })), recurring.length === 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: "var(--sans)",
       fontSize: 13,
