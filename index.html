@@ -805,6 +805,19 @@ const FREQUENCIES = ["Monthly", "Quarterly", "Semi-Annual", "Annual"];
 const PAYMENT_METHODS = ["GIRO", "Credit card", "PayNow", "Cheque", "Other"];
 const RECUR_UNITS = ["day", "week", "month", "year"];
 const RECUR_UNIT_LABELS = { day: "day(s)", week: "week(s)", month: "month(s)", year: "year(s)" };
+// Old paymentFrequency/frequency enums (recurring's old {direction, frequency, dueMonth}
+// shape, and insurance's old {paymentFrequency, annualPremium}) all meant "every N months"
+// in disguise — one shared mapping so every legacy-shape migration agrees on the same
+// cadence instead of each hand-rolling its own interval/unit table.
+const legacyFrequencyToCadence = freq => ({
+  interval: freq === "Quarterly" ? 3 : freq === "Semi-Annual" ? 6 : freq === "Annual" ? 12 : 1,
+  unit: "month"
+});
+// How many times a cadence occurs per year, for any interval+unit — lets a total annual
+// figure (old insurance policies stored annualPremium) convert to a per-occurrence amount
+// generically, without a second hardcoded table that has to stay in sync with the first.
+const occurrencesPerYear = (interval, unit) =>
+  ({ day: 365, week: 52, month: 12, year: 1 }[unit] || 12) / Math.max(1, interval);
 // Recurring items now post real transactions on their due date, so every item
 // needs an account (and category, unless it's a transfer) to be postable.
 // Old items only ever had {direction, frequency, dueMonth} and never touched
@@ -813,9 +826,9 @@ const RECUR_UNIT_LABELS = { day: "day(s)", week: "week(s)", month: "month(s)", y
 // silently posting transactions the moment this ships.
 const reconcileRecurring = list => (list || []).map(r => {
   const type = r.type || r.direction || "expense";
-  const unit = RECUR_UNITS.includes(r.unit) ? r.unit : "month";
-  const interval = Math.max(1, Math.round(Number(r.interval)) ||
-    (r.frequency === "Quarterly" ? 3 : r.frequency === "Semi-Annual" ? 6 : r.frequency === "Annual" ? 12 : 1));
+  const legacy = legacyFrequencyToCadence(r.frequency);
+  const unit = RECUR_UNITS.includes(r.unit) ? r.unit : legacy.unit;
+  const interval = Math.max(1, Math.round(Number(r.interval)) || legacy.interval);
   const canPost = !!r.account && (type === "transfer" ? !!r.toAccount : !!r.category);
   return {
     id: r.id,
@@ -833,6 +846,44 @@ const reconcileRecurring = list => (list || []).map(r => {
     nextDueDate: r.nextDueDate || todayISO(),
     active: typeof r.active === "boolean" ? r.active : canPost,
     lastPostedDate: r.lastPostedDate || null
+  };
+});
+// Insurance policies moved onto the same real-posting cadence engine as Recurring items
+// (account/category/interval/unit/nextDueDate/active/lastPostedDate) instead of staying a
+// forecast-only estimate. Old rows had {annualPremium, paymentFrequency, nextPaymentDate,
+// paymentAccount (free text), paymentMethod} and never touched the ledger — migrated with
+// the same safety rule as reconcileRecurring: `paymentAccount` free text can't be mapped to
+// a real registry key, so `active` only defaults true once a real account+category are
+// already present, meaning no pre-existing policy silently starts auto-posting the moment
+// this ships — it sits "Incomplete" until the user picks a real paying account.
+const reconcilePolicies = list => (list || []).map(p => {
+  const legacy = legacyFrequencyToCadence(p.paymentFrequency);
+  const unit = RECUR_UNITS.includes(p.unit) ? p.unit : legacy.unit;
+  const interval = Math.max(1, Math.round(Number(p.interval)) || legacy.interval);
+  const amount = Number(p.amount) || (Number(p.annualPremium) || 0) / occurrencesPerYear(interval, unit);
+  const category = p.category || (p.type === "Endowment" ? "endowment" : "insurance");
+  const account = p.account || "";
+  const canPost = !!account && !!category;
+  return {
+    id: p.id,
+    person: p.person || "Person 1",
+    type: p.type || INSURANCE_TYPES[0],
+    insurer: p.insurer || "",
+    product: p.product || "",
+    policyNumber: p.policyNumber || "",
+    coverage: Number(p.coverage) || 0,
+    amount,
+    account,
+    category,
+    subcat: p.subcat || "",
+    interval,
+    unit,
+    nextDueDate: p.nextDueDate || p.nextPaymentDate || todayISO(),
+    lapseDate: p.lapseDate || "",
+    notes: p.notes || "",
+    active: typeof p.active === "boolean" ? p.active : canPost,
+    lastPostedDate: p.lastPostedDate || null,
+    locked: !!p.locked
   };
 });
 
@@ -2160,6 +2211,43 @@ const addIntervalISO = (dateISO, interval, unit) => {
   else d.setUTCMonth(d.getUTCMonth() + n);
   return d.toISOString().slice(0, 10);
 };
+// Walks one recurring-shaped item's cadence forward from nextDueDate, posting every
+// occurrence <= today via saveTxn (buildTxn maps item+date -> a txn), and returns the
+// item with nextDueDate/lastPostedDate advanced (or the same item if nothing was due).
+// Shared by the Recurring and Insurance posting effects so the guard-loop/advance logic
+// can't drift out of sync between them.
+const postDueCadence = (item, today, saveTxn, buildTxn) => {
+  if (!(Number(item.amount) > 0)) return item;
+  let cursor = item.nextDueDate || today;
+  let posted = false;
+  for (let guard = 0; guard < 500 && cursor <= today; guard++) {
+    saveTxn(buildTxn(item, cursor));
+    cursor = addIntervalISO(cursor, item.interval, item.unit);
+    posted = true;
+  }
+  return posted ? { ...item, nextDueDate: cursor, lastPostedDate: today } : item;
+};
+// Buckets each active item's amount into the forecast month it lands in, walking its
+// cadence forward from nextDueDate (capped at lapseDate when present). Shared by the
+// Recurring and Insurance forecast calculations so they can't disagree with the actual
+// posting logic above about which months an item's amount lands in.
+const bucketDueAmounts = (items, startKey) => {
+  const byMonth = {};
+  items.forEach(item => {
+    if (item.active === false) return;
+    const amt = Number(item.amount) || 0;
+    if (!amt) return;
+    let cursor = item.nextDueDate || todayISO();
+    for (let guard = 0; guard < 60; guard++) {
+      if (item.lapseDate && cursor > item.lapseDate) break;
+      const monthKey = monthSortKey(isoToMonthLabel(cursor));
+      if (monthKey > startKey + 11) break;
+      if (monthKey >= startKey) byMonth[monthKey] = (byMonth[monthKey] || 0) + amt;
+      cursor = addIntervalISO(cursor, item.interval, item.unit);
+    }
+  });
+  return byMonth;
+};
 const monthsAgoISO = n => {
   const d = new Date(todayISO() + "T00:00:00Z");
   d.setUTCMonth(d.getUTCMonth() - n);
@@ -2285,9 +2373,9 @@ const inputStyle = {
   background: "#fff", color: "var(--ink-1)", width: "100%"
 };
 
-function AccountSelect({ registry, value, onChange, placeholder, allowExternal }) {
+function AccountSelect({ registry, value, onChange, placeholder, allowExternal, disabled }) {
   const groups = ["liquidCash", "investments", "cpfPerson1", "cpfPerson2", "property"];
-  return rc("select", { value: value || "", onChange: e => onChange(e.target.value), style: inputStyle },
+  return rc("select", { value: value || "", disabled, onChange: e => onChange(e.target.value), style: inputStyle },
     rc("option", { value: "" }, placeholder || "Select account…"),
     allowExternal && rc("option", { value: EXTERNAL_KEY }, "\u27F6 " + EXTERNAL_LABEL),
     groups.map(g => {
@@ -2300,13 +2388,14 @@ function AccountSelect({ registry, value, onChange, placeholder, allowExternal }
   );
 }
 
-function LedgerCategorySelect({ cats, value, subValue, onChange }) {
+function LedgerCategorySelect({ cats, value, subValue, onChange, disabled }) {
   const active = (cats || []).filter(c => !c.archived);
   const cur = active.find(c => c.key === value);
   const subs = (cur && cur.subcats) || [];
   return rc("div", { style: { display: "flex", gap: 6 } },
     rc("select", {
       value: value || "",
+      disabled,
       onChange: e => onChange(e.target.value, ""),
       style: { ...inputStyle, flex: subs.length ? "1 1 55%" : "1 1 100%" }
     },
@@ -2315,6 +2404,7 @@ function LedgerCategorySelect({ cats, value, subValue, onChange }) {
     ),
     subs.length > 0 && rc("select", {
       value: subValue || "",
+      disabled,
       onChange: e => onChange(value, e.target.value),
       style: { ...inputStyle, flex: "1 1 45%" }
     },
@@ -3127,7 +3217,12 @@ function App() {
   const [assumptions, setAssumptions] = useState(DEFAULT_ASSUMPTIONS);
   const [budgets, setBudgets] = useState({});
   const [contracts, setContracts] = useState([]);
-  const [policies, setPolicies] = useState([]);
+  const [policiesRaw, setPolicies] = useState([]);
+  const policies = useMemo(() => reconcilePolicies(policiesRaw), [policiesRaw]);
+  // A lapsed policy provides zero actual coverage, so it's excluded from the family
+  // coverage totals below rather than inflating a number the household relies on for
+  // protection planning.
+  const isPolicyLapsed = p => !!p.lapseDate && p.lapseDate < todayISO();
   const [recurringRaw, setRecurring] = useState([]);
   const recurring = useMemo(() => reconcileRecurring(recurringRaw), [recurringRaw]);
   const [familyMembers, setFamilyMembers] = useState(["Person 1", "Person 2"]);
@@ -3397,37 +3492,65 @@ function App() {
       if (item.active === false) return item;
       if (!item.account) return item;
       if (item.type === "transfer" ? !item.toAccount : !item.category) return item;
-      if (!(Number(item.amount) > 0)) return item;
-      let cursor = item.nextDueDate || today;
-      let posted = false;
-      for (let guard = 0; guard < 500 && cursor <= today; guard++) {
-        saveTxn({
-          id: `rec_${item.id}_${cursor}`,
-          date: cursor,
-          type: item.type,
-          amount: Number(item.amount),
-          account: item.account,
-          toAccount: item.type === "transfer" ? item.toAccount : null,
-          category: item.type === "transfer" ? null : item.category,
-          subcat: item.type === "transfer" ? null : (item.subcat || null),
-          payee: item.name || "",
-          note: item.notes || "",
-          who: item.type === "income" ? (item.who || "Joint") : "Joint",
-          recurringId: item.id,
-          createdAt: new Date().toISOString()
-        });
-        cursor = addIntervalISO(cursor, item.interval, item.unit);
-        posted = true;
-      }
-      if (!posted) return item;
-      changed = true;
-      return { ...item, nextDueDate: cursor, lastPostedDate: today };
+      const next = postDueCadence(item, today, saveTxn, (it, cursor) => ({
+        id: `rec_${it.id}_${cursor}`,
+        date: cursor,
+        type: it.type,
+        amount: Number(it.amount),
+        account: it.account,
+        toAccount: it.type === "transfer" ? it.toAccount : null,
+        category: it.type === "transfer" ? null : it.category,
+        subcat: it.type === "transfer" ? null : (it.subcat || null),
+        payee: it.name || "",
+        note: it.notes || "",
+        who: it.type === "income" ? (it.who || "Joint") : "Joint",
+        recurringId: it.id,
+        createdAt: new Date().toISOString()
+      }));
+      if (next !== item) changed = true;
+      return next;
     });
     if (changed) {
       setRecurring(nextRecurring);
       persistAll({ recurring: nextRecurring });
     }
   }, [householdName, recurring]);
+
+  // Insurance premiums post real transactions the same way Recurring items do (shared
+  // postDueCadence), walking each policy's cadence forward from nextDueDate. Capped at
+  // lapseDate so a lapsed policy stops generating premium charges past its expiry instead
+  // of posting forever — see postDueCadence, index.html ~2154.
+  useEffect(() => {
+    if (!householdName || !policies.length) return;
+    const today = todayISO();
+    let changed = false;
+    const nextPolicies = policies.map(item => {
+      if (item.active === false) return item;
+      if (!item.account || !item.category) return item;
+      const cappedToday = item.lapseDate && item.lapseDate < today ? item.lapseDate : today;
+      const next = postDueCadence(item, cappedToday, saveTxn, (it, cursor) => ({
+        id: `pol_${it.id}_${cursor}`,
+        date: cursor,
+        type: "expense",
+        amount: Number(it.amount),
+        account: it.account,
+        toAccount: null,
+        category: it.category,
+        subcat: it.subcat || null,
+        payee: it.insurer || it.product || "Insurance premium",
+        note: it.notes || "",
+        who: "Joint",
+        policyId: it.id,
+        createdAt: new Date().toISOString()
+      }));
+      if (next !== item) changed = true;
+      return next;
+    });
+    if (changed) {
+      setPolicies(nextPolicies);
+      persistAll({ policies: nextPolicies });
+    }
+  }, [householdName, policies]);
   const setOpeningFromLatest = () => {
     const list = sealedRecords || [];
     const last = list[list.length - 1];
@@ -3478,6 +3601,8 @@ function App() {
       contracts: next
     });
   };
+  // Minimal seed — reconcilePolicies fills in every other field's default (including
+  // active: false, since a blank policy has no account/category yet and so can't post).
   const addPolicy = () => setPolicies([...policies, {
     id: uid(),
     person: familyMembers[0] || "Person 1",
@@ -3486,11 +3611,6 @@ function App() {
     product: "",
     policyNumber: "",
     coverage: 0,
-    annualPremium: 0,
-    paymentFrequency: "Annual",
-    nextPaymentDate: todayISO(),
-    paymentMethod: "GIRO",
-    paymentAccount: "",
     locked: false
   }]);
   const updatePolicy = (id, patch) => {
@@ -3853,22 +3973,17 @@ function App() {
         cursor = addIntervalISO(cursor, item.interval, item.unit);
       }
     });
+    // Same cadence-walk as recurByMonth above (via the shared bucketDueAmounts helper),
+    // applied to insurance policies — replaces the old calendar-month/frequency guess so
+    // this can never disagree with the policy posting effect about which months a premium
+    // lands in. Capped at lapseDate inside the helper, so a lapsed policy stops contributing.
+    const policyByMonth = bucketDueAmounts(policies.filter(p => p.account && p.category), startKey);
     const rows = [];
     for (let i = 0; i < 12; i++) {
       const monthName = monthLabelFromSortKey(startKey + i);
-      const calendarMonth = new Date(`${monthName.split(" ")[0]} 1, 2026`).getMonth() + 1;
       const recurBucket = recurByMonth[startKey + i] || { income: 0, expense: 0 };
-      let recurExpense = recurBucket.expense,
+      let recurExpense = recurBucket.expense + (policyByMonth[startKey + i] || 0),
         recurIncome = recurBucket.income;
-      policies.forEach(p => {
-        const premium = Number(p.annualPremium) || 0;
-        if (!premium) return;
-        const anchorMonth = p.nextPaymentDate ? new Date(p.nextPaymentDate).getMonth() + 1 : 1;
-        const freq = p.paymentFrequency || "Annual";
-        const perPayment = freq === "Monthly" ? premium / 12 : freq === "Quarterly" ? premium / 4 : freq === "Semi-Annual" ? premium / 2 : premium;
-        const isDue = freq === "Monthly" ? true : freq === "Quarterly" ? (calendarMonth - anchorMonth) % 3 === 0 : freq === "Semi-Annual" ? (calendarMonth - anchorMonth) % 6 === 0 : calendarMonth === anchorMonth;
-        if (isDue) recurExpense += perPayment;
-      });
       contracts.forEach(c => {
         // Monthly amount is billed every month regardless of renewal
         // cadence, so it always counts as a planned monthly expense.
@@ -5355,7 +5470,7 @@ function App() {
       borderBottom: "1px solid var(--hair-strong)"
     }
   }, "Total"))), /*#__PURE__*/React.createElement("tbody", null, INSURANCE_TYPES.map(type => {
-    const rowTotal = policies.filter(p => p.type === type).reduce((a, p) => a + (Number(p.coverage) || 0), 0);
+    const rowTotal = policies.filter(p => p.type === type && !isPolicyLapsed(p)).reduce((a, p) => a + (Number(p.coverage) || 0), 0);
     return /*#__PURE__*/React.createElement("tr", {
       key: type
     }, /*#__PURE__*/React.createElement("td", {
@@ -5367,7 +5482,7 @@ function App() {
         borderBottom: "1px solid var(--hair)"
       }
     }, type), familyMembers.map(p => {
-      const v = policies.filter(pl => pl.type === type && pl.person === p).reduce((a, pl) => a + (Number(pl.coverage) || 0), 0);
+      const v = policies.filter(pl => pl.type === type && pl.person === p && !isPolicyLapsed(pl)).reduce((a, pl) => a + (Number(pl.coverage) || 0), 0);
       return /*#__PURE__*/React.createElement("td", {
         key: p,
         style: {
@@ -5393,7 +5508,7 @@ function App() {
       color: "var(--ink-3)",
       marginBottom: 10
     }
-  }, "Each policy premium feeds the Forecast automatically and appears as a tracked item in Recurring \u2014 no need to add it there yourself."), /*#__PURE__*/React.createElement("div", {
+  }, "Each policy premium posts to the ledger on its due date and feeds the Forecast automatically \u2014 no need to add it in Recurring yourself."), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -5401,131 +5516,80 @@ function App() {
     }
   }, policies.map(p => {
     const locked = !!p.locked;
-    return /*#__PURE__*/React.createElement(Card, {
-      key: p.id
-    }, /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        justifyContent: "flex-end",
-        marginBottom: 8
-      }
-    }, /*#__PURE__*/React.createElement("span", {
-      style: {
-        fontFamily: "var(--sans)",
-        fontSize: 10.5,
-        fontWeight: 700,
-        letterSpacing: "0.05em",
-        textTransform: "uppercase",
-        padding: "3px 8px",
-        borderRadius: 999,
-        background: locked ? "#E7F0EC" : "#FBF3E4",
-        color: locked ? "var(--accent)" : "var(--amber)"
-      }
-    }, locked ? "Saved" : "Draft \u2014 not yet saved")), /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "grid",
-        gridTemplateColumns: "repeat(3, minmax(0,1fr))",
-        gap: 10,
-        marginBottom: 10
-      }
-    }, /*#__PURE__*/React.createElement(SelectField, {
-      label: "Person",
-      value: p.person,
-      disabled: locked,
-      onChange: v => updatePolicy(p.id, {
-        person: v
-      }),
-      options: familyMembers
-    }), /*#__PURE__*/React.createElement(SelectField, {
-      label: "Type",
-      value: p.type,
-      disabled: locked,
-      onChange: v => updatePolicy(p.id, {
-        type: v
-      }),
-      options: INSURANCE_TYPES
-    }), /*#__PURE__*/React.createElement(TextField, {
-      label: "Insurer",
-      value: p.insurer,
-      disabled: locked,
-      onChange: v => updatePolicy(p.id, {
-        insurer: v
-      })
-    }), /*#__PURE__*/React.createElement(TextField, {
-      label: "Product",
-      value: p.product,
-      disabled: locked,
-      onChange: v => updatePolicy(p.id, {
-        product: v
-      })
-    }), /*#__PURE__*/React.createElement(TextField, {
-      label: "Policy number",
-      value: p.policyNumber || "",
-      disabled: locked,
-      onChange: v => updatePolicy(p.id, {
-        policyNumber: v
-      })
-    }), /*#__PURE__*/React.createElement(NumberField, {
-      label: "Coverage / sum assured",
-      value: p.coverage,
-      disabled: locked,
-      onChange: v => updatePolicy(p.id, {
-        coverage: v
-      })
-    }), /*#__PURE__*/React.createElement(NumberField, {
-      label: "Annual premium",
-      value: p.annualPremium,
-      disabled: locked,
-      onChange: v => updatePolicy(p.id, {
-        annualPremium: v
-      })
-    }), /*#__PURE__*/React.createElement(SelectField, {
-      label: "Payment frequency",
-      value: p.paymentFrequency,
-      disabled: locked,
-      onChange: v => updatePolicy(p.id, {
-        paymentFrequency: v
-      }),
-      options: FREQUENCIES
-    }), /*#__PURE__*/React.createElement(DateField, {
-      label: "Next payment date",
-      value: p.nextPaymentDate,
-      disabled: locked,
-      onChange: v => updatePolicy(p.id, {
-        nextPaymentDate: v
-      })
-    }), /*#__PURE__*/React.createElement(SelectField, {
-      label: "Payment method",
-      value: p.paymentMethod,
-      disabled: locked,
-      onChange: v => updatePolicy(p.id, {
-        paymentMethod: v
-      }),
-      options: PAYMENT_METHODS
-    }), /*#__PURE__*/React.createElement(TextField, {
-      label: "Paid from (account or card)",
-      value: p.paymentAccount,
-      disabled: locked,
-      onChange: v => updatePolicy(p.id, {
-        paymentAccount: v
-      })
-    })), /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        justifyContent: "flex-end",
-        gap: 8
-      }
-    }, /*#__PURE__*/React.createElement("button", {
-      className: locked ? "btn-secondary" : "btn-primary",
-      disabled: !locked && !(p.insurer || "").trim(),
-      onClick: () => togglePolicyLock(p.id),
-      style: {
-        padding: "5px 10px",
-        fontSize: 12
-      }
-    }, locked ? "Edit" : "Save"), /*#__PURE__*/React.createElement(IconBtn, {
-      onClick: () => setConfirmRemovePolicyId(p.id)
-    }, "Remove")));
+    const lapsed = isPolicyLapsed(p);
+    const canPost = !!p.account && !!p.category && Number(p.amount) > 0;
+    const isPaused = p.active === false;
+    const overdue = !isPaused && !lapsed && canPost && p.nextDueDate <= todayISO();
+    const status = lapsed
+      ? { label: "Lapsed", bg: "#F3F2EE", color: "var(--ink-3)" }
+      : isPaused
+      ? { label: "Paused", bg: "#F3F2EE", color: "var(--ink-3)" }
+      : !canPost
+      ? { label: "Incomplete \u2014 won't auto-post", bg: "#FBF3E6", color: "var(--amber)" }
+      : overdue
+      ? { label: "Posting on next visit", bg: "#FBEAF0", color: "var(--warn)" }
+      : { label: `Next: ${isoToDayLabel(p.nextDueDate)}`, bg: "#E8F3EE", color: "var(--accent)" };
+    return rc(Card, { key: p.id },
+      rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 6 } },
+        rc("span", {
+          style: {
+            fontFamily: "var(--sans)", fontSize: 10.5, fontWeight: 700, letterSpacing: "0.05em",
+            textTransform: "uppercase", padding: "3px 8px", borderRadius: 999,
+            background: locked ? "#E7F0EC" : "#FBF3E4", color: locked ? "var(--accent)" : "var(--amber)"
+          }
+        }, locked ? "Saved" : "Draft \u2014 not yet saved"),
+        rc("span", {
+          style: {
+            fontFamily: "var(--sans)", fontSize: 11, fontWeight: 600,
+            padding: "3px 10px", borderRadius: 999, background: status.bg, color: status.color
+          }
+        }, status.label)),
+      rc("div", {
+        style: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 10, marginBottom: 10 }
+      },
+        rc(SelectField, { label: "Person", value: p.person, disabled: locked, onChange: v => updatePolicy(p.id, { person: v }), options: familyMembers }),
+        rc(SelectField, { label: "Type", value: p.type, disabled: locked, onChange: v => updatePolicy(p.id, { type: v }), options: INSURANCE_TYPES }),
+        rc(TextField, { label: "Insurer", value: p.insurer, disabled: locked, onChange: v => updatePolicy(p.id, { insurer: v }) }),
+        rc(TextField, { label: "Product", value: p.product, disabled: locked, onChange: v => updatePolicy(p.id, { product: v }) }),
+        rc(TextField, { label: "Policy number", value: p.policyNumber || "", disabled: locked, onChange: v => updatePolicy(p.id, { policyNumber: v }) }),
+        rc(NumberField, { label: "Coverage / sum assured", value: p.coverage, disabled: locked, onChange: v => updatePolicy(p.id, { coverage: v }) }),
+        rc(NumberField, { label: "Premium per payment", value: p.amount, disabled: locked, onChange: v => updatePolicy(p.id, { amount: v }) })
+      ),
+      rc("div", { style: { display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 10 } },
+        rc("div", { style: { flex: "1 1 220px" } },
+          rc(LedgerLabel, null, "Account (debited from)"),
+          rc(AccountSelect, { registry, value: p.account, disabled: locked, onChange: v => updatePolicy(p.id, { account: v }), allowExternal: false })),
+        rc("div", { style: { flex: "1 1 220px" } },
+          rc(LedgerLabel, null, "Category"),
+          rc(LedgerCategorySelect, { cats: categories.expense, disabled: locked, value: p.category, subValue: p.subcat, onChange: (c, s) => updatePolicy(p.id, { category: c, subcat: s }) }))),
+      rc("div", { style: { display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 10 } },
+        rc("div", null, rc(LedgerLabel, null, "Every"),
+          rc("div", { style: { display: "flex", gap: 6 } },
+            rc("input", {
+              type: "number", min: 1, step: 1, value: p.interval, disabled: locked,
+              onFocus: e => e.target.select(),
+              onChange: e => updatePolicy(p.id, { interval: Math.max(1, Math.round(Number(e.target.value) || 1)) }),
+              style: { ...inputStyle, width: 64, fontFamily: "var(--mono)" }
+            }),
+            rc("select", {
+              value: p.unit, disabled: locked, onChange: e => updatePolicy(p.id, { unit: e.target.value }), style: inputStyle
+            }, RECUR_UNITS.map(u => rc("option", { key: u, value: u }, RECUR_UNIT_LABELS[u]))))),
+        rc("div", null, rc(LedgerLabel, null, "Next due date"),
+          rc("input", { type: "date", value: p.nextDueDate, disabled: locked, onChange: e => updatePolicy(p.id, { nextDueDate: e.target.value }), style: inputStyle })),
+        rc("div", null, rc(LedgerLabel, null, "Lapse date"),
+          rc("input", { type: "date", value: p.lapseDate || "", disabled: locked, placeholder: "optional", onChange: e => updatePolicy(p.id, { lapseDate: e.target.value }), style: inputStyle }))),
+      rc("div", { style: { marginBottom: 10 } },
+        rc(LedgerLabel, null, "Notes"),
+        rc("input", { type: "text", value: p.notes || "", disabled: locked, placeholder: "optional", onChange: e => updatePolicy(p.id, { notes: e.target.value }), style: inputStyle })),
+      rc("div", { style: { display: "flex", justifyContent: "flex-end", gap: 8 } },
+        rc(IconBtn, { onClick: () => updatePolicy(p.id, { active: isPaused }) }, isPaused ? "Resume" : "Pause"),
+        rc("button", {
+          className: locked ? "btn-secondary" : "btn-primary",
+          disabled: !locked && !(p.insurer || "").trim(),
+          onClick: () => togglePolicyLock(p.id),
+          style: { padding: "5px 10px", fontSize: 12 }
+        }, locked ? "Edit" : "Save"),
+        rc(IconBtn, { onClick: () => setConfirmRemovePolicyId(p.id) }, "Remove")));
   }))), tab === "recurring" && /*#__PURE__*/React.createElement(Section, {
     title: "Recurring payments",
     eyebrow: "Planning register",
@@ -5540,7 +5604,7 @@ function App() {
       color: "var(--ink-3)",
       marginBottom: 14
     }
-  }, "Recurring items post a real transaction to the ledger on their due date, and project into the Forecast until then. Give each one an account and category so it has somewhere to post \u2014 items missing either stay marked \u201cIncomplete\u201d and won\u2019t post. Use Pause to stop one temporarily without losing its setup. Insurance premiums are handled automatically from the Insurance tab."), contracts.filter(c => Number(c.monthlyAmount) > 0).length > 0 && /*#__PURE__*/React.createElement("div", {
+  }, "Recurring items post a real transaction to the ledger on their due date, and project into the Forecast until then. Give each one an account and category so it has somewhere to post \u2014 items missing either stay marked \u201cIncomplete\u201d and won\u2019t post. Use Pause to stop one temporarily without losing its setup. Insurance premiums post the same way, automatically, from the Insurance tab."), contracts.filter(c => Number(c.monthlyAmount) > 0).length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: 18
     }
@@ -5613,7 +5677,7 @@ function App() {
       fontSize: 11,
       color: "var(--ink-3)"
     }
-  }, "Synced from the Contracts tab \u2014 update amounts there and they'll flow into this register and the Forecast automatically.")), policies.filter(p => Number(p.annualPremium) > 0).length > 0 && /*#__PURE__*/React.createElement("div", {
+  }, "Synced from the Contracts tab \u2014 update amounts there and they'll flow into this register and the Forecast automatically.")), policies.filter(p => Number(p.amount) > 0 && !isPolicyLapsed(p)).length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: 18
     }
@@ -5634,7 +5698,7 @@ function App() {
       gap: 6,
       marginBottom: 8
     }
-  }, policies.filter(p => Number(p.annualPremium) > 0).map(p => /*#__PURE__*/React.createElement("div", {
+  }, policies.filter(p => Number(p.amount) > 0 && !isPolicyLapsed(p)).map(p => /*#__PURE__*/React.createElement("div", {
     key: p.id,
     style: {
       display: "flex",
@@ -5673,7 +5737,7 @@ function App() {
       fontWeight: 600,
       color: "var(--ink-1)"
     }
-  }, `${fmt(p.annualPremium)}/yr`), /*#__PURE__*/React.createElement("button", {
+  }, `${fmt(p.amount)} / ${p.interval} ${RECUR_UNIT_LABELS[p.unit]}`), /*#__PURE__*/React.createElement("button", {
     className: "btn-secondary",
     style: {
       padding: "4px 9px",
@@ -5686,7 +5750,7 @@ function App() {
       fontSize: 11,
       color: "var(--ink-3)"
     }
-  }, "Synced from the Insurance tab \u2014 update premiums there and they'll flow into this register and the Forecast automatically.")), /*#__PURE__*/React.createElement("div", {
+  }, "Synced from the Insurance tab \u2014 update premiums there and they'll post to the ledger and the Forecast automatically.")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
