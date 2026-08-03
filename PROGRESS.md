@@ -7,7 +7,7 @@ Context reference for QddFi (household finance tracker). Read before making chan
 QddFi: household finance tracker (budgeting, transaction ledger, CPF contribution tracking, income tax estimate, insurance/contract/loan tracking, dashboards) for a couple to log together.
 
 **Stack — single file, no build step:**
-- `index.html` (~6,860 lines): all markup, styles, app code.
+- `index.html` (~7,020 lines): all markup, styles, app code.
 - React 18 + ReactDOM via `<script>` CDN (unpkg, production builds), no JSX — `React.createElement(...)`, aliased `rc(...)`.
 - Recharts 2.12.0, SheetJS `xlsx`, also CDN `<script>`.
 - Firebase v8 "classic" SDK (not v9+ — avoids ES-module loading issues from plain `<script>` tag).
@@ -36,6 +36,8 @@ QddFi: household finance tracker (budgeting, transaction ledger, CPF contributio
 
 **Live balances (moved to Dashboard):** The account-balance breakdown + "Adjust" (reconcile) flow moved out of `TransactionsTab` into `App`'s dashboard render, as a "💰 Live balances · net $X" pill (`showLiveBalances` state) sitting above the Liquid cash KPI card. Expanding it shows the same grouped-by-account breakdown as before. `ReconcileDialog` is now driven from `App`-level state (`reconcileTarget`) rather than living inside `TransactionsTab`.
 
+**Recurring items post real transactions (posting engine, shipped):** `recurring` items now carry `{type (expense/income/transfer), amount, account, toAccount, category, subcat, who, notes, interval, unit (day/week/month/year), nextDueDate, active, lastPostedDate}` instead of the old `{direction, frequency, dueMonth}` forecast-only shape. Stored as `recurringRaw` + `const recurring = useMemo(() => reconcileRecurring(recurringRaw), [recurringRaw])` — same raw/derived pattern as `categoriesRaw`/`categories`. `reconcileRecurring` (index.html, next to `FREQUENCIES`) migrates old-shape items and defaults `active: false` unless the item already has an account plus (category or toAccount) — nothing pre-existing started auto-posting the moment this shipped; it just sits "Incomplete" until reviewed. A `useEffect` in `App` (right after `reconcileAccount`) walks every active, complete item whose `nextDueDate <= today`, posts via `saveTxn` with a **deterministic id** (`` rec_<itemId>_<dueDate> ``) — two household members' browsers racing to post the same occurrence overwrite the same doc instead of duplicating — then advances `nextDueDate` with `addIntervalISO(cursor, interval, unit)`, looping to catch up on any missed occurrences. Self-limiting (no ref guard needed): once caught up, `nextDueDate` sits past today so the next pass is a no-op. The 12-month `forecast` useMemo precomputes a `recurByMonth` bucket by walking each active item's cadence forward from `nextDueDate` (replaced the old fixed calendar-month/frequency check), so the forecast and actual posting can never disagree. UI is `RecurringItemCard` (index.html, just before `TransactionsTab`) — same account/category/who fields as the daily ledger, plus "Every N day/week/month/year" and an editable next-due-date, with a status pill (Paused / Incomplete / Next: date).
+
 ## 3. Known bugs — confirmed, not yet fixed
 
 Fix order: #2 first (clearer scope), then #1 (needs user input first), then get end-to-end verification on the live authenticated site (sign-in, real transactions, confirm CPF/tax numbers).
@@ -50,22 +52,33 @@ Fix order: #2 first (clearer scope), then #1 (needs user input first), then get 
 
 ## 5. Testing approach (no build step, no test runner)
 
-No dev server, bundler, or test suite — static file only.
+No dev server, bundler, or test suite — static file only. No Node/Deno/Bun on this Mac either (checked).
 
-1. **Bracket-balance check before opening a browser**, after any large text removal/replacement. Python script scans the last `<script>` block, treats `"`/`'`/`` ` ``-delimited spans as opaque, sums `( { [` vs `) } ]`. Compare against same scan on last known-good commit (`git show <sha>:index.html`) — should roughly match, but this scanner has known false positives (regex literals get misread as string delimiters) and the mismatch count can shift with unrelated edits even when the code is valid. Treat it as a coarse smoke test, not proof — the `debug.html` run in step 2 (checking `read_console_messages` for real parse/runtime errors, not just permission-denied noise) is the actual authority on whether the file is syntactically sound.
-2. **Temporary `debug.html` inside the project folder** (`cp index.html debug.html`), skip auth by changing the final render line from `ReactDOM.createRoot(...).render(React.createElement(LoginGate, null, React.createElement(App, null)))` to `ReactDOM.createRoot(...).render(React.createElement(App, null))` (Firebase Auth requires http/https, won't work over `file://`).
+1. **Real syntax check via macOS's built-in JavaScriptCore** — authoritative (a real JS parser), not a heuristic. Run after any structural edit (adding/removing/replacing nested `React.createElement(...)`/`rc(...)` blocks), before even opening a browser:
+   ```bash
+   osascript -l JavaScript -e '
+   ObjC.import("Foundation");
+   function run(argv) {
+     const nsstr = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null);
+     const script = nsstr.js.split("<script>").pop().split("</script>")[0];
+     try { new Function(script); return "OK"; } catch (e) { return "ERROR: " + e.toString(); }
+   }' /Users/ethan/Documents/QddFi/index.html
+   ```
+   This only tells you *whether* it parses, not *where* the bug is — bisecting by truncating to N lines doesn't reliably localize it either, since a truncation inside still-valid nested structure always reports the same benign "Unexpected end of script" regardless of whether a real bug exists later in the file. What actually works: take the exact text you replaced (`git show <sha>:index.html`) and your new text, and compare their net open/close counts per bracket type (string-literal-aware, e.g. a small Python scanner) — for a like-for-like replacement they must match exactly, since everything outside the edited region is unchanged. This is exactly how a real bug got found in the recurring-tab session: one extra `)` in a JSX replacement, invisible to eye review, that only surfaced as a confusing "Unexpected token ')'" at the very end of the file.
+2. **Bracket-balance heuristic (quick, noisy, use only as a first pass)**: Python script scans the last `<script>` block, treats `"`/`'`/`` ` ``-delimited spans as opaque, sums `( { [` vs `) } ]`. Compare against the same scan on the last known-good commit — should roughly match, but this scanner has known false positives (regex literals get misread as string delimiters) and the mismatch count can shift with unrelated edits even when the code is valid. Don't trust it alone — step 1 above is the real authority.
+3. **Temporary `debug.html` inside the project folder** (`cp index.html debug.html`), skip auth by changing the final render line from `ReactDOM.createRoot(...).render(React.createElement(LoginGate, null, React.createElement(App, null)))` to `ReactDOM.createRoot(...).render(React.createElement(App, null))` (Firebase Auth requires http/https, won't work over `file://`).
    - Files opened via `file://` **outside** the project folder render as inert static snapshots in the Claude Browser tool — copy must be inside the project dir for a scriptable page.
    - `localStorage.setItem("householdName", "<fresh-name>")` to skip the household chooser — always use a name not used earlier in the same browser session (`localStorage` persists across `navigate()`; `localStorage.clear()` doesn't reliably force a fresh React mount — use a new value or new tab).
-   - Unauthenticated Firestore calls fail with `permission-denied`, which the app handles gracefully (local/seed fallback + banner) — fine for UI/logic testing, can't verify real authenticated read/write.
+   - Unauthenticated Firestore calls fail with `permission-denied`, which the app handles gracefully (local/seed fallback + banner) — fine for UI/logic testing, can't verify real authenticated read/write. This also means a recurring item's auto-post `saveTxn` call will visibly fail in this mode ("Could not save that entry to shared storage") — that failure is expected offline and isn't itself a bug; it still proves the posting logic ran.
    - **Always `rm -f debug.html` before finishing** — never commit it.
    - `navigate()`/`screenshot()` on `file://` pages can be flaky (stale tab state, wrong origin). Prefer querying the live DOM directly (`document.getElementById('root').innerText`, `localStorage.getItem(...)`, `[...document.querySelectorAll('button')].find(...).click()`) over trusting a screenshot. Rapid synchronous `.click()` calls in the same tick don't reliably simulate distinct user actions with React re-renders between them — insert `setTimeout` (~50ms) between dependent simulated clicks.
-3. **Real production debugging**: app's `window.onerror` shows only generic "Script error." for cross-origin CDN script exceptions (Firebase, React, etc.). Use Safari Web Inspector → JavaScript Console (Settings → Advanced → enable "Show features for web developers" → Develop → Show JavaScript Console) for the real file/line/message.
+4. **Real production debugging**: app's `window.onerror` shows only generic "Script error." for cross-origin CDN script exceptions (Firebase, React, etc.). Use Safari Web Inspector → JavaScript Console (Settings → Advanced → enable "Show features for web developers" → Develop → Show JavaScript Console) for the real file/line/message.
 
 ## 6. Fragile / easy to break
 
 - **Never run `git config` yourself.** If git identity is missing, ask the user to run it themselves **from inside the project directory** (`cd /Users/ethan/Documents/QddFi` first) — running from home directory fails semi-silently (`fatal: not in a git directory`).
 - **`git push` doesn't work from the Bash-tool environment** — no credential helper available, even on the same Mac where GitHub Desktop works. Route pushes through GitHub Desktop, verify after via `git fetch origin main && git log --oneline -3 origin/main` compared against local `HEAD` — don't trust a verbal "done."
-- **Single ~6,860-line file, zero build step, zero linting.** Syntax errors only surface at runtime, often just as "Script error." (see §5.3). Large text-block removals are highest risk — always run the bracket-balance check (§5.1) immediately after.
+- **Single ~7,020-line file, zero build step, zero linting.** Syntax errors only surface at runtime, often just as "Script error." (see §5.4). Large text-block removals/replacements are highest risk — always run the real syntax check (§5.1) immediately after.
 - **GitHub Pages caching** — after a confirmed push, the live page can still serve stale content briefly. Check the commit landed before debugging application logic for a reported "I don't see the change."
 - **No migration layer exists for pre-rename Firestore data.** Don't build one without checking with the user first — abandoning old-schema data was deliberate.
 - **Firebase config, API keys, `ALLOWED_EMAILS` are intentionally hardcoded**, not a bug. Don't harden/env-var-ize without being asked — fine for current personal-trial phase.
