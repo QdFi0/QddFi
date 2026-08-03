@@ -158,36 +158,6 @@ const sumByOwner = (balancesObj, accountDefs) => {
 const catTotal = v => (v && typeof v === "object") ? sum(v) : (Number(v) || 0);
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const daysUntil = iso => Math.ceil((new Date(iso) - new Date(todayISO())) / 86400000);
-// Projects a stored renewal/anchor date forward by its cadence until it lands
-// on the next upcoming occurrence, so a lapsed date still shows a useful
-// "days until next payment" countdown instead of just "renewed X days ago".
-// Built entirely in UTC (matching todayISO's UTC-based day string) and always
-// rebuilt from the original year/month rather than repeatedly mutating a
-// running date, so month-end anchors (e.g. the 31st) clamp to the last valid
-// day of a shorter month instead of silently rolling into the next one.
-const nextOccurrence = (iso, frequency) => {
-  const stepMonths = frequency === "Monthly" ? 1 : frequency === "Quarterly" ? 3 : frequency === "Semi-Annual" ? 6 : 12;
-  const base = new Date(iso);
-  if (isNaN(base.getTime())) return iso;
-  const today = new Date(todayISO());
-  const originalDay = base.getUTCDate();
-  const startYear = base.getUTCFullYear();
-  const startMonth = base.getUTCMonth();
-  const build = monthsElapsed => {
-    const targetMonthIndex = startMonth + monthsElapsed;
-    const daysInTargetMonth = new Date(Date.UTC(startYear, targetMonthIndex + 1, 0)).getUTCDate();
-    return new Date(Date.UTC(startYear, targetMonthIndex, Math.min(originalDay, daysInTargetMonth)));
-  };
-  let steps = 0;
-  let d = build(0);
-  let guard = 0;
-  while (d < today && guard < 2000) {
-    steps += stepMonths;
-    d = build(steps);
-    guard++;
-  }
-  return d.toISOString().slice(0, 10);
-};
 const DASH = "—";
 const MONTH_ORDER = (() => {
   const a = [];
@@ -804,7 +774,6 @@ const blankHouseholdDoc = () => ({
   ledgerStart: monthStartISO(isoToMonthLabel(todayISO())),
   assumptions: DEFAULT_ASSUMPTIONS,
   budgets: {},
-  contracts: [],
   policies: [],
   recurring: [],
   familyMembers: ["Person 1", "Person 2"],
@@ -817,8 +786,6 @@ const blankHouseholdDoc = () => ({
   dismissedHints: {}
 });
 const INSURANCE_TYPES = ["Death/TPD", "CI/ECI", "Personal Accident", "Hospitalisation", "Endowment"];
-const FREQUENCIES = ["Monthly", "Quarterly", "Semi-Annual", "Annual"];
-const PAYMENT_METHODS = ["GIRO", "Credit card", "PayNow", "Cheque", "Other"];
 const RECUR_UNITS = ["day", "week", "month", "year"];
 const RECUR_UNIT_LABELS = { day: "day(s)", week: "week(s)", month: "month(s)", year: "year(s)" };
 // Old paymentFrequency/frequency enums (recurring's old {direction, frequency, dueMonth}
@@ -860,6 +827,7 @@ const reconcileRecurring = list => (list || []).map(r => {
     interval,
     unit,
     nextDueDate: r.nextDueDate || todayISO(),
+    lapseDate: r.lapseDate || "",
     active: typeof r.active === "boolean" ? r.active : canPost,
     lastPostedDate: r.lastPostedDate || null
   };
@@ -1502,70 +1470,6 @@ function SelectField({
 // category list (with subcategories nested under an <optgroup>, which
 // browsers render indented and bold-labelled automatically) instead of a
 // flat, disconnected list of strings.
-function CategorySelectField({
-  label,
-  value,
-  onChange,
-  categories,
-  hint,
-  hintOnFocus,
-  disabled
-}) {
-  const [focused, setFocused] = useState(false);
-  const showHint = hint && (hintOnFocus ? focused : true);
-  const cats = (categories || []).filter(c => !c.archived).slice().sort((a, b) => a.label.localeCompare(b.label));
-  const known = new Set();
-  cats.forEach(c => {
-    known.add(c.label);
-    (c.subcats || []).forEach(s => known.add(`${c.label} \u2014 ${s.label}`));
-  });
-  const isKnownOrEmpty = !value || known.has(value);
-  return /*#__PURE__*/React.createElement("label", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 4,
-      fontFamily: "var(--sans)",
-      fontSize: 12.5,
-      color: "var(--ink-2)"
-    }
-  }, label, /*#__PURE__*/React.createElement("select", {
-    value: value,
-    disabled: disabled,
-    onFocus: () => setFocused(true),
-    onBlur: () => setFocused(false),
-    onChange: e => onChange(e.target.value),
-    style: {
-      padding: "7px 9px",
-      background: disabled ? "var(--paper)" : "#fff",
-      color: disabled ? "var(--ink-3)" : "var(--ink-1)"
-    }
-  }, !isKnownOrEmpty && /*#__PURE__*/React.createElement("option", {
-    value: value
-  }, value), cats.map(c => {
-    const subs = (c.subcats || []).slice().sort((a, b) => a.label.localeCompare(b.label));
-    if (subs.length === 0) {
-      return /*#__PURE__*/React.createElement("option", {
-        key: c.key,
-        value: c.label
-      }, c.icon ? `${c.icon} ${c.label}` : c.label);
-    }
-    return /*#__PURE__*/React.createElement("optgroup", {
-      key: c.key,
-      label: c.icon ? `${c.icon} ${c.label}` : c.label
-    }, /*#__PURE__*/React.createElement("option", {
-      value: c.label
-    }, `${c.label} (general)`), subs.map(s => /*#__PURE__*/React.createElement("option", {
-      key: s.key,
-      value: `${c.label} \u2014 ${s.label}`
-    }, s.label)));
-  })), showHint && /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 11,
-      color: "var(--ink-3)"
-    }
-  }, hint));
-}
 function CheckField({
   label,
   checked,
@@ -2556,16 +2460,27 @@ function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate
   const isTransfer = item.type === "transfer";
   const catList = item.type === "income" ? categories.income : categories.expense;
   const canPost = !!item.account && (isTransfer ? !!item.toAccount : !!item.category) && Number(item.amount) > 0;
+  const lapsed = !!item.lapseDate && item.lapseDate < todayISO();
   const isPaused = item.active === false;
-  const overdue = !isPaused && canPost && item.nextDueDate <= todayISO();
+  const overdue = !isPaused && !lapsed && canPost && item.nextDueDate <= todayISO();
 
-  const status = isPaused
+  const status = lapsed
+    ? { label: "Ended", bg: "#F3F2EE", color: "var(--ink-3)" }
+    : isPaused
     ? { label: "Paused", bg: "#F3F2EE", color: "var(--ink-3)" }
     : !canPost
     ? { label: "Incomplete — won't auto-post", bg: "#FBF3E6", color: "var(--amber)" }
     : overdue
     ? { label: "Posting on next visit", bg: "#FBEAF0", color: "var(--warn)" }
     : { label: `Next: ${isoToDayLabel(item.nextDueDate)}`, bg: "#E8F3EE", color: "var(--accent)" };
+  // Same "get flagged before it lapses" nudge Contracts used to give (daysUntil, ≤30/≤60
+  // color thresholds), reused here now that any Recurring item can carry an end date.
+  const endFlag = (() => {
+    if (!item.lapseDate || lapsed) return null;
+    const days = daysUntil(item.lapseDate);
+    const color = days <= 30 ? "var(--warn)" : days <= 60 ? "var(--amber)" : "var(--ink-3)";
+    return { text: days === 0 ? "Ends today" : `Ends in ${days} day${days === 1 ? "" : "s"}`, color };
+  })();
 
   const chip = (label, active, onClick, key) => rc("button", {
     key: key || label, onClick, className: active ? "btn-primary" : "btn-secondary",
@@ -2631,8 +2546,11 @@ function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate
             value: item.unit, onChange: e => set({ unit: e.target.value }), style: inputStyle
           }, RECUR_UNITS.map(u => rc("option", { key: u, value: u }, RECUR_UNIT_LABELS[u]))))),
       rc("div", null, rc(LedgerLabel, null, "Next due date"),
-        rc("input", { type: "date", value: item.nextDueDate, onChange: e => set({ nextDueDate: e.target.value }), style: inputStyle }))
+        rc("input", { type: "date", value: item.nextDueDate, onChange: e => set({ nextDueDate: e.target.value }), style: inputStyle })),
+      rc("div", null, rc(LedgerLabel, null, "End date"),
+        rc("input", { type: "date", value: item.lapseDate || "", placeholder: "optional", onChange: e => set({ lapseDate: e.target.value }), style: inputStyle }))
     ),
+    endFlag && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 11.5, fontWeight: 600, color: endFlag.color, marginTop: -4, marginBottom: 10 } }, endFlag.text),
 
     rc("div", null,
       rc(LedgerLabel, null, "Notes"),
@@ -3211,7 +3129,7 @@ function HouseholdChooser({ onChoose }) {
 }
 
 const PRIMARY_TABS = [["dashboard", "Dashboard"], ["daily", "Daily ledger"]];
-const OTHER_TABS = [["budgets", "Budgets"], ["contracts", "Contracts"], ["insurance", "Insurance"], ["recurring", "Recurring"], ["loans", "Loans"], ["cpf", "CPF"], ["tax", "Tax"], ["forecast", "Forecast"], ["history", "History"], ["settings", "Settings"]];
+const OTHER_TABS = [["budgets", "Budgets"], ["insurance", "Insurance"], ["recurring", "Recurring"], ["loans", "Loans"], ["cpf", "CPF"], ["tax", "Tax"], ["forecast", "Forecast"], ["history", "History"], ["settings", "Settings"]];
 
 function App() {
   const [householdName, setHouseholdName] = useState(() => localStorage.getItem("householdName") || "");
@@ -3265,7 +3183,6 @@ function App() {
   const [ledgerStart, setLedgerStart] = useState(null);
   const [assumptions, setAssumptions] = useState(DEFAULT_ASSUMPTIONS);
   const [budgets, setBudgets] = useState({});
-  const [contracts, setContracts] = useState([]);
   const [policiesRaw, setPolicies] = useState([]);
   const policies = useMemo(() => reconcilePolicies(policiesRaw), [policiesRaw]);
   // A lapsed policy provides zero actual coverage, so it's excluded from the family
@@ -3318,7 +3235,6 @@ function App() {
   const [newAccountLabel, setNewAccountLabel] = useState({});
   const [settingsView, setSettingsView] = useState("menu");
   const [dismissedHints, setDismissedHints] = useState({});
-  const [confirmRemoveContractId, setConfirmRemoveContractId] = useState(null);
   const [confirmRemovePolicyId, setConfirmRemovePolicyId] = useState(null);
   const [txns, setTxns] = useState([]);
   const [openingBalances, setOpeningBalances] = useState({});
@@ -3339,9 +3255,46 @@ function App() {
             ...(p.assumptions || {})
           });
           setBudgets(p.budgets || {});
-          setContracts(p.contracts || []);
           setPolicies(p.policies || []);
-          setRecurring(p.recurring || []);
+          // One-time, idempotent fold of the old Contracts register into Recurring — matched
+          // by a deterministic `contract_<id>` id, checked against the just-loaded `p.recurring`
+          // (not React state, which hasn't settled into this render yet) so this is a no-op
+          // once already merged. Same safety rule as every other reconcile/migration in this
+          // app: starts `active:false` with a blank `account`, so nothing auto-posts until the
+          // household reviews it and picks a real account.
+          const existingRecurring = p.recurring || [];
+          const existingRecurringIds = new Set(existingRecurring.map(r => r.id));
+          const migratedFromContracts = (p.contracts || [])
+            .filter(c => !existingRecurringIds.has(`contract_${c.id}`))
+            .map(c => ({
+              id: `contract_${c.id}`,
+              name: c.name || "",
+              type: "expense",
+              amount: Number(c.monthlyAmount) || 0,
+              account: "",
+              category: c.category || "",
+              subcat: "",
+              who: "Joint",
+              interval: 1,
+              unit: "month",
+              nextDueDate: todayISO(),
+              lapseDate: "",
+              active: false,
+              lastPostedDate: null,
+              notes: [
+                c.provider && `Provider: ${c.provider}`,
+                c.contractNumber && `Contract #${c.contractNumber}`,
+                c.renewalDate && `Renews ${c.renewalFrequency || "Annual"} from ${c.renewalDate}`,
+                c.notes
+              ].filter(Boolean).join(" · ")
+            }));
+          const mergedRecurring = migratedFromContracts.length
+            ? [...existingRecurring, ...migratedFromContracts]
+            : existingRecurring;
+          setRecurring(mergedRecurring);
+          if (migratedFromContracts.length) {
+            LEDGER_DOC.set({ ...p, recurring: mergedRecurring, contracts: [] }).catch(err => console.error(err));
+          }
           setFamilyMembers(p.familyMembers || ["Person 1", "Person 2"]);
           if (p.categories) setCategories(reconcileCategories(p.categories));
           if (p.accounts) {
@@ -3393,7 +3346,6 @@ function App() {
       ledgerStart: patch.ledgerStart ?? ledgerStart,
       assumptions: patch.assumptions ?? assumptions,
       budgets: patch.budgets ?? budgets,
-      contracts: patch.contracts ?? contracts,
       policies: patch.policies ?? policies,
       recurring: patch.recurring ?? recurring,
       familyMembers: patch.familyMembers ?? familyMembers,
@@ -3410,7 +3362,6 @@ function App() {
     if (patch.ledgerStart) setLedgerStart(patch.ledgerStart);
     if (patch.assumptions) setAssumptions(patch.assumptions);
     if (patch.budgets) setBudgets(patch.budgets);
-    if (patch.contracts) setContracts(patch.contracts);
     if (patch.policies) setPolicies(patch.policies);
     if (patch.recurring) setRecurring(patch.recurring);
     if (patch.familyMembers) setFamilyMembers(patch.familyMembers);
@@ -3532,7 +3483,8 @@ function App() {
       if (item.active === false) return item;
       if (!item.account) return item;
       if (item.type === "transfer" ? !item.toAccount : !item.category) return item;
-      const next = postDueCadence(item, today, saveTxn, (it, cursor) => ({
+      const cappedToday = item.lapseDate && item.lapseDate < today ? item.lapseDate : today;
+      const next = postDueCadence(item, cappedToday, saveTxn, (it, cursor) => ({
         id: `rec_${it.id}_${cursor}`,
         date: cursor,
         type: it.type,
@@ -3605,43 +3557,6 @@ function App() {
     setTimeout(() => setSaveMsg(""), 3000);
   };
 
-  const addContract = () => setContracts([...contracts, {
-    id: uid(),
-    name: "",
-    provider: "",
-    contractNumber: "",
-    category: (categories.expense.find(c => !c.archived) || {}).label || "",
-    monthlyAmount: "",
-    renewalDate: todayISO(),
-    renewalFrequency: "Annual",
-    notes: "",
-    locked: false,
-    createdAt: new Date().toISOString()
-  }]);
-  const updateContract = (id, patch) => {
-    const next = contracts.map(c => c.id === id ? {
-      ...c,
-      ...patch
-    } : c);
-    setContracts(next);
-    persistAll({
-      contracts: next
-    });
-  };
-  const toggleContractLock = id => {
-    const target = contracts.find(c => c.id === id);
-    if (!target) return;
-    updateContract(id, {
-      locked: !target.locked
-    });
-  };
-  const removeContract = id => {
-    const next = contracts.filter(c => c.id !== id);
-    setContracts(next);
-    persistAll({
-      contracts: next
-    });
-  };
   // Minimal seed — reconcilePolicies fills in every other field's default (including
   // active: false, since a blank policy has no account/category yet and so can't post).
   const addPolicy = () => setPolicies([...policies, {
@@ -4108,6 +4023,7 @@ function App() {
       if (!amt) return;
       let cursor = item.nextDueDate || todayISO();
       for (let guard = 0; guard < 60; guard++) {
+        if (item.lapseDate && cursor > item.lapseDate) break;
         const monthKey = monthSortKey(isoToMonthLabel(cursor));
         if (monthKey > startKey + 11) break;
         if (monthKey >= startKey) {
@@ -4141,12 +4057,6 @@ function App() {
       const recurBucket = recurByMonth[startKey + i] || { income: 0, expense: 0 };
       let recurExpense = recurBucket.expense + (policyByMonth[startKey + i] || 0) + (loanByMonth[startKey + i] || 0),
         recurIncome = recurBucket.income;
-      contracts.forEach(c => {
-        // Monthly amount is billed every month regardless of renewal
-        // cadence, so it always counts as a planned monthly expense.
-        const amt = Number(c.monthlyAmount) || 0;
-        if (amt) recurExpense += amt;
-      });
       const income = avgIncome + recurIncome;
       const expenses = avgExpense + recurExpense;
       const net = income - expenses;
@@ -4161,7 +4071,7 @@ function App() {
       });
     }
     return rows;
-  }, [records, assumptions, recurring, policies, contracts, derivedByMonth, housingLoan, carLoan, housingAmort, carAmort]);
+  }, [records, assumptions, recurring, policies, derivedByMonth, housingLoan, carLoan, housingAmort, carAmort]);
   if (!householdName) return /*#__PURE__*/React.createElement(HouseholdChooser, { onChoose: chooseHousehold });
   if (loading || !records) return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -5330,196 +5240,7 @@ function App() {
         }
       }, `3-mo avg ${fmt(s.avg3)}/mo for reference`));
     })));
-  })(), tab === "contracts" && /*#__PURE__*/React.createElement(Section, {
-    title: "Contract tracker",
-    eyebrow: "Contracts",
-    right: /*#__PURE__*/React.createElement("button", {
-      className: "btn-primary",
-      onClick: addContract
-    }, "Add contract")
-  }, contracts.length === 0 && /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 13,
-      color: "var(--ink-3)"
-    }
-  }, "No contracts yet. Add telco, broadband, or insurance renewal dates to get flagged before they lapse."), contracts.length > 0 && /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 12.5,
-      color: "var(--ink-3)",
-      marginBottom: 14
-    }
-  }, "Monthly amounts here flow automatically into Recurring and the Forecast \u2014 no need to add them again. Tap Save to lock a contract in place; use Edit to change it later."), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 10
-    }
-  }, [...contracts].sort((a, b) => daysUntil(nextOccurrence(a.renewalDate, a.renewalFrequency || "Annual")) - daysUntil(nextOccurrence(b.renewalDate, b.renewalFrequency || "Annual"))).map(c => {
-    const frequency = c.renewalFrequency || "Annual";
-    const nextDate = nextOccurrence(c.renewalDate, frequency);
-    const days = daysUntil(nextDate);
-    const flag = days <= 30 ? "var(--warn)" : days <= 60 ? "var(--amber)" : "var(--accent)";
-    const niceDate = new Date(nextDate).toLocaleDateString("en-SG", {
-      day: "numeric",
-      month: "short",
-      year: "numeric"
-    });
-    const locked = !!c.locked;
-    const addedNice = c.createdAt ? new Date(c.createdAt).toLocaleDateString("en-SG", {
-      day: "numeric",
-      month: "short",
-      year: "numeric"
-    }) : null;
-    return /*#__PURE__*/React.createElement(Card, {
-      key: c.id
-    }, /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        marginBottom: 8,
-        gap: 8,
-        flexWrap: "wrap"
-      }
-    }, /*#__PURE__*/React.createElement("span", {
-      style: {
-        fontFamily: "var(--sans)",
-        fontSize: 11,
-        color: "var(--ink-3)"
-      }
-    }, addedNice ? `Added ${addedNice}` : ""), /*#__PURE__*/React.createElement("span", {
-      style: {
-        fontFamily: "var(--sans)",
-        fontSize: 10.5,
-        fontWeight: 700,
-        letterSpacing: "0.05em",
-        textTransform: "uppercase",
-        padding: "3px 8px",
-        borderRadius: 999,
-        background: locked ? "#E7F0EC" : "#FBF3E4",
-        color: locked ? "var(--accent)" : "var(--amber)"
-      }
-    }, locked ? "Saved" : "Draft \u2014 not yet saved")), /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "grid",
-        gridTemplateColumns: "repeat(3, minmax(0,1fr))",
-        gap: 10,
-        marginBottom: 10
-      }
-    }, /*#__PURE__*/React.createElement(TextField, {
-      label: "Name",
-      value: c.name,
-      disabled: locked,
-      hint: "What you'll call this contract, e.g. \u201CHome broadband\u201D or \u201CCar insurance\u201D.",
-      hintOnFocus: true,
-      onChange: v => updateContract(c.id, {
-        name: v
-      })
-    }), /*#__PURE__*/React.createElement(TextField, {
-      label: "Provider",
-      value: c.provider,
-      disabled: locked,
-      hint: "Who the contract is with, e.g. Singtel, StarHub, AIA.",
-      hintOnFocus: true,
-      onChange: v => updateContract(c.id, {
-        provider: v
-      })
-    }), /*#__PURE__*/React.createElement(TextField, {
-      label: "Contract number",
-      value: c.contractNumber || "",
-      disabled: locked,
-      hint: "Your account or contract reference number, if you have one.",
-      hintOnFocus: true,
-      onChange: v => updateContract(c.id, {
-        contractNumber: v
-      })
-    }), /*#__PURE__*/React.createElement(CategorySelectField, {
-      label: "Category",
-      value: c.category,
-      disabled: locked,
-      hint: "Pulled from your expense categories in Settings, so contracts line up with the rest of your budget.",
-      hintOnFocus: true,
-      onChange: v => updateContract(c.id, {
-        category: v
-      }),
-      categories: categories.expense
-    }), /*#__PURE__*/React.createElement(NumberField, {
-      label: "Monthly amount",
-      value: c.monthlyAmount,
-      disabled: locked,
-      hint: "What you're billed each month. Feeds into Recurring and the Forecast automatically.",
-      hintOnFocus: true,
-      onChange: v => updateContract(c.id, {
-        monthlyAmount: v
-      })
-    }), /*#__PURE__*/React.createElement(DateField, {
-      label: "Renewal date",
-      value: c.renewalDate,
-      disabled: locked,
-      hint: "The last known renewal or contract start date.",
-      hintOnFocus: true,
-      onChange: v => updateContract(c.id, {
-        renewalDate: v
-      })
-    }), /*#__PURE__*/React.createElement(SelectField, {
-      label: "Renewal frequency",
-      value: frequency,
-      disabled: locked,
-      hint: "How often this contract renews \u2014 used to track when the next payment is due.",
-      hintOnFocus: true,
-      onChange: v => updateContract(c.id, {
-        renewalFrequency: v
-      }),
-      options: FREQUENCIES
-    }), /*#__PURE__*/React.createElement(TextField, {
-      label: "Notes",
-      value: c.notes,
-      disabled: locked,
-      hint: "Anything else worth remembering, e.g. contract terms or a cancellation deadline.",
-      hintOnFocus: true,
-      onChange: v => updateContract(c.id, {
-        notes: v
-      })
-    })), /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        flexWrap: "wrap",
-        gap: 8
-      }
-    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-      style: {
-        fontFamily: "var(--sans)",
-        fontSize: 12.5,
-        fontWeight: 600,
-        color: flag
-      }
-    }, days === 0 ? "Due today" : `${days} days to next payment`), /*#__PURE__*/React.createElement("div", {
-      style: {
-        fontFamily: "var(--sans)",
-        fontSize: 11,
-        color: "var(--ink-3)"
-      }
-    }, `Next payment due ${niceDate}`)), /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        gap: 8
-      }
-    }, /*#__PURE__*/React.createElement("button", {
-      className: locked ? "btn-secondary" : "btn-primary",
-      disabled: !locked && !(c.name || "").trim(),
-      onClick: () => toggleContractLock(c.id),
-      style: {
-        padding: "5px 10px",
-        fontSize: 12
-      }
-    }, locked ? "Edit" : "Save"), /*#__PURE__*/React.createElement(IconBtn, {
-      onClick: () => setConfirmRemoveContractId(c.id)
-    }, "Remove"))));
-  }))), tab === "insurance" && /*#__PURE__*/React.createElement(Section, {
+  })(), tab === "insurance" && /*#__PURE__*/React.createElement(Section, {
     title: "Family coverage",
     eyebrow: "Insurance",
     right: /*#__PURE__*/React.createElement("button", {
@@ -5761,80 +5482,7 @@ function App() {
       color: "var(--ink-3)",
       marginBottom: 14
     }
-  }, "Recurring items post a real transaction to the ledger on their due date, and project into the Forecast until then. Give each one an account and category so it has somewhere to post \u2014 items missing either stay marked \u201cIncomplete\u201d and won\u2019t post. Use Pause to stop one temporarily without losing its setup. Insurance premiums post the same way, automatically, from the Insurance tab."), contracts.filter(c => Number(c.monthlyAmount) > 0).length > 0 && /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginBottom: 18
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 11,
-      letterSpacing: "0.06em",
-      textTransform: "uppercase",
-      color: "var(--ink-3)",
-      fontWeight: 600,
-      marginBottom: 8
-    }
-  }, "From contracts \u2014 tracked automatically"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 6,
-      marginBottom: 8
-    }
-  }, contracts.filter(c => Number(c.monthlyAmount) > 0).map(c => /*#__PURE__*/React.createElement("div", {
-    key: c.id,
-    style: {
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center",
-      padding: "8px 12px",
-      background: "#FAF9F4",
-      border: "1px solid var(--hair)",
-      borderRadius: 8,
-      gap: 10,
-      flexWrap: "wrap"
-    }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 13,
-      fontWeight: 600,
-      color: "var(--ink-1)"
-    }
-  }, c.name || "Untitled contract"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 11,
-      color: "var(--ink-3)"
-    }
-  }, c.provider || c.category)), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      alignItems: "center",
-      gap: 10
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontFamily: "var(--mono)",
-      fontSize: 13,
-      fontWeight: 600,
-      color: "var(--ink-1)"
-    }
-  }, `${fmt(c.monthlyAmount)}/mo`), /*#__PURE__*/React.createElement("button", {
-    className: "btn-secondary",
-    style: {
-      padding: "4px 9px",
-      fontSize: 11
-    },
-    onClick: () => setTab("contracts")
-  }, "Edit in Contracts"))))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 11,
-      color: "var(--ink-3)"
-    }
-  }, "Synced from the Contracts tab \u2014 update amounts there and they'll flow into this register and the Forecast automatically.")), policies.filter(p => Number(p.amount) > 0 && !isPolicyLapsed(p)).length > 0 && /*#__PURE__*/React.createElement("div", {
+  }, "Recurring items post a real transaction to the ledger on their due date, and project into the Forecast until then. Give each one an account and category so it has somewhere to post \u2014 items missing either stay marked \u201cIncomplete\u201d and won\u2019t post. Use Pause to stop one temporarily without losing its setup \u2014 or give it an End date so it stops on its own, e.g. a fixed-term contract. Insurance premiums post the same way, automatically, from the Insurance tab."), policies.filter(p => Number(p.amount) > 0 && !isPolicyLapsed(p)).length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: 18
     }
@@ -7275,16 +6923,7 @@ function App() {
       color: "var(--ink-3)",
       textAlign: "center"
     }
-  }, "Data is stored in your shared Firestore project, not shared with anyone outside it."), confirmRemoveContractId && /*#__PURE__*/React.createElement(ConfirmDialog, {
-    title: "Remove this contract?",
-    message: "Recurring payments and the Forecast will stop tracking this expense. This can't be undone.",
-    confirmLabel: "Remove contract",
-    onCancel: () => setConfirmRemoveContractId(null),
-    onConfirm: () => {
-      removeContract(confirmRemoveContractId);
-      setConfirmRemoveContractId(null);
-    }
-  }), confirmRemovePolicyId && /*#__PURE__*/React.createElement(ConfirmDialog, {
+  }, "Data is stored in your shared Firestore project, not shared with anyone outside it."), confirmRemovePolicyId && /*#__PURE__*/React.createElement(ConfirmDialog, {
     title: "Remove this policy?",
     message: "Recurring payments and the Forecast will stop tracking this premium. This can't be undone.",
     confirmLabel: "Remove policy",
