@@ -781,6 +781,22 @@ const seedAccounts = () => ({
     owner: "Joint"
   }]
 });
+// Default shape for housingLoan/carLoan — used both for a fresh household and to backfill
+// fields onto a loan stored before the recurring-posting/loan-events work shipped, so an
+// existing loan missing `events`/`account`/`category` doesn't crash on load.
+const blankLoan = () => ({
+  principal: 0,
+  ratePct: 0,
+  tenureYears: 0,
+  startDate: "",
+  events: [],
+  trackAsRecurring: false,
+  account: "",
+  category: "",
+  subcat: "",
+  nextDueDate: "",
+  lastPostedDate: null
+});
 // The shape a household document starts from — used both when a brand-new
 // household name is first seen, and when resetting an existing one back to blank.
 const blankHouseholdDoc = () => ({
@@ -1058,45 +1074,78 @@ function computeTax(chargeableIncome) {
   return Math.round(tax * 100) / 100;
 }
 const earnedIncomeRelief = age => age >= 60 ? 8000 : age >= 55 ? 6000 : 1000;
-function amortize(principal, ratePct, tenureYears) {
-  const n = Math.round((tenureYears || 0) * 12);
-  // A blank/no-loan state (principal or tenure not yet set) has no schedule
-  // to amortize — return zeros instead of letting 0/0 or n=0 produce NaN/Infinity.
-  if (!principal || !n) {
-    return { payment: 0, n: 0, totalInterest: 0, totalRepayment: 0, yearly: [] };
-  }
+// Extracted from the old flat formula — used both for the initial segment and after every
+// rateChange event below, which recomputes payment from whatever balance/rate/remaining-term
+// applies from that point on.
+function loanPayment(principal, ratePct, months) {
+  if (!principal || !months) return 0;
   const r = ratePct / 100 / 12;
-  const payment = r === 0 ? principal / n : principal * r / (1 - Math.pow(1 + r, -n));
-  let balance = principal;
-  const yearly = [];
-  let yr = {
-    principal: 0,
-    interest: 0
-  };
-  let totalInterest = 0;
-  for (let m = 1; m <= n; m++) {
+  return r === 0 ? principal / months : principal * r / (1 - Math.pow(1 + r, -months));
+}
+// Walks a loan's full payment history as one chronological simulation instead of a fixed
+// formula, applying `events` (index.html, near addLoanEvent) in date order as it goes:
+// extraPayment knocks the balance down immediately and lets the same payment keep being
+// simulated forward, so the loan just pays off sooner (no separate "shorten tenure vs. lower
+// payment" toggle needed — nothing about the payment itself changes). rateChange recomputes
+// a fresh payment from the balance/rate/remaining-term as of that date — covers a refinance
+// and a bank repricing identically. `payment`/`payoffDate` reflect whichever segment is
+// current as of the end of the walk, so the posting engine always uses the right amount even
+// after a refinance changes it mid-schedule.
+function amortize(loan) {
+  const events = [...((loan || {}).events || [])]
+    .filter(e => e.kind === "extraPayment" || e.kind === "rateChange")
+    .sort((a, b) => a.date.localeCompare(b.date));
+  let balance = Number((loan || {}).principal) || 0;
+  const originalPrincipal = balance;
+  let ratePct = Number((loan || {}).ratePct) || 0;
+  let remainingMonths = Math.round((Number((loan || {}).tenureYears) || 0) * 12);
+  // A blank/no-loan state (principal or tenure not yet set) has no schedule to amortize —
+  // return zeros instead of letting 0/0 or n=0 produce NaN/Infinity.
+  if (!balance || !remainingMonths) {
+    return { payment: 0, n: 0, totalInterest: 0, totalRepayment: 0, yearly: [], monthly: [], payoffDate: null };
+  }
+  let payment = loanPayment(balance, ratePct, remainingMonths);
+  let cursor = loan.startDate || todayISO();
+  let eventIdx = 0, m = 0, totalInterest = 0;
+  const monthly = [], yearly = [];
+  let yr = { principal: 0, interest: 0 };
+  while (balance > 0.005 && m < 1200) { // 1200mo/100yr guard vs. a payment too small to ever amortize
+    while (eventIdx < events.length && events[eventIdx].date <= cursor) {
+      const ev = events[eventIdx++];
+      if (ev.kind === "extraPayment") {
+        balance = Math.max(0, balance - (Number(ev.amount) || 0));
+      } else {
+        if (ev.principal !== "" && ev.principal != null) balance = Number(ev.principal) || balance;
+        ratePct = Number(ev.ratePct) || ratePct;
+        remainingMonths = Math.round((Number(ev.tenureYears) || 0) * 12) || remainingMonths;
+        payment = loanPayment(balance, ratePct, remainingMonths);
+      }
+    }
+    if (balance <= 0.005) break;
+    m++;
+    const r = ratePct / 100 / 12;
     const interestPortion = balance * r;
-    let principalPortion = payment - interestPortion;
-    if (principalPortion > balance) principalPortion = balance;
+    const principalPortion = payment <= 0 ? balance : Math.min(payment - interestPortion, balance);
     balance = Math.max(balance - principalPortion, 0);
     totalInterest += interestPortion;
+    monthly.push({ month: m, date: cursor, principal: principalPortion, interest: interestPortion, balance, payment });
     yr.principal += principalPortion;
     yr.interest += interestPortion;
-    if (m % 12 === 0 || m === n) {
+    cursor = addIntervalISO(cursor, 1, "month");
+    if (m % 12 === 0 || balance <= 0.005) {
       yr.balance = balance;
       yearly.push(yr);
-      yr = {
-        principal: 0,
-        interest: 0
-      };
+      yr = { principal: 0, interest: 0 };
     }
   }
   return {
     payment,
-    n,
+    n: m,
     totalInterest,
-    totalRepayment: principal + totalInterest,
-    yearly
+    totalRepayment: originalPrincipal + totalInterest,
+    yearly,
+    monthly,
+    payoffDate: monthly.length ? monthly[monthly.length - 1].date : null
   };
 }
 
@@ -3226,18 +3275,8 @@ function App() {
   const [recurringRaw, setRecurring] = useState([]);
   const recurring = useMemo(() => reconcileRecurring(recurringRaw), [recurringRaw]);
   const [familyMembers, setFamilyMembers] = useState(["Person 1", "Person 2"]);
-  const [housingLoan, setHousingLoan] = useState({
-    principal: 0,
-    ratePct: 0,
-    tenureYears: 0,
-    startMonth: ""
-  });
-  const [carLoan, setCarLoan] = useState({
-    principal: 0,
-    ratePct: 0,
-    tenureYears: 0,
-    startMonth: ""
-  });
+  const [housingLoan, setHousingLoan] = useState(blankLoan());
+  const [carLoan, setCarLoan] = useState(blankLoan());
   const [cpfSettings, setCpfSettings] = useState(DEFAULT_CPF_SETTINGS);
   const [taxSettings, setTaxSettings] = useState({
     annualEmploymentIncome: 0,
@@ -3261,6 +3300,7 @@ function App() {
   const [ownerSplitOpen, setOwnerSplitOpen] = useState(null);
   const [saveMsg, setSaveMsg] = useState("");
   const [showMonthlySchedule, setShowMonthlySchedule] = useState(false);
+  const [showLoanEvents, setShowLoanEvents] = useState(false);
   const [syncError, setSyncError] = useState("");
   const [newBudgetCat, setNewBudgetCat] = useState("");
   const [newBudgetAmount, setNewBudgetAmount] = useState(0);
@@ -3318,8 +3358,8 @@ function App() {
           }
           if (p.openingBalances) setOpeningBalances(p.openingBalances);
           if (p.dismissedHints) setDismissedHints(p.dismissedHints);
-          if (p.housingLoan) setHousingLoan(p.housingLoan);
-          if (p.carLoan) setCarLoan(p.carLoan);
+          if (p.housingLoan) setHousingLoan({ ...blankLoan(), ...p.housingLoan });
+          if (p.carLoan) setCarLoan({ ...blankLoan(), ...p.carLoan });
           if (p.cpfSettings) setCpfSettings({ ...DEFAULT_CPF_SETTINGS, ...p.cpfSettings });
           if (p.taxSettings) setTaxSettings(p.taxSettings);
           // Once the ledger is live the newest month is the current one, which
@@ -3551,6 +3591,7 @@ function App() {
       persistAll({ policies: nextPolicies });
     }
   }, [householdName, policies]);
+
   const setOpeningFromLatest = () => {
     const list = sealedRecords || [];
     const last = list[list.length - 1];
@@ -3636,6 +3677,44 @@ function App() {
     persistAll({
       policies: next
     });
+  };
+  // Early repayment, refinancing, and bank repricing are all, mechanically, "the schedule's
+  // terms reset as of this date" — one events list on the loan covers all three (see
+  // amortize(), which walks them in date order). `kind: "extraPayment"` just knocks money off
+  // the balance; `kind: "rateChange"` covers refinance/repricing identically by recomputing
+  // the payment. Pre-filling ratePct/tenureYears from the loan's current values means leaving
+  // them untouched is a no-op change, not a jump to zero.
+  const loanDocKey = loanKey => loanKey === "housing" ? "housingLoan" : "carLoan";
+  const addLoanEvent = (loanKey, kind) => {
+    const loan = loanKey === "housing" ? housingLoan : carLoan;
+    const setLoan = loanKey === "housing" ? setHousingLoan : setCarLoan;
+    const next = {
+      ...loan,
+      events: [...(loan.events || []), {
+        id: uid(), date: todayISO(), kind,
+        amount: 0, ratePct: loan.ratePct, tenureYears: loan.tenureYears, principal: "",
+        notes: "", posted: false
+      }]
+    };
+    setLoan(next);
+    persistAll({ [loanDocKey(loanKey)]: next });
+  };
+  const updateLoanEvent = (loanKey, eventId, patch) => {
+    const loan = loanKey === "housing" ? housingLoan : carLoan;
+    const setLoan = loanKey === "housing" ? setHousingLoan : setCarLoan;
+    const next = {
+      ...loan,
+      events: (loan.events || []).map(e => e.id === eventId ? { ...e, ...patch } : e)
+    };
+    setLoan(next);
+    persistAll({ [loanDocKey(loanKey)]: next });
+  };
+  const removeLoanEvent = (loanKey, eventId) => {
+    const loan = loanKey === "housing" ? housingLoan : carLoan;
+    const setLoan = loanKey === "housing" ? setHousingLoan : setCarLoan;
+    const next = { ...loan, events: (loan.events || []).filter(e => e.id !== eventId) };
+    setLoan(next);
+    persistAll({ [loanDocKey(loanKey)]: next });
   };
   // Minimal seed — reconcileRecurring fills in every other field's default
   // (including active: false, since a blank item has no account/category yet
@@ -3927,11 +4006,77 @@ function App() {
       effectiveRate: taxSettings.annualEmploymentIncome ? netTax / taxSettings.annualEmploymentIncome : 0
     };
   }, [taxSettings, cpfSettings]);
-  const housingAmort = useMemo(() => amortize(housingLoan.principal, housingLoan.ratePct, housingLoan.tenureYears), [housingLoan]);
-  const carAmort = useMemo(() => amortize(carLoan.principal, carLoan.ratePct, carLoan.tenureYears), [carLoan]);
+  const housingAmort = useMemo(() => amortize(housingLoan), [housingLoan]);
+  const carAmort = useMemo(() => amortize(carLoan), [carLoan]);
   const activeLoan = loanSub === "housing" ? housingLoan : carLoan;
   const activeAmort = loanSub === "housing" ? housingAmort : carAmort;
   const activeLoanKey = loanSub === "housing" ? "housingLoan" : "carLoan";
+
+  // Loan repayments post as one flat expense (principal+interest together, no liability
+  // account entry — the amortisation table's own Balance column is what shows the
+  // outstanding-loan trajectory). Fixed monthly cadence, capped at amort.payoffDate so a
+  // fully repaid loan self-stops. Extra/lump-sum repayment events also post their own one-off
+  // transaction exactly once, guarded by event.posted the same way lastPostedDate guards the
+  // regular cadence.
+  useEffect(() => {
+    if (!householdName) return;
+    const today = todayISO();
+    [["housing", housingLoan, setHousingLoan, housingAmort],
+     ["car", carLoan, setCarLoan, carAmort]].forEach(([key, loan, setLoan, amort]) => {
+      if (!loan.trackAsRecurring || !loan.account || !loan.category) return;
+      let nextLoan = loan;
+      let changed = false;
+      if (amort.payment > 0) {
+        const cappedToday = amort.payoffDate && amort.payoffDate < today ? amort.payoffDate : today;
+        const asItem = { amount: amort.payment, nextDueDate: loan.nextDueDate || loan.startDate, interval: 1, unit: "month" };
+        const posted = postDueCadence(asItem, cappedToday, saveTxn, (it, cursor) => ({
+          id: `loan_${key}_${cursor}`,
+          date: cursor,
+          type: "expense",
+          amount: amort.payment,
+          account: loan.account,
+          toAccount: null,
+          category: loan.category,
+          subcat: loan.subcat || null,
+          payee: key === "housing" ? "Housing loan" : "Car loan",
+          note: "",
+          who: "Joint",
+          loanKey: key,
+          createdAt: new Date().toISOString()
+        }));
+        if (posted.nextDueDate !== asItem.nextDueDate) {
+          nextLoan = { ...nextLoan, nextDueDate: posted.nextDueDate, lastPostedDate: today };
+          changed = true;
+        }
+      }
+      const nextEvents = (nextLoan.events || []).map(ev => {
+        if (ev.kind !== "extraPayment" || ev.posted || ev.date > today) return ev;
+        saveTxn({
+          id: `loan_${key}_extra_${ev.id}`,
+          date: ev.date,
+          type: "expense",
+          amount: Number(ev.amount) || 0,
+          account: loan.account,
+          toAccount: null,
+          category: loan.category,
+          subcat: loan.subcat || null,
+          payee: (key === "housing" ? "Housing loan" : "Car loan") + " — extra repayment",
+          note: ev.notes || "",
+          who: "Joint",
+          loanKey: key,
+          createdAt: new Date().toISOString()
+        });
+        changed = true;
+        return { ...ev, posted: true };
+      });
+      if (changed) {
+        nextLoan = { ...nextLoan, events: nextEvents };
+        setLoan(nextLoan);
+        persistAll({ [key === "housing" ? "housingLoan" : "carLoan"]: nextLoan });
+      }
+    });
+  }, [householdName, housingLoan, carLoan, housingAmort, carAmort]);
+
   const forecast = useMemo(() => {
     if (!records || records.length === 0) return [];
     // The in-progress month is only partly logged, so averaging it in drags
@@ -3978,11 +4123,23 @@ function App() {
     // this can never disagree with the policy posting effect about which months a premium
     // lands in. Capped at lapseDate inside the helper, so a lapsed policy stops contributing.
     const policyByMonth = bucketDueAmounts(policies.filter(p => p.account && p.category), startKey);
+    // Same shared cadence-walk, applied to the two loans (each a single "item" rather than
+    // an array) — a loan not opted into recurring tracking, or one already past payoffDate,
+    // simply contributes nothing.
+    const loanByMonth = bucketDueAmounts(
+      [["housing", housingLoan, housingAmort], ["car", carLoan, carAmort]]
+        .filter(([, loan, amort]) => loan.trackAsRecurring && loan.account && loan.category && amort.payment > 0)
+        .map(([, loan, amort]) => ({
+          active: true, amount: amort.payment, nextDueDate: loan.nextDueDate || loan.startDate,
+          interval: 1, unit: "month", lapseDate: amort.payoffDate
+        })),
+      startKey
+    );
     const rows = [];
     for (let i = 0; i < 12; i++) {
       const monthName = monthLabelFromSortKey(startKey + i);
       const recurBucket = recurByMonth[startKey + i] || { income: 0, expense: 0 };
-      let recurExpense = recurBucket.expense + (policyByMonth[startKey + i] || 0),
+      let recurExpense = recurBucket.expense + (policyByMonth[startKey + i] || 0) + (loanByMonth[startKey + i] || 0),
         recurIncome = recurBucket.income;
       contracts.forEach(c => {
         // Monthly amount is billed every month regardless of renewal
@@ -4004,7 +4161,7 @@ function App() {
       });
     }
     return rows;
-  }, [records, assumptions, recurring, policies, contracts, derivedByMonth]);
+  }, [records, assumptions, recurring, policies, contracts, derivedByMonth, housingLoan, carLoan, housingAmort, carAmort]);
   if (!householdName) return /*#__PURE__*/React.createElement(HouseholdChooser, { onChoose: chooseHousehold });
   if (loading || !records) return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -5822,16 +5979,44 @@ function App() {
         tenureYears: v
       }
     })
-  }), /*#__PURE__*/React.createElement(TextField, {
-    label: "Start month",
-    value: activeLoan.startMonth,
+  }), /*#__PURE__*/React.createElement(DateField, {
+    label: "Start date",
+    value: activeLoan.startDate,
     onChange: v => persistAll({
       [activeLoanKey]: {
         ...activeLoan,
-        startMonth: v
+        startDate: v
       }
     })
-  }))), /*#__PURE__*/React.createElement("div", {
+  })), rc("div", { style: { marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--hair)" } },
+    rc(CheckField, {
+      label: "Track as a recurring expense",
+      checked: !!activeLoan.trackAsRecurring,
+      onChange: v => persistAll({
+        [activeLoanKey]: {
+          ...activeLoan,
+          trackAsRecurring: v,
+          category: activeLoan.category || (loanSub === "housing" ? "housingUtilities" : "vehicle")
+        }
+      })
+    }),
+    activeLoan.trackAsRecurring && rc("div", { style: { marginTop: 10 } },
+      rc("div", { style: { display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 8 } },
+        rc("div", { style: { flex: "1 1 220px" } },
+          rc(LedgerLabel, null, "Account (debited from)"),
+          rc(AccountSelect, { registry, value: activeLoan.account, onChange: v => persistAll({ [activeLoanKey]: { ...activeLoan, account: v } }), allowExternal: false })),
+        rc("div", { style: { flex: "1 1 220px" } },
+          rc(LedgerLabel, null, "Category"),
+          rc(LedgerCategorySelect, { cats: categories.expense, value: activeLoan.category, subValue: activeLoan.subcat, onChange: (c, s) => persistAll({ [activeLoanKey]: { ...activeLoan, category: c, subcat: s } }) }))),
+      rc("div", {
+        style: { fontFamily: "var(--sans)", fontSize: 12, color: "var(--ink-3)" }
+      }, (() => {
+        const canPost = !!activeLoan.account && !!activeLoan.category && activeAmort.payment > 0;
+        const paidOff = activeAmort.payoffDate && activeAmort.payoffDate < todayISO();
+        if (paidOff) return "Loan fully repaid — no more postings.";
+        if (!canPost) return "Missing account/category — won't post yet.";
+        return `Next: ${isoToDayLabel(activeLoan.nextDueDate || activeLoan.startDate || todayISO())}`;
+      })())))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 12,
@@ -5849,7 +6034,50 @@ function App() {
   }), /*#__PURE__*/React.createElement(KpiCard, {
     label: "Number of payments",
     value: activeAmort.n
-  })), /*#__PURE__*/React.createElement("div", {
+  })), rc(Card, { style: { marginTop: 16 } },
+    rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 } },
+      rc("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
+        rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, fontWeight: 600, color: "var(--ink-1)" } }, "Loan events"),
+        rc("span", { style: { fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)" } },
+          (activeLoan.events || []).length > 0 ? `${activeLoan.events.length} recorded` : "early repayment / refinancing — ad hoc, none recorded")),
+      rc("button", {
+        className: "btn-secondary", style: { padding: "5px 10px", fontSize: 12 },
+        onClick: () => setShowLoanEvents(s => !s)
+      }, showLoanEvents ? "Hide" : "Show")),
+    showLoanEvents && rc("div", { style: { marginTop: 12 } },
+      rc("div", { style: { display: "flex", gap: 6, marginBottom: 10 } },
+        rc("button", { className: "btn-secondary", style: { padding: "5px 10px", fontSize: 12 }, onClick: () => addLoanEvent(loanSub, "extraPayment") }, "Add extra repayment"),
+        rc("button", { className: "btn-secondary", style: { padding: "5px 10px", fontSize: 12 }, onClick: () => addLoanEvent(loanSub, "rateChange") }, "Add refinance / rate change")),
+      (activeLoan.events || []).length === 0 && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)" } }, "No early repayments or refinancing recorded."),
+      rc("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+        (activeLoan.events || []).slice().sort((a, b) => a.date.localeCompare(b.date)).map(ev => rc("div", {
+          key: ev.id,
+          style: { border: "1px solid var(--hair)", borderRadius: 8, padding: 10, background: "#FAF9F4" }
+        },
+          rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 8, flexWrap: "wrap" } },
+            rc("span", {
+              style: { fontFamily: "var(--sans)", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.04em", color: "var(--ink-3)" }
+            }, ev.kind === "extraPayment" ? "Extra repayment" : "Refinance / rate change"),
+            rc(IconBtn, { onClick: () => removeLoanEvent(loanSub, ev.id) }, "Remove")),
+          rc("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 8 } },
+            rc("div", null, rc(LedgerLabel, null, "Date"),
+              rc("input", { type: "date", value: ev.date, onChange: e => updateLoanEvent(loanSub, ev.id, { date: e.target.value }), style: inputStyle })),
+            ev.kind === "extraPayment"
+              ? rc("div", null, rc(LedgerLabel, null, "Amount"),
+                  rc("input", { type: "number", value: ev.amount, onFocus: e => e.target.select(), onChange: e => updateLoanEvent(loanSub, ev.id, { amount: Number(e.target.value) || 0 }), style: inputStyle }))
+              : [
+                  rc("div", { key: "rate" }, rc(LedgerLabel, null, "New rate (% p.a.)"),
+                    rc("input", { type: "number", value: ev.ratePct, onFocus: e => e.target.select(), onChange: e => updateLoanEvent(loanSub, ev.id, { ratePct: Number(e.target.value) || 0 }), style: inputStyle })),
+                  rc("div", { key: "tenure" }, rc(LedgerLabel, null, "New remaining tenure (years)"),
+                    rc("input", { type: "number", value: ev.tenureYears, onFocus: e => e.target.select(), onChange: e => updateLoanEvent(loanSub, ev.id, { tenureYears: Number(e.target.value) || 0 }), style: inputStyle })),
+                  rc("div", { key: "principal" }, rc(LedgerLabel, null, "New principal (optional)"),
+                    rc("input", { type: "number", value: ev.principal, placeholder: "carry over balance", onFocus: e => e.target.select(), onChange: e => updateLoanEvent(loanSub, ev.id, { principal: e.target.value === "" ? "" : Number(e.target.value) || 0 }), style: inputStyle }))
+                ]),
+          rc("input", { type: "text", value: ev.notes || "", placeholder: "Notes (optional)", onChange: e => updateLoanEvent(loanSub, ev.id, { notes: e.target.value }), style: { ...inputStyle, width: "100%" } })
+        ))
+      )
+    )
+  ), /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 16,
       display: "flex",
@@ -5863,7 +6091,7 @@ function App() {
       fontWeight: 600,
       color: "var(--ink-1)"
     }
-  }, "Yearly schedule"), /*#__PURE__*/React.createElement("button", {
+  }, showMonthlySchedule ? "Monthly schedule" : "Yearly schedule"), /*#__PURE__*/React.createElement("button", {
     className: "btn-secondary",
     onClick: () => setShowMonthlySchedule(s => !s)
   }, showMonthlySchedule ? "Collapse" : "Scrollable view")), /*#__PURE__*/React.createElement("div", {
@@ -5883,10 +6111,10 @@ function App() {
       border: "1px solid var(--hair)",
       borderRadius: 10
     }
-  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, ["Year", "Principal paid", "Interest paid", "Remaining balance"].map(h => /*#__PURE__*/React.createElement("th", {
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, (showMonthlySchedule ? ["Date", "Principal paid", "Interest paid", "Remaining balance"] : ["Year", "Principal paid", "Interest paid", "Remaining balance"]).map(h => /*#__PURE__*/React.createElement("th", {
     key: h,
     style: {
-      textAlign: h === "Year" ? "left" : "right",
+      textAlign: (h === "Year" || h === "Date") ? "left" : "right",
       padding: "8px 12px",
       fontFamily: "var(--sans)",
       fontSize: 11,
@@ -5894,7 +6122,7 @@ function App() {
       textTransform: "uppercase",
       borderBottom: "1px solid var(--hair-strong)"
     }
-  }, h)))), /*#__PURE__*/React.createElement("tbody", null, activeAmort.yearly.map((y, i) => /*#__PURE__*/React.createElement("tr", {
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, (showMonthlySchedule ? activeAmort.monthly : activeAmort.yearly).map((y, i) => /*#__PURE__*/React.createElement("tr", {
     key: i
   }, /*#__PURE__*/React.createElement("td", {
     style: {
@@ -5904,7 +6132,7 @@ function App() {
       color: "var(--ink-2)",
       borderBottom: "1px solid var(--hair)"
     }
-  }, "Year ", i + 1), /*#__PURE__*/React.createElement("td", {
+  }, showMonthlySchedule ? isoToDayLabel(y.date) : `Year ${i + 1}`), /*#__PURE__*/React.createElement("td", {
     style: {
       padding: "7px 12px",
       textAlign: "right",
