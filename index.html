@@ -3602,10 +3602,15 @@ function App() {
     if (!householdName || !recurring.length) return;
     const today = todayISO();
     let changed = false;
-    const nextRecurring = recurring.map(item => {
-      if (item.active === false) return item;
-      if (!item.account) return item;
-      if (item.type === "transfer" ? !item.toAccount : !item.category) return item;
+    // Collect only the nextDueDate/lastPostedDate advance per item, then merge onto
+    // recurringRaw below (not the derived `recurring`) — otherwise writing the full
+    // derived array back would freeze every OTHER item's derived `active` value into
+    // storage too, including incomplete items nobody has touched yet.
+    const advances = {};
+    recurring.forEach(item => {
+      if (item.active === false) return;
+      if (!item.account) return;
+      if (item.type === "transfer" ? !item.toAccount : !item.category) return;
       const cappedToday = item.lapseDate && item.lapseDate < today ? item.lapseDate : today;
       const next = postDueCadence(item, cappedToday, saveTxn, (it, cursor) => ({
         id: `rec_${it.id}_${cursor}`,
@@ -3622,10 +3627,13 @@ function App() {
         recurringId: it.id,
         createdAt: new Date().toISOString()
       }));
-      if (next !== item) changed = true;
-      return next;
+      if (next !== item) {
+        changed = true;
+        advances[item.id] = { nextDueDate: next.nextDueDate, lastPostedDate: next.lastPostedDate };
+      }
     });
     if (changed) {
+      const nextRecurring = recurringRaw.map(r => advances[r.id] ? { ...r, ...advances[r.id] } : r);
       setRecurring(nextRecurring);
       persistAll({ recurring: nextRecurring });
     }
@@ -3639,9 +3647,14 @@ function App() {
     if (!householdName || !policies.length) return;
     const today = todayISO();
     let changed = false;
-    const nextPolicies = policies.map(item => {
-      if (item.active === false) return item;
-      if (!item.account || !item.category) return item;
+    // Same reasoning as the Recurring posting effect above: merge only the advanced
+    // nextDueDate/lastPostedDate onto policiesRaw, not the full derived array, so an
+    // untouched incomplete policy elsewhere in the list never gets its derived
+    // `active` value frozen into storage.
+    const advances = {};
+    policies.forEach(item => {
+      if (item.active === false) return;
+      if (!item.account || !item.category) return;
       const cappedToday = item.lapseDate && item.lapseDate < today ? item.lapseDate : today;
       const next = postDueCadence(item, cappedToday, saveTxn, (it, cursor) => ({
         id: `pol_${it.id}_${cursor}`,
@@ -3658,10 +3671,13 @@ function App() {
         policyId: it.id,
         createdAt: new Date().toISOString()
       }));
-      if (next !== item) changed = true;
-      return next;
+      if (next !== item) {
+        changed = true;
+        advances[item.id] = { nextDueDate: next.nextDueDate, lastPostedDate: next.lastPostedDate };
+      }
     });
     if (changed) {
+      const nextPolicies = policiesRaw.map(p => advances[p.id] ? { ...p, ...advances[p.id] } : p);
       setPolicies(nextPolicies);
       persistAll({ policies: nextPolicies });
     }
@@ -3682,7 +3698,7 @@ function App() {
 
   // Minimal seed — reconcilePolicies fills in every other field's default (including
   // active: false, since a blank policy has no account/category yet and so can't post).
-  const addPolicy = () => setPolicies([...policies, {
+  const addPolicy = () => setPolicies([...policiesRaw, {
     id: uid(),
     person: familyMembers[0] || "Person 1",
     type: INSURANCE_TYPES[0],
@@ -3692,8 +3708,13 @@ function App() {
     coverage: 0,
     locked: false
   }]);
+  // Built off policiesRaw (not the reconciled `policies`), so editing one field doesn't
+  // freeze `active`'s derived canPost value into storage before the rest of the required
+  // fields are filled in — otherwise a policy that becomes postable after this edit would
+  // stay stuck "Paused" until the user notices and clicks Resume by hand. Explicit
+  // Pause/Resume clicks still stick, since those always pass `active` in the patch itself.
   const updatePolicy = (id, patch) => {
-    const next = policies.map(p => p.id === id ? {
+    const next = policiesRaw.map(p => p.id === id ? {
       ...p,
       ...patch
     } : p);
@@ -3710,7 +3731,7 @@ function App() {
     });
   };
   const removePolicy = id => {
-    const next = policies.filter(p => p.id !== id);
+    const next = policiesRaw.filter(p => p.id !== id);
     setPolicies(next);
     persistAll({
       policies: next
@@ -3757,13 +3778,16 @@ function App() {
   // Minimal seed — reconcileRecurring fills in every other field's default
   // (including active: false, since a blank item has no account/category yet
   // and so can't post) the moment this flows back through the `recurring` memo.
-  const addRecurring = () => setRecurring([...recurring, {
+  const addRecurring = () => setRecurring([...recurringRaw, {
     id: uid(),
     name: "",
     notes: ""
   }]);
+  // Built off recurringRaw, not the reconciled `recurring` — see updatePolicy's comment
+  // above for why: otherwise `active`'s derived canPost value freezes into storage on the
+  // first edit, before the item is actually postable, and it never auto-activates.
   const updateRecurring = (id, patch) => {
-    const next = recurring.map(r => r.id === id ? {
+    const next = recurringRaw.map(r => r.id === id ? {
       ...r,
       ...patch
     } : r);
@@ -3773,7 +3797,7 @@ function App() {
     });
   };
   const removeRecurring = id => {
-    const next = recurring.filter(r => r.id !== id);
+    const next = recurringRaw.filter(r => r.id !== id);
     setRecurring(next);
     persistAll({
       recurring: next
@@ -3801,7 +3825,7 @@ function App() {
       // Keep any policies already assigned to this person pointed at the
       // renamed value, instead of leaving them referencing a name that no
       // longer exists in the household member list.
-      const nextPolicies = policies.map(p => p.person === oldName ? {
+      const nextPolicies = policiesRaw.map(p => p.person === oldName ? {
         ...p,
         person: trimmed
       } : p);
