@@ -135,6 +135,15 @@ const fmt = (n, d = 0) => (n < 0 ? "-$" : "$") + Math.abs(n || 0).toLocaleString
 });
 const fmtPct = (n, d = 1) => ((n || 0) * 100).toFixed(d) + "%";
 const fmtRatio = n => (n || 0).toFixed(2) + "x";
+// Tints an arbitrary category hex (from a native color-picker input, so any hue/lightness
+// is possible) to a low-alpha wash over white. Kept deliberately low so category cards stay
+// readable with plain --ink-1/--ink-3 text regardless of which color the user picked.
+const hexToRgba = (hex, alpha) => {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex || "");
+  if (!m) return `rgba(95,94,90,${alpha})`;
+  const [r, g, b] = m.slice(1).map(h => parseInt(h, 16));
+  return `rgba(${r},${g},${b},${alpha})`;
+};
 // Guards every ratio/percentage division in the app: a zero or missing
 // denominator returns 0 instead of Infinity/NaN, which fmt/fmtPct/fmtRatio
 // cannot clean up on their own (n || 0 only catches NaN, not Infinity).
@@ -339,11 +348,6 @@ const BLANK_EXPENSES = {
 const DEFAULT_ASSUMPTIONS = {
   emergencyBufferTarget: 0,
   bufferMonths: 6,
-  monthlyGrossIncome: 0,
-  carLoanRepayment: 0,
-  annualInsurancePremiums: 0,
-  annualInsurancePremiumsExclEndowments: 0,
-  person1LegacyCover: 0,
   savingsRateTarget: 0.28
 };
 // Two employed CPF profiles, one per household member. Kept as a named
@@ -1591,6 +1595,7 @@ function CategorySettingsList({
 }) {
   const [pendingHint, setPendingHint] = React.useState(null);
   const [dontShowAgain, setDontShowAgain] = React.useState(false);
+  const [openMenuKey, setOpenMenuKey] = React.useState(null);
   const isFixedCat = c => type === "income" ? c.key === "primaryIncome" : CORE_EXPENSE_KEYS.includes(c.key);
   const sortedList = [...list].sort((a, b) => {
     const af = isFixedCat(a),
@@ -1617,15 +1622,145 @@ function CategorySettingsList({
     }
   }, sortedList.map(c => {
     const isFixed = isFixedCat(c);
+    const avatarBg = hexToRgba(c.color || "#5F5E5A", 0.18);
+    const groupLabel = type === "expense" ? (EXPENSE_GROUPS.find(g => g.key === c.group) || {}).label : null;
+    const subtitleParts = [];
+    if (isFixed) subtitleParts.push("Built-in");
+    if (groupLabel) subtitleParts.push(groupLabel);
+    if (type === "income" && c.cpfLinked) subtitleParts.push("CPF-linked");
+    if (c.archived) subtitleParts.push("Archived");
+    const subtitle = subtitleParts.join(" \u00B7 ");
+    const menuOpen = openMenuKey === c.key;
+    const menuItemStyle = {
+      display: "block",
+      width: "100%",
+      textAlign: "left",
+      padding: "8px 12px",
+      fontSize: 12.5,
+      fontFamily: "var(--sans)",
+      color: "var(--ink-1)",
+      border: "none",
+      background: "#fff",
+      cursor: "pointer"
+    };
     return /*#__PURE__*/React.createElement("div", {
     key: c.key,
     style: {
       border: "1px solid var(--hair)",
-      borderRadius: 8,
-      padding: 10,
-      opacity: c.archived ? 0.55 : 1
+      borderRadius: 10,
+      padding: 12,
+      opacity: c.archived ? 0.55 : 1,
+      position: "relative"
     }
   }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      alignItems: "center",
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 36,
+      height: 36,
+      borderRadius: "50%",
+      background: avatarBg,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontSize: 17,
+      flexShrink: 0
+    }
+  }, c.icon || "\uD83C\uDFF7\uFE0F"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 auto",
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "text",
+    value: c.label,
+    onChange: e => onUpdate(c.key, {
+      label: e.target.value
+    }),
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 13.5,
+      fontWeight: 600,
+      padding: "4px 6px",
+      borderRadius: 6,
+      border: "1px solid transparent",
+      width: "100%",
+      background: "transparent"
+    }
+  }), subtitle && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)",
+      padding: "0 6px"
+    }
+  }, subtitle)), /*#__PURE__*/React.createElement(IconBtn, {
+    onClick: () => setOpenMenuKey(menuOpen ? null : c.key)
+  }, "\u22EF")), menuOpen && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    onClick: () => setOpenMenuKey(null),
+    style: {
+      position: "fixed",
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      zIndex: 900
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      top: 40,
+      right: 10,
+      zIndex: 901,
+      background: "#fff",
+      border: "1px solid var(--hair-strong)",
+      borderRadius: 8,
+      boxShadow: "0 4px 16px rgba(0,0,0,0.15)",
+      minWidth: 160,
+      overflow: "hidden",
+      display: "flex",
+      flexDirection: "column"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      onUpdate(c.key, {
+        pinned: !c.pinned
+      });
+      setOpenMenuKey(null);
+    },
+    style: menuItemStyle
+  }, c.pinned ? "Pinned to top \u2713" : "Pin to top"), type === "income" && /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      runOrExplain("cpfLinked", () => onUpdate(c.key, {
+        cpfLinked: !c.cpfLinked
+      }));
+      setOpenMenuKey(null);
+    },
+    style: menuItemStyle
+  }, c.cpfLinked ? "CPF-linked: Yes" : "CPF-linked: No"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      runOrExplain("archive", () => onUpdate(c.key, {
+        archived: !c.archived
+      }));
+      setOpenMenuKey(null);
+    },
+    style: menuItemStyle
+  }, c.archived ? "Unarchive" : "Archive"), !isFixed && /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      runOrExplain("delete", () => onRemove(c.key));
+      setOpenMenuKey(null);
+    },
+    style: {
+      ...menuItemStyle,
+      color: "var(--warn)",
+      borderTop: "1px solid var(--hair)"
+    }
+  }, "Delete"))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 8,
@@ -1648,36 +1783,7 @@ function CategorySettingsList({
   }, "\u2014"), CATEGORY_ICONS.map(ic => /*#__PURE__*/React.createElement("option", {
     key: ic,
     value: ic
-  }, ic))), /*#__PURE__*/React.createElement("input", {
-    type: "color",
-    value: c.color || "#5F5E5A",
-    onChange: e => onUpdate(c.key, {
-      color: e.target.value
-    }),
-    title: "Category colour",
-    style: {
-      width: 30,
-      height: 28,
-      padding: 0,
-      border: "1px solid var(--hair-strong)",
-      borderRadius: 6,
-      cursor: "pointer"
-    }
-  }), /*#__PURE__*/React.createElement("input", {
-    type: "text",
-    value: c.label,
-    onChange: e => onUpdate(c.key, {
-      label: e.target.value
-    }),
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 13,
-      padding: "4px 7px",
-      borderRadius: 6,
-      border: "1px solid var(--hair-strong)",
-      flex: "1 1 160px"
-    }
-  }), type === "expense" && /*#__PURE__*/React.createElement("select", {
+  }, ic))), type === "expense" && /*#__PURE__*/React.createElement("select", {
     value: c.group,
     onChange: e => onUpdate(c.key, {
       group: e.target.value
@@ -1689,27 +1795,7 @@ function CategorySettingsList({
   }, EXPENSE_GROUPS.map(g => /*#__PURE__*/React.createElement("option", {
     key: g.key,
     value: g.key
-  }, g.label))), /*#__PURE__*/React.createElement(IconBtn, {
-    onClick: () => onUpdate(c.key, {
-      pinned: !c.pinned
-    })
-  }, c.pinned ? "Pinned to top" : "Pin to top"), type === "income" && /*#__PURE__*/React.createElement(IconBtn, {
-    onClick: () => runOrExplain("cpfLinked", () => onUpdate(c.key, {
-      cpfLinked: !c.cpfLinked
-    }))
-  }, c.cpfLinked ? "CPF-linked: Yes" : "CPF-linked: No"), /*#__PURE__*/React.createElement(IconBtn, {
-    onClick: () => runOrExplain("archive", () => onUpdate(c.key, {
-      archived: !c.archived
-    }))
-  }, c.archived ? "Unarchive" : "Archive"), !isFixed && /*#__PURE__*/React.createElement(IconBtn, {
-    onClick: () => runOrExplain("delete", () => onRemove(c.key))
-  }, "Delete"), isFixed && /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 10.5,
-      color: "var(--ink-3)"
-    }
-  }, "built-in")), /*#__PURE__*/React.createElement("div", {
+  }, g.label)))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 6,
@@ -1763,7 +1849,26 @@ function CategorySettingsList({
       border: "1px dashed var(--hair-strong)",
       width: 130
     }
-  })));
+  }), /*#__PURE__*/React.createElement("button", {
+    disabled: !(newSubLabel[c.key] || "").trim(),
+    onClick: () => {
+      if ((newSubLabel[c.key] || "").trim()) {
+        onAddSub(c.key, newSubLabel[c.key]);
+        setNewSubLabel({
+          ...newSubLabel,
+          [c.key]: ""
+        });
+      }
+    },
+    style: {
+      fontSize: 11.5,
+      padding: "3px 10px",
+      borderRadius: 999,
+      border: "1px solid var(--hair-strong)",
+      background: "#fff",
+      cursor: "pointer"
+    }
+  }, "+ Add")));
   })), pendingHint && /*#__PURE__*/React.createElement("div", {
     onClick: () => setPendingHint(null),
     style: {
@@ -3195,6 +3300,24 @@ function App() {
   const [housingLoan, setHousingLoan] = useState(blankLoan());
   const [carLoan, setCarLoan] = useState(blankLoan());
   const [cpfSettings, setCpfSettings] = useState(DEFAULT_CPF_SETTINGS);
+  // Dashboard ratios used to run on hand-typed "assumption" numbers that duplicated
+  // real data already tracked elsewhere (CPF salary, the Loans posting engine, Insurance
+  // policies) with no sync between the two — the same staleness problem the Contracts
+  // tab had before it was folded into Recurring. These derive the same five figures live
+  // instead, so effectiveAssumptions below always reflects current state.
+  const carAmort = useMemo(() => amortize(carLoan), [carLoan]);
+  const primaryEarner = familyMembers[0] || "Person 1";
+  const annualInsurancePremiumsTotal = useMemo(() => policies.filter(p => !isPolicyLapsed(p)).reduce((a, p) => a + (Number(p.amount) || 0) * occurrencesPerYear(p.interval, p.unit), 0), [policies]);
+  const annualInsurancePremiumsExclEndowmentsTotal = useMemo(() => policies.filter(p => !isPolicyLapsed(p) && p.type !== "Endowment").reduce((a, p) => a + (Number(p.amount) || 0) * occurrencesPerYear(p.interval, p.unit), 0), [policies]);
+  const primaryEarnerLegacyCover = useMemo(() => policies.filter(p => p.type === "Death/TPD" && p.person === primaryEarner && !isPolicyLapsed(p)).reduce((a, p) => a + (Number(p.coverage) || 0), 0), [policies, primaryEarner]);
+  const effectiveAssumptions = useMemo(() => ({
+    ...assumptions,
+    monthlyGrossIncome: (cpfSettings.person1Salary || 0) + (cpfSettings.person2Salary || 0),
+    carLoanRepayment: carAmort.payment || 0,
+    annualInsurancePremiums: annualInsurancePremiumsTotal,
+    annualInsurancePremiumsExclEndowments: annualInsurancePremiumsExclEndowmentsTotal,
+    person1LegacyCover: primaryEarnerLegacyCover
+  }), [assumptions, cpfSettings, carAmort, annualInsurancePremiumsTotal, annualInsurancePremiumsExclEndowmentsTotal, primaryEarnerLegacyCover]);
   const [taxSettings, setTaxSettings] = useState({
     annualEmploymentIncome: 0,
     includeCpfRelief: true,
@@ -3417,10 +3540,10 @@ function App() {
     if (!records) return {};
     const map = {};
     records.forEach(r => {
-      map[r.month] = computeDerived(r, assumptions, accounts);
+      map[r.month] = computeDerived(r, effectiveAssumptions, accounts);
     });
     return map;
-  }, [records, assumptions, accounts]);
+  }, [records, effectiveAssumptions, accounts]);
   const trendData = useMemo(() => {
     if (!records) return [];
     return records.map(r => {
@@ -3922,7 +4045,6 @@ function App() {
     };
   }, [taxSettings, cpfSettings]);
   const housingAmort = useMemo(() => amortize(housingLoan), [housingLoan]);
-  const carAmort = useMemo(() => amortize(carLoan), [carLoan]);
   const activeLoan = loanSub === "housing" ? housingLoan : carLoan;
   const activeAmort = loanSub === "housing" ? housingAmort : carAmort;
   const activeLoanKey = loanSub === "housing" ? "housingLoan" : "carLoan";
@@ -4002,9 +4124,9 @@ function App() {
     // Was hardcoded to a fixed set of income category keys, which silently
     // produced NaN if any of those were renamed and ignored any category added.
     const avgIncome = baseline.reduce((a, r) =>
-      a + computeDerived(r, assumptions, accounts).totalIncome, 0) / baseline.length;
+      a + computeDerived(r, effectiveAssumptions, accounts).totalIncome, 0) / baseline.length;
     const avgExpense = baseline.reduce((a, r) =>
-      a + computeDerived(r, assumptions, accounts).totalExpenses
+      a + computeDerived(r, effectiveAssumptions, accounts).totalExpenses
         - catTotal(r.expenses.variable.bigTicket), 0) / baseline.length;
     const lastRec = records[records.length - 1];
     const lastDerived = derivedByMonth[lastRec.month];
@@ -4071,7 +4193,7 @@ function App() {
       });
     }
     return rows;
-  }, [records, assumptions, recurring, policies, derivedByMonth, housingLoan, carLoan, housingAmort, carAmort]);
+  }, [records, effectiveAssumptions, recurring, policies, derivedByMonth, housingLoan, carLoan, housingAmort, carAmort]);
   if (!householdName) return /*#__PURE__*/React.createElement(HouseholdChooser, { onChoose: chooseHousehold });
   if (loading || !records) return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -4129,7 +4251,7 @@ function App() {
       variance
     };
   })() : null;
-  const avgMonthlyExpenses = records.length ? records.reduce((a, r) => a + computeDerived(r, assumptions, accounts).totalExpenses, 0) / records.length : 0;
+  const avgMonthlyExpenses = records.length ? records.reduce((a, r) => a + computeDerived(r, effectiveAssumptions, accounts).totalExpenses, 0) / records.length : 0;
   return /*#__PURE__*/React.createElement("div", {
     style: {
       "--serif": "'Spectral', Georgia, serif",
@@ -5155,10 +5277,9 @@ function App() {
       }
     }, "No budgets set yet. Add one above to start tracking.") : /*#__PURE__*/React.createElement("div", {
       style: {
-        background: "#fff",
-        border: "1px solid var(--hair)",
-        borderRadius: 10,
-        overflow: "hidden"
+        display: "grid",
+        gridTemplateColumns: "repeat(2, minmax(0,1fr))",
+        gap: 10
       }
     }, budgetedKeys.map((key, i) => {
       const entry = normalizeBudget(budgets[key]);
@@ -5168,11 +5289,16 @@ function App() {
       const compareBasis = isAnnual ? s.paceAnnual : s.monthActual;
       const pct = entry.amount > 0 ? compareBasis / entry.amount : 0;
       const barColor = pct >= 1 ? "var(--warn)" : pct >= 0.8 ? "var(--amber)" : "var(--accent)";
+      const catColor = s.cat.color || "#5F5E5A";
+      const spansFullWidth = budgetedKeys.length % 2 === 1 && i === budgetedKeys.length - 1;
       return /*#__PURE__*/React.createElement("div", {
         key: key,
         style: {
-          padding: "12px 16px",
-          borderTop: i === 0 ? "none" : "1px solid var(--hair)"
+          gridColumn: spansFullWidth ? "1 / -1" : undefined,
+          background: hexToRgba(catColor, 0.08),
+          border: "1px solid " + hexToRgba(catColor, 0.35),
+          borderRadius: 12,
+          padding: "12px 14px"
         }
       }, /*#__PURE__*/React.createElement("div", {
         style: {
@@ -5186,15 +5312,19 @@ function App() {
       }, /*#__PURE__*/React.createElement("div", {
         style: {
           fontFamily: "var(--sans)",
+          fontWeight: 600,
           fontSize: 13,
           color: "var(--ink-1)"
         }
-      }, s.cat.icon ? `${s.cat.icon} ${s.cat.label}` : s.cat.label), /*#__PURE__*/React.createElement("div", {
+      }, s.cat.icon ? `${s.cat.icon} ${s.cat.label}` : s.cat.label), /*#__PURE__*/React.createElement(IconBtn, {
+        onClick: () => removeBudget(key)
+      }, "Remove")), /*#__PURE__*/React.createElement("div", {
         style: {
           display: "flex",
           gap: 8,
           alignItems: "center",
-          flexWrap: "wrap"
+          flexWrap: "wrap",
+          marginBottom: 8
         }
       }, /*#__PURE__*/React.createElement("select", {
         value: isAnnual ? "Annual" : "Monthly",
@@ -5220,9 +5350,7 @@ function App() {
           borderRadius: 6,
           border: "1px solid var(--hair-strong)"
         }
-      }), /*#__PURE__*/React.createElement(IconBtn, {
-        onClick: () => removeBudget(key)
-      }, "Remove"))), entry.amount > 0 && /*#__PURE__*/React.createElement(Bar, {
+      })), entry.amount > 0 && /*#__PURE__*/React.createElement(Bar, {
         pct: pct,
         color: barColor
       }), /*#__PURE__*/React.createElement("div", {
@@ -6543,14 +6671,15 @@ function App() {
       }, /*#__PURE__*/React.createElement("div", {
         style: {
           display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(220px,1fr))",
+          gridTemplateColumns: "repeat(2, minmax(0,1fr))",
           gap: 12
         }
       }, /*#__PURE__*/React.createElement("button", {
         className: "btn-secondary",
         style: {
           textAlign: "left",
-          padding: 16
+          padding: 16,
+          minHeight: 96
         },
         onClick: () => setSettingsView("accounts")
       }, /*#__PURE__*/React.createElement("div", {
@@ -6571,7 +6700,8 @@ function App() {
         className: "btn-secondary",
         style: {
           textAlign: "left",
-          padding: 16
+          padding: 16,
+          minHeight: 96
         },
         onClick: () => setSettingsView("categories")
       }, /*#__PURE__*/React.createElement("div", {
@@ -6592,7 +6722,9 @@ function App() {
         className: "btn-secondary",
         style: {
           textAlign: "left",
-          padding: 16
+          padding: 16,
+          minHeight: 96,
+          gridColumn: "1 / -1"
         },
         onClick: () => setSettingsView("household")
       }, /*#__PURE__*/React.createElement("div", {
@@ -6609,61 +6741,7 @@ function App() {
           fontSize: 12,
           color: "var(--ink-3)"
         }
-      }, "Current household name, and switching to a different one."))), /*#__PURE__*/React.createElement("button", {
-        className: "btn-secondary",
-        style: {
-          textAlign: "left",
-          padding: 16
-        },
-        onClick: () => setSettingsView("assumptions")
-      }, /*#__PURE__*/React.createElement("div", {
-        style: {
-          fontFamily: "var(--sans)",
-          fontWeight: 600,
-          fontSize: 14,
-          color: "var(--ink-1)",
-          marginBottom: 4
-        }
-      }, "Assumptions"), /*#__PURE__*/React.createElement("div", {
-        style: {
-          fontFamily: "var(--sans)",
-          fontSize: 12,
-          color: "var(--ink-3)"
-        }
-      }, "Income, insurance and legacy-cover inputs used across ratios and CPF/tax.")));
-    }
-    if (settingsView === "assumptions") {
-      return /*#__PURE__*/React.createElement(Section, {
-        title: "Assumptions",
-        eyebrow: "Settings",
-        right: /*#__PURE__*/React.createElement(IconBtn, {
-          onClick: () => setSettingsView("menu")
-        }, "← Back to Settings")
-      }, /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
-        style: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 10 }
-      }, /*#__PURE__*/React.createElement(NumberField, {
-        label: "Monthly gross income (OW)",
-        value: assumptions.monthlyGrossIncome,
-        onChange: v => persistAll({ assumptions: { ...assumptions, monthlyGrossIncome: v } })
-      }), /*#__PURE__*/React.createElement(NumberField, {
-        label: "Car loan repayment / mth",
-        value: assumptions.carLoanRepayment,
-        onChange: v => persistAll({ assumptions: { ...assumptions, carLoanRepayment: v } })
-      }), /*#__PURE__*/React.createElement(NumberField, {
-        label: "Annual insurance premiums",
-        value: assumptions.annualInsurancePremiums,
-        onChange: v => persistAll({ assumptions: { ...assumptions, annualInsurancePremiums: v } })
-      }), /*#__PURE__*/React.createElement(NumberField, {
-        label: "Annual ins. excl. endowments",
-        value: assumptions.annualInsurancePremiumsExclEndowments,
-        onChange: v => persistAll({ assumptions: { ...assumptions, annualInsurancePremiumsExclEndowments: v } })
-      }), /*#__PURE__*/React.createElement(NumberField, {
-        label: "Policy 1 legacy / life cover",
-        value: assumptions.person1LegacyCover,
-        onChange: v => persistAll({ assumptions: { ...assumptions, person1LegacyCover: v } })
-      })), /*#__PURE__*/React.createElement("div", {
-        style: { fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)", marginTop: 10 }
-      }, "Emergency buffer target and months of cover are edited from the Dashboard's Emergency buffer detail instead, since that view can recalculate the target from your actual spending.")));
+      }, "Current household name, and switching to a different one."))));
     }
     if (settingsView === "household") {
       return /*#__PURE__*/React.createElement(Section, {
