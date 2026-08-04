@@ -833,7 +833,8 @@ const reconcileRecurring = list => (list || []).map(r => {
     nextDueDate: r.nextDueDate || todayISO(),
     lapseDate: r.lapseDate || "",
     active: typeof r.active === "boolean" ? r.active : canPost,
-    lastPostedDate: r.lastPostedDate || null
+    lastPostedDate: r.lastPostedDate || null,
+    locked: !!r.locked
   };
 });
 // Insurance policies moved onto the same real-posting cadence engine as Recurring items
@@ -2581,6 +2582,44 @@ function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate
     style: { padding: "5px 11px", fontSize: 12, borderRadius: 999 }
   }, label);
 
+  const locked = !!item.locked;
+
+  // Saved items collapse to the same compact row as the "From insurance"/"From loans"
+  // rollups above, so a Recurring register with many items doesn't stay a wall of full
+  // forms — only the item currently being added/edited is ever expanded.
+  if (locked) {
+    const catLabel = isTransfer ? "Transfer" : ((catList.find(c => c.key === item.category) || {}).label || "—");
+    return rc("div", {
+      style: {
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        padding: "10px 14px", background: "#FAF9F4", border: "1px solid var(--hair)",
+        borderRadius: 8, gap: 10, flexWrap: "wrap"
+      }
+    },
+      rc("div", { style: { minWidth: 0 } },
+        rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, fontWeight: 600, color: "var(--ink-1)" } },
+          item.name || "Untitled"),
+        rc("div", { style: { fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)" } },
+          catLabel)),
+      rc("div", { style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } },
+        rc("span", {
+          style: {
+            fontFamily: "var(--sans)", fontSize: 11, fontWeight: 600,
+            padding: "3px 10px", borderRadius: 999, background: status.bg, color: status.color
+          }
+        }, status.label),
+        rc("span", { style: { fontFamily: "var(--mono)", fontSize: 13, fontWeight: 600, color: "var(--ink-1)" } },
+          `${fmt(item.amount)} / ${item.interval} ${RECUR_UNIT_LABELS[item.unit]}`),
+        rc(IconBtn, { onClick: () => set({ active: isPaused }) }, isPaused ? "Resume" : "Pause"),
+        rc("button", {
+          className: "btn-secondary", style: { padding: "5px 10px", fontSize: 12 },
+          onClick: () => set({ locked: false })
+        }, "Edit"),
+        rc(IconBtn, { onClick: () => onRemove(item.id) }, "Remove")
+      )
+    );
+  }
+
   return rc(Card, null,
     rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 8 } },
       rc("span", {
@@ -2646,9 +2685,17 @@ function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate
     ),
     endFlag && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 11.5, fontWeight: 600, color: endFlag.color, marginTop: -4, marginBottom: 10 } }, endFlag.text),
 
-    rc("div", null,
+    rc("div", { style: { marginBottom: 12 } },
       rc(LedgerLabel, null, "Notes"),
-      rc("input", { type: "text", value: item.notes, placeholder: "optional", onChange: e => set({ notes: e.target.value }), style: inputStyle }))
+      rc("input", { type: "text", value: item.notes, placeholder: "optional", onChange: e => set({ notes: e.target.value }), style: inputStyle })),
+
+    rc("div", { style: { display: "flex", justifyContent: "flex-end" } },
+      rc("button", {
+        className: "btn-primary",
+        disabled: !(item.name || "").trim(),
+        onClick: () => set({ locked: true }),
+        style: { padding: "6px 14px", fontSize: 12.5 }
+      }, "Save"))
   );
 }
 
@@ -3747,7 +3794,8 @@ function App() {
   const addRecurring = () => setRecurring([...recurringRaw, {
     id: uid(),
     name: "",
-    notes: ""
+    notes: "",
+    locked: false
   }]);
   // Built off recurringRaw, not the reconciled `recurring` — see updatePolicy's comment
   // above for why: otherwise `active`'s derived canPost value freezes into storage on the
@@ -5670,7 +5718,43 @@ function App() {
       fontSize: 11,
       color: "var(--ink-3)"
     }
-  }, "Synced from the Insurance tab \u2014 update premiums there and they'll post to the ledger and the Forecast automatically.")), /*#__PURE__*/React.createElement("div", {
+  }, "Synced from the Insurance tab \u2014 update premiums there and they'll post to the ledger and the Forecast automatically.")),
+
+  [["housing", "Housing loan", housingLoan, housingAmort], ["car", "Car loan", carLoan, carAmort]]
+    .filter(([, , loan, amort]) => loan.trackAsRecurring && loan.account && loan.category && amort.payment > 0 && !(amort.payoffDate && amort.payoffDate < todayISO()))
+    .length > 0 && rc("div", { style: { marginBottom: 18 } },
+      rc("div", {
+        style: {
+          fontFamily: "var(--sans)", fontSize: 11, letterSpacing: "0.06em", textTransform: "uppercase",
+          color: "var(--ink-3)", fontWeight: 600, marginBottom: 8
+        }
+      }, "From loans \u2014 tracked automatically"),
+      rc("div", { style: { display: "flex", flexDirection: "column", gap: 6, marginBottom: 8 } },
+        [["housing", "Housing loan", housingLoan, housingAmort], ["car", "Car loan", carLoan, carAmort]]
+          .filter(([, , loan, amort]) => loan.trackAsRecurring && loan.account && loan.category && amort.payment > 0 && !(amort.payoffDate && amort.payoffDate < todayISO()))
+          .map(([key, label, loan, amort]) => rc("div", {
+            key,
+            style: {
+              display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px",
+              background: "#FAF9F4", border: "1px solid var(--hair)", borderRadius: 8, gap: 10, flexWrap: "wrap"
+            }
+          },
+            rc("div", null,
+              rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, fontWeight: 600, color: "var(--ink-1)" } }, label),
+              rc("div", { style: { fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)" } }, `${loan.ratePct}% p.a.`)),
+            rc("div", { style: { display: "flex", alignItems: "center", gap: 10 } },
+              rc("span", { style: { fontFamily: "var(--mono)", fontSize: 13, fontWeight: 600, color: "var(--ink-1)" } },
+                `${fmt(amort.payment)} / month`),
+              rc("button", {
+                className: "btn-secondary", style: { padding: "4px 9px", fontSize: 11 },
+                onClick: () => { setLoanSub(key); setTab("loans"); }
+              }, "Edit in Loans")))
+          )),
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)" } },
+        "Synced from the Loans tab \u2014 update the repayment there and it'll post to the ledger and the Forecast automatically.")
+    ),
+
+  /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
