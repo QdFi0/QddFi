@@ -172,11 +172,6 @@ const catTotal = v => (v && typeof v === "object") ? sum(v) : (Number(v) || 0);
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const daysUntil = iso => Math.ceil((new Date(iso) - new Date(todayISO())) / 86400000);
 const DASH = "—";
-const MONTH_ORDER = (() => {
-  const a = [];
-  for (let y = 2026; y <= 2029; y++) ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].forEach(m => a.push(`${m} ${y}`));
-  return a;
-})();
 const EXPENSE_CATS = [{
   key: "housingUtilities",
   label: "Housing & utilities",
@@ -512,7 +507,7 @@ const RATIO_META = [{
   key: "savingsRatio",
   label: "Savings ratio",
   fmt: v => fmtPct(v),
-  bench: "2026 target 28%",
+  bench: "Target 28%",
   what: "The share of your gross income you're actually keeping each month.",
   group: "wealth",
   status: v => v >= 0.28 ? "good" : v >= 0.15 ? "watch" : "attention"
@@ -2218,8 +2213,8 @@ const computeBalances = (registry, opening, txns, asOf) => {
 };
 
 const MONTH_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-// MONTH_ORDER is a fixed 2026-2029 list, so indexOf breaks outside it.
-// This derives the same ordinal arithmetically and keeps working forever.
+// Deliberately arithmetic, not a lookup against a fixed list of "Mon YYYY" strings —
+// a fixed list would need extending every few years; this keeps working forever.
 const monthSortKey = label => {
   const parts = String(label || "").split(" ");
   const mi = MONTH_ABBR.indexOf(parts[0]);
@@ -3598,9 +3593,23 @@ function App() {
   const records = useMemo(() => {
     if (!sealedRecords) return null;
     if (!ledgerStart) return sealedRecords;
-    const startKey = monthSortKey(isoToMonthLabel(ledgerStart));
     const endKey = monthSortKey(isoToMonthLabel(todayISO()));
+    let startKey = monthSortKey(isoToMonthLabel(ledgerStart));
     if (startKey === Number.MAX_SAFE_INTEGER || endKey === Number.MAX_SAFE_INTEGER) return sealedRecords;
+    // ledgerStart never moves backward on its own (it's fixed at household creation/reset),
+    // so a transaction backdated earlier than it — e.g. entering a missed month after the
+    // fact — would otherwise land in a month deriveRecord never visits. Its balance-sheet
+    // effect still reaches every later month's running balance (computeBalances has no date
+    // floor), but its income/expense would never get attributed to any month's P&L, silently
+    // dropping it from History, Budgets, and the net-worth chart. Widen the derive range to
+    // the earliest transaction actually present, capped to 120 months so one fat-fingered
+    // date can't force a runaway derive loop.
+    const earliestTxnKey = (txns || []).reduce((min, t) => {
+      if (!t.date) return min;
+      const k = monthSortKey(isoToMonthLabel(t.date));
+      return k < min ? k : min;
+    }, startKey);
+    startKey = Math.max(earliestTxnKey, endKey - 119);
     const out = sealedRecords.filter(r => monthSortKey(r.month) < startKey);
     for (let k = startKey; k <= endKey; k++) {
       out.push(deriveRecord(monthLabelFromSortKey(k), registry, openingBalances, txns, categories));
