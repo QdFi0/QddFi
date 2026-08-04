@@ -135,6 +135,10 @@ const fmt = (n, d = 0) => (n < 0 ? "-$" : "$") + Math.abs(n || 0).toLocaleString
 });
 const fmtPct = (n, d = 1) => ((n || 0) * 100).toFixed(d) + "%";
 const fmtRatio = n => (n || 0).toFixed(2) + "x";
+// History tab's variance column — same formatter as the metric's own value column (fmt or
+// fmtPct), just with an explicit "+" on positive deltas so a comparison reads at a glance
+// (fmt/fmtPct already render negative numbers with their own "-" sign).
+const fmtDelta = (raw, formatter) => raw === null || raw === undefined ? DASH : (raw > 0 ? "+" : "") + formatter(raw);
 // Tints an arbitrary category hex (from a native color-picker input, so any hue/lightness
 // is possible) to a low-alpha wash over white. Kept deliberately low so category cards stay
 // readable with plain --ink-1/--ink-3 text regardless of which color the user picked.
@@ -2351,6 +2355,55 @@ const deriveRecord = (monthLabel, registry, opening, txns, categories) => {
   return { month: monthLabel, income, expenses, balances, derived: true };
 };
 
+// History tab's Annual view: flow metrics (income/expenses/cashflow) sum across every month
+// in the year, but balance-sheet metrics (liquid cash, investments, CPF, net worth, buffer)
+// are a point-in-time snapshot, not a sum — summing twelve month-end balances would be
+// meaningless, so each year takes its latest month that actually has balances instead.
+// Records arrive pre-sorted chronologically, so the last hasBalances month seen per year is
+// that year's most recent. Returns the same field shape as computeDerived's output, so the
+// History table renders monthly and annual rows through identical row-formatter code.
+const aggregateAnnual = (records, derivedByMonth) => {
+  const byYear = {};
+  (records || []).forEach(r => {
+    const year = r.month.split(" ")[1];
+    const d = derivedByMonth[r.month];
+    if (!d) return;
+    if (!byYear[year]) byYear[year] = { year, totalIncome: 0, totalExpenses: 0, netCashflow: 0, snapshot: null };
+    const acc = byYear[year];
+    acc.totalIncome += d.totalIncome;
+    acc.totalExpenses += d.totalExpenses;
+    acc.netCashflow += d.netCashflow;
+    if (d.hasBalances) acc.snapshot = d;
+  });
+  return Object.values(byYear)
+    .sort((a, b) => Number(a.year) - Number(b.year))
+    .map(acc => ({
+      year: acc.year,
+      totalIncome: acc.totalIncome,
+      totalExpenses: acc.totalExpenses,
+      netCashflow: acc.netCashflow,
+      hasBalances: !!acc.snapshot,
+      totalLiquidCash: acc.snapshot ? acc.snapshot.totalLiquidCash : 0,
+      totalInvestments: acc.snapshot ? acc.snapshot.totalInvestments : 0,
+      combinedCpf: acc.snapshot ? acc.snapshot.combinedCpf : 0,
+      netWorth: acc.snapshot ? acc.snapshot.netWorth : 0,
+      bufferProgress: acc.snapshot ? acc.snapshot.bufferProgress : 0
+    }));
+};
+// Shared by the History table's monthly and annual views — [label, raw-value getter (null
+// when not applicable), display formatter]. Kept separate from a formatted-string getter (the
+// table used to have) so the variance column can do real arithmetic on the raw number.
+const HISTORY_ROWS = [
+  ["Total income", d => d.totalIncome, fmt],
+  ["Total expenses", d => d.totalExpenses, fmt],
+  ["Net cashflow", d => d.netCashflow, fmt],
+  ["Liquid cash", d => d.hasBalances ? d.totalLiquidCash : null, fmt],
+  ["Investments", d => d.hasBalances ? d.totalInvestments : null, fmt],
+  ["CPF combined", d => d.hasBalances ? d.combinedCpf : null, fmt],
+  ["Net worth", d => d.hasBalances ? d.netWorth : null, fmt],
+  ["Emergency buffer %", d => d.hasBalances ? d.bufferProgress : null, fmtPct]
+];
+
 const downloadBlob = (content, filename, mime) => {
   const blob = new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);
@@ -3358,6 +3411,7 @@ function App() {
   const [showLiveBalances, setShowLiveBalances] = useState(false);
   const [reconcileTarget, setReconcileTarget] = useState(null);
   const [loanSub, setLoanSub] = useState("housing");
+  const [historyPeriod, setHistoryPeriod] = useState("monthly");
   const [expenseView, setExpenseView] = useState("month");
   const [selectedMonth, setSelectedMonth] = useState(isoToMonthLabel(todayISO()));
   const [loading, setLoading] = useState(true);
@@ -3570,6 +3624,10 @@ function App() {
     });
     return map;
   }, [records, effectiveAssumptions, accounts]);
+  const annualHistory = useMemo(
+    () => aggregateAnnual(records, derivedByMonth),
+    [records, derivedByMonth]
+  );
   const trendData = useMemo(() => {
     if (!records) return [];
     return records.map(r => {
@@ -6691,59 +6749,83 @@ function App() {
       borderBottom: "1px solid var(--hair)",
       fontWeight: 600
     }
-  }, fmt(f.netWorth)))))))), tab === "history" && /*#__PURE__*/React.createElement(Section, {
-    title: "All months",
-    eyebrow: "Ledger"
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      overflowX: "auto"
+  }, fmt(f.netWorth)))))))), tab === "history" && rc(Section, {
+    title: "History",
+    eyebrow: "Ledger",
+    right: rc("div", { style: { display: "flex", gap: 6 } },
+      [["monthly", "Monthly"], ["annual", "Annually"]].map(([v, l]) => rc("button", {
+        key: v,
+        className: historyPeriod === v ? "btn-primary" : "btn-secondary",
+        style: { padding: "6px 14px", fontSize: 12.5 },
+        onClick: () => setHistoryPeriod(v)
+      }, l)))
+  }, (() => {
+    const thLeft = {
+      textAlign: "left", padding: "8px 10px", fontFamily: "var(--sans)", fontSize: 11,
+      color: "var(--ink-3)", textTransform: "uppercase", borderBottom: "1px solid var(--hair-strong)"
+    };
+    const thRight = {
+      textAlign: "right", padding: "8px 10px", fontFamily: "var(--sans)", fontSize: 11,
+      color: "var(--ink-3)", borderBottom: "1px solid var(--hair-strong)"
+    };
+    const tdLabel = {
+      padding: "7px 10px", fontFamily: "var(--sans)", fontSize: 12.5,
+      color: "var(--ink-2)", borderBottom: "1px solid var(--hair)"
+    };
+    const tdValue = { padding: "7px 10px", textAlign: "right", borderBottom: "1px solid var(--hair)", color: "var(--ink-1)" };
+
+    const currentYear = todayISO().split("-")[0];
+    const nowKey = monthSortKey(isoToMonthLabel(todayISO()));
+
+    // Monthly always spans January of the current year through the latest month, regardless
+    // of ledgerStart/sealedRecords coverage — a month with no derived record yet (d: null)
+    // just renders as DASH in every cell rather than being omitted from the table entirely.
+    // The variance comparison is deliberately independent of this visible range (looked up
+    // straight from derivedByMonth by calendar month) so it still reads correctly even in
+    // January, when "last month" falls in the previous year and off the displayed columns.
+    let periods, last, prev, deltaLabel;
+    if (historyPeriod === "monthly") {
+      const janKey = monthSortKey(`Jan ${currentYear}`);
+      periods = [];
+      for (let k = janKey; k <= nowKey; k++) {
+        const label = monthLabelFromSortKey(k);
+        periods.push({ key: label, label, d: derivedByMonth[label] || null });
+      }
+      last = { d: derivedByMonth[monthLabelFromSortKey(nowKey)] || null };
+      prev = { d: derivedByMonth[monthLabelFromSortKey(nowKey - 1)] || null };
+      deltaLabel = "Δ vs last month";
+    } else {
+      periods = annualHistory.map(a => ({ key: a.year, label: a.year === currentYear ? `${a.year} (YTD)` : a.year, d: a }));
+      last = periods[periods.length - 1];
+      prev = periods[periods.length - 2];
+      deltaLabel = "Δ vs last year";
     }
-  }, /*#__PURE__*/React.createElement("table", {
-    style: {
-      width: "100%",
-      borderCollapse: "collapse",
-      fontFamily: "var(--mono)",
-      fontSize: 12.5
-    }
-  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
-    style: {
-      textAlign: "left",
-      padding: "8px 10px",
-      fontFamily: "var(--sans)",
-      fontSize: 11,
-      color: "var(--ink-3)",
-      textTransform: "uppercase",
-      borderBottom: "1px solid var(--hair-strong)"
-    }
-  }, "Metric"), records.map(r => /*#__PURE__*/React.createElement("th", {
-    key: r.month,
-    style: {
-      textAlign: "right",
-      padding: "8px 10px",
-      fontFamily: "var(--sans)",
-      fontSize: 11,
-      color: "var(--ink-3)",
-      borderBottom: "1px solid var(--hair-strong)"
-    }
-  }, r.month)))), /*#__PURE__*/React.createElement("tbody", null, [["Total income", d => fmt(d.totalIncome)], ["Total expenses", d => fmt(d.totalExpenses)], ["Net cashflow", d => fmt(d.netCashflow)], ["Liquid cash", d => d.hasBalances ? fmt(d.totalLiquidCash) : DASH], ["Investments", d => d.hasBalances ? fmt(d.totalInvestments) : DASH], ["CPF combined", d => d.hasBalances ? fmt(d.combinedCpf) : DASH], ["Net worth", d => d.hasBalances ? fmt(d.netWorth) : DASH], ["Emergency buffer %", d => d.hasBalances ? fmtPct(d.bufferProgress) : DASH]].map(([label, get]) => /*#__PURE__*/React.createElement("tr", {
-    key: label
-  }, /*#__PURE__*/React.createElement("td", {
-    style: {
-      padding: "7px 10px",
-      fontFamily: "var(--sans)",
-      fontSize: 12.5,
-      color: "var(--ink-2)",
-      borderBottom: "1px solid var(--hair)"
-    }
-  }, label), records.map(r => /*#__PURE__*/React.createElement("td", {
-    key: r.month,
-    style: {
-      padding: "7px 10px",
-      textAlign: "right",
-      borderBottom: "1px solid var(--hair)",
-      color: "var(--ink-1)"
-    }
-  }, get(derivedByMonth[r.month]))))))))), tab === "settings" && (() => {
+
+    return rc("div", { style: { overflowX: "auto" } },
+      rc("table", { style: { width: "100%", borderCollapse: "collapse", fontFamily: "var(--mono)", fontSize: 12.5 } },
+        rc("thead", null, rc("tr", null,
+          rc("th", { style: thLeft }, "Metric"),
+          periods.map(p => rc("th", { key: p.key, style: thRight }, p.label)),
+          rc("th", { style: { ...thRight, borderLeft: "1px solid var(--hair-strong)" } }, deltaLabel)
+        )),
+        rc("tbody", null, HISTORY_ROWS.map(([label, get, formatter]) => {
+          const lastRaw = last && last.d ? get(last.d) : null;
+          const prevRaw = prev && prev.d ? get(prev.d) : null;
+          const delta = (lastRaw !== null && prevRaw !== null) ? lastRaw - prevRaw : null;
+          return rc("tr", { key: label },
+            rc("td", { style: tdLabel }, label),
+            periods.map(p => {
+              const raw = p.d ? get(p.d) : null;
+              return rc("td", { key: p.key, style: tdValue }, raw === null ? DASH : formatter(raw));
+            }),
+            rc("td", {
+              style: { ...tdValue, fontWeight: 600, color: "var(--ink-2)", borderLeft: "1px solid var(--hair-strong)" }
+            }, fmtDelta(delta, formatter))
+          );
+        }))
+      )
+    );
+  })()), tab === "settings" && (() => {
     if (settingsView === "menu") {
       return /*#__PURE__*/React.createElement(Section, {
         title: "Settings"
