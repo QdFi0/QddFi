@@ -2212,17 +2212,6 @@ const computeBalances = (registry, opening, txns, asOf) => {
   return bal;
 };
 
-// Seeds opening balances from an existing monthly record, so the historical
-// snapshots you already have become the ledger's starting position.
-const openingFromRecord = (record, registry) => {
-  const out = {};
-  registry.forEach(a => {
-    const grp = ((record || {}).balances || {})[a.group] || {};
-    out[a.key] = Number(grp[a.ref]) || 0;
-  });
-  return out;
-};
-
 const MONTH_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 // MONTH_ORDER is a fixed 2026-2029 list, so indexOf breaks outside it.
 // This derives the same ordinal arithmetically and keeps working forever.
@@ -2667,8 +2656,7 @@ function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate
 
 function TransactionsTab({
   registry, txns, categories, familyMembers,
-  onSave, onDelete, opening, onSetOpening,
-  latestRecord, txnError, orphans
+  onSave, onDelete, txnError, orphans
 }) {
   const blank = {
     id: null, date: todayISO(), type: "expense", amount: "",
@@ -2767,8 +2755,6 @@ function TransactionsTab({
   const rows = () => inRange.map(t => txnToRow(t, registry, catLookup));
   const fname = `transactions_${from}_to_${to}`;
 
-  const needsOpening = !opening || Object.keys(opening).length === 0;
-
   return rc("div", { style: { marginTop: 20 } },
 
     txnError && rc(Card, { style: { marginBottom: 14, borderColor: "#A6402B", background: "#FBEAF0" } },
@@ -2777,13 +2763,6 @@ function TransactionsTab({
     (orphans || []).length > 0 && rc(Card, { style: { marginBottom: 14, background: "#FBF3E6" } },
       rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", lineHeight: 1.5 } },
         `${orphans.length} entr${orphans.length === 1 ? "y is" : "ies are"} pointing at an account that no longer exists. They are excluded from balances and from monthly totals. Re-create the account in Settings, or edit each entry onto a live account.`)),
-
-    needsOpening && rc(Card, { style: { marginBottom: 14, background: "#FBF3E6" } },
-      rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13.5, color: "var(--ink-1)", marginBottom: 6 } },
-        "Set your opening balances"),
-      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", marginBottom: 12, lineHeight: 1.5 } },
-        `The ledger needs a starting position before it can derive balances. This will copy the closing balances from ${latestRecord ? latestRecord.month : "your latest month"} and treat them as the opening position. Every transaction you log from here on adjusts them.`),
-      rc("button", { className: "btn-primary", onClick: onSetOpening }, "Use latest month as opening balances")),
 
     /* ── quick add ── */
     rc(Card, null,
@@ -3683,19 +3662,6 @@ function App() {
     }
   }, [householdName, policies]);
 
-  const setOpeningFromLatest = () => {
-    const list = sealedRecords || [];
-    const last = list[list.length - 1];
-    if (!last) return;
-    // The ledger takes over from the month AFTER the last sealed record, so
-    // sealed and derived months never overlap and never disagree.
-    const start = monthStartISO(monthLabelFromSortKey(monthSortKey(last.month) + 1));
-    persistAll({ openingBalances: openingFromRecord(last, registry), ledgerStart: start });
-    setSelectedMonth(isoToMonthLabel(todayISO()));
-    setSaveMsg("Opening balances set — ledger is live from " + isoToMonthLabel(start));
-    setTimeout(() => setSaveMsg(""), 3000);
-  };
-
   // Minimal seed — reconcilePolicies fills in every other field's default (including
   // active: false, since a blank policy has no account/category yet and so can't post).
   const addPolicy = () => setPolicies([...policiesRaw, {
@@ -4460,7 +4426,7 @@ function App() {
           if (!items.length) return null;
           return rc("div", { key: g, style: { marginBottom: 14 } },
             rc(LedgerLabel, null, ACCOUNT_GROUP_LABELS[g]),
-            rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 8 } },
+            rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 8 } },
               items.map(a => rc("div", {
                 key: a.key,
                 style: {
@@ -5181,12 +5147,9 @@ function App() {
     txns: txns,
     categories: categories,
     familyMembers: familyMembers,
-    opening: openingBalances,
-    latestRecord: records[records.length - 1],
     txnError: txnError,
     onSave: saveTxn,
     onDelete: deleteTxn,
-    onSetOpening: setOpeningFromLatest,
     orphans: orphanTxns(registry, txns)
   }), tab === "budgets" && (() => {
     const budgetedKeys = Object.keys(budgets);
@@ -5742,7 +5705,15 @@ function App() {
       className: `tab-btn ${loanSub === "car" ? "active" : ""}`,
       onClick: () => setLoanSub("car")
     }, "Car"))
-  }, /*#__PURE__*/React.createElement(Card, {
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)",
+      marginBottom: 12,
+      lineHeight: 1.5
+    }
+  }, "This calculates a repayment schedule only — it doesn’t change your net worth. To reflect this loan's outstanding balance in Property equity, use “Adjust” on the matching liability account under Live balances (Dashboard)."), /*#__PURE__*/React.createElement(Card, {
     style: {
       marginBottom: 16
     }
