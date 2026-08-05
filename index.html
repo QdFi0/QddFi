@@ -3429,13 +3429,18 @@ function TransactionsTab({
                   }, signed),
                   rc("div", { style: { display: "flex", gap: 4 } },
                     !isAdj && rc(IconBtn, {
-                      onClick: () => setForm({
-                        id: t.id, date: t.date, type: t.type, amount: t.amount,
-                        account: t.account, toAccount: t.toAccount || "",
-                        category: t.category || "", subcat: t.subcat || "",
-                        payee: t.payee || "", note: t.note || "", who: t.who || "Joint",
-                        createdAt: t.createdAt || null
-                      })
+                      onClick: () => {
+                        setForm({
+                          id: t.id, date: t.date, type: t.type, amount: t.amount,
+                          account: t.account, toAccount: t.toAccount || "",
+                          category: t.category || "", subcat: t.subcat || "",
+                          payee: t.payee || "", note: t.note || "", who: t.who || "Joint",
+                          createdAt: t.createdAt || null
+                        });
+                        // The edit form lives at the top of the tab; without this, clicking
+                        // Edit from a long list scrolled out of view looks like a no-op.
+                        window.scrollTo(0, 0);
+                      }
                     }, "Edit"),
                     rc(IconBtn, { onClick: () => setConfirmDelete(t) }, "Delete"))
                 );
