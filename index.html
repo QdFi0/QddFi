@@ -349,6 +349,16 @@ const DEFAULT_ASSUMPTIONS = {
   bufferMonths: 6,
   savingsRateTarget: 0.28
 };
+// The 3 genuinely new judgment-call inputs the metrics spec needs (Income
+// Replacement Gap, Years to FI) — unlike the old Assumptions screen these
+// don't duplicate data a posting engine already tracks, so they're kept
+// small and edited inline on the two Dashboard cards that use them rather
+// than reviving a dedicated settings screen.
+const DEFAULT_FINANCIAL_PLANNING = {
+  dependentSupportYears: 10,
+  expectedRealReturn: 0.04,
+  withdrawalRate: 0.04
+};
 // Two employed CPF profiles, one per household member. Kept as a named
 // constant (not just an inline useState default) so a household document
 // saved before the second profile existed can be merged up to this shape
@@ -474,83 +484,405 @@ function computeDerived(record, assumptions, accounts) {
     ratios
   };
 }
+/* ─── Household financial metrics (metrics-spec.md) ───
+   Pure functions, no React/Firestore dependency — each returns
+   { value, status, inputs_used, warnings } so the UI can render badges
+   and explain itself. Callers (the dashboardMetrics memo in App) are
+   responsible for assembling the plain-data inputs from live state. */
+function emergencyFundRatio(liquidAssets, monthlyExpensesSeries) {
+  if (!monthlyExpensesSeries || monthlyExpensesSeries.length < 3) {
+    return { value: null, status: "insufficient_data", inputs_used: { liquidAssets }, warnings: ["Need at least 3 months of transaction history"] };
+  }
+  const windows = [];
+  for (let i = 0; i <= monthlyExpensesSeries.length - 3; i++) {
+    const s = monthlyExpensesSeries[i].total + monthlyExpensesSeries[i + 1].total + monthlyExpensesSeries[i + 2].total;
+    windows.push(s / 3);
+  }
+  const worstCaseMonthlySpend = Math.max(...windows);
+  const value = safeDiv(liquidAssets, worstCaseMonthlySpend);
+  return {
+    value,
+    status: value >= 6 ? "healthy" : value >= 3 ? "adequate" : "low",
+    inputs_used: { liquidAssets, worstCaseMonthlySpend, windowCount: windows.length },
+    warnings: monthlyExpensesSeries.length < 12 ? ["Less than 12 months of history — worst-case window may understate true risk"] : []
+  };
+}
+function debtToIncome(monthlyDebtPayments, grossMonthlyIncome) {
+  const housingDebt = monthlyDebtPayments.filter(d => d.category === "mortgage").reduce((a, d) => a + d.amount, 0);
+  const totalDebt = monthlyDebtPayments.reduce((a, d) => a + d.amount, 0);
+  if (grossMonthlyIncome <= 0) {
+    return {
+      housingDTI: { value: null, status: "no_income_data" },
+      totalDTI: { value: null, status: "no_income_data" },
+      inputs_used: { housingDebt, totalDebt, grossMonthlyIncome },
+      warnings: ["No gross income recorded"]
+    };
+  }
+  const housingDTI = housingDebt / grossMonthlyIncome;
+  const totalDTI = totalDebt / grossMonthlyIncome;
+  return {
+    housingDTI: { value: housingDTI, status: housingDTI <= 0.30 ? "healthy" : housingDTI <= 0.35 ? "caution" : "high" },
+    totalDTI: { value: totalDTI, status: totalDTI <= 0.40 ? "healthy" : totalDTI <= 0.55 ? "caution" : "high" },
+    inputs_used: { housingDebt, totalDebt, grossMonthlyIncome },
+    warnings: []
+  };
+}
+function debtToAssetRatio(totalLiabilities, totalAssets) {
+  if (totalAssets <= 0) return { value: null, status: "no_asset_data", inputs_used: { totalLiabilities, totalAssets }, warnings: [] };
+  const value = totalLiabilities / totalAssets;
+  return { value, status: value <= 0.4 ? "healthy" : value <= 0.6 ? "caution" : "high", inputs_used: { totalLiabilities, totalAssets }, warnings: [] };
+}
+function lifeCoverageRatio(totalLifeSumAssured, annualGrossIncome) {
+  if (annualGrossIncome <= 0) return { value: null, status: "no_income_data", inputs_used: { totalLifeSumAssured, annualGrossIncome }, warnings: [] };
+  const value = totalLifeSumAssured / annualGrossIncome;
+  // Healthy threshold pegged to LIA Singapore's published 9x-annual-income
+  // recommendation for Death & TPD coverage, not an arbitrary round number.
+  return { value, status: value >= 9 ? "healthy" : value >= 4.5 ? "adequate" : "low", inputs_used: { totalLifeSumAssured, annualGrossIncome }, warnings: [] };
+}
+function incomeReplacementGap(outstandingDebt, dependentSupportYears, annualEssentialExpenses, existingLifeCoverage, liquidAssets) {
+  const futureNeed = dependentSupportYears * annualEssentialExpenses;
+  const totalNeed = outstandingDebt + futureNeed;
+  const totalCovered = existingLifeCoverage + liquidAssets;
+  const gap = totalNeed - totalCovered;
+  return {
+    value: gap,
+    status: gap <= 0 ? "covered" : gap <= totalNeed * 0.25 ? "minor_gap" : "significant_gap",
+    inputs_used: { outstandingDebt, futureNeed, existingLifeCoverage, liquidAssets, dependentSupportYears },
+    warnings: []
+  };
+}
+function insuranceCostRatio(protectionPremiums, grossMonthlyIncome) {
+  if (grossMonthlyIncome <= 0) return { value: null, status: "no_income_data", inputs_used: { protectionPremiums, grossMonthlyIncome }, warnings: [] };
+  const value = protectionPremiums / grossMonthlyIncome;
+  return { value, status: value <= 0.10 ? "healthy" : value <= 0.15 ? "caution" : "high", inputs_used: { protectionPremiums, grossMonthlyIncome }, warnings: [] };
+}
+function savingsRate(totalIncome, totalExpenses, cpfContribution, includeCPF) {
+  if (totalIncome <= 0) return { value: null, status: "no_income_data", inputs_used: {}, warnings: [] };
+  const cashSaved = totalIncome - totalExpenses;
+  const effectiveSaved = includeCPF ? cashSaved + cpfContribution : cashSaved;
+  const effectiveIncome = includeCPF ? totalIncome + cpfContribution : totalIncome;
+  const value = safeDiv(effectiveSaved, effectiveIncome);
+  return { value, status: value >= 0.20 ? "healthy" : value >= 0.10 ? "adequate" : "low", inputs_used: { cashSaved, effectiveSaved, effectiveIncome, includeCPF }, warnings: [] };
+}
+function netWorthGrowthRate(netWorthSeries, periodMonths) {
+  periodMonths = periodMonths || 12;
+  if (!netWorthSeries || netWorthSeries.length < periodMonths + 1) {
+    return { value: null, status: "insufficient_data", inputs_used: {}, warnings: [`Need ${periodMonths + 1} months of balance sheet history`] };
+  }
+  const curr = netWorthSeries[netWorthSeries.length - 1].netWorth;
+  const past = netWorthSeries[netWorthSeries.length - 1 - periodMonths].netWorth;
+  if (past === 0) return { value: null, status: "undefined", inputs_used: { curr, past, periodMonths }, warnings: ["Starting net worth was zero"] };
+  const value = (curr - past) / Math.abs(past);
+  return { value, status: value > 0 ? "growing" : value === 0 ? "flat" : "declining", inputs_used: { curr, past, periodMonths }, warnings: [] };
+}
+function fixedVsVariableRatio(fixed, variable) {
+  const total = fixed + variable;
+  if (total === 0) return { value: null, status: "no_spend_data", inputs_used: { fixed, variable, total }, warnings: [] };
+  const value = fixed / total;
+  return { value, status: value <= 0.5 ? "flexible" : value <= 0.7 ? "moderate" : "rigid", inputs_used: { fixed, variable, total }, warnings: [] };
+}
+function housingCostRatio(monthlyHousingCost, grossMonthlyIncome) {
+  if (grossMonthlyIncome <= 0) return { value: null, status: "no_income_data", inputs_used: { monthlyHousingCost, grossMonthlyIncome }, warnings: [] };
+  const value = monthlyHousingCost / grossMonthlyIncome;
+  return { value, status: value <= 0.28 ? "healthy" : value <= 0.35 ? "caution" : "high", inputs_used: { monthlyHousingCost, grossMonthlyIncome }, warnings: [] };
+}
+function discretionarySpendTrend(monthlyDiscretionarySpend, windowMonths) {
+  windowMonths = windowMonths || 3;
+  if (!monthlyDiscretionarySpend || monthlyDiscretionarySpend.length < windowMonths * 2) {
+    return { value: null, status: "insufficient_data", inputs_used: {}, warnings: [`Need at least ${windowMonths * 2} months to compare trend`] };
+  }
+  const series = monthlyDiscretionarySpend.map(m => m.total);
+  const recentWindow = series.slice(-windowMonths);
+  const priorWindow = series.slice(-windowMonths * 2, -windowMonths);
+  const recentAvg = recentWindow.reduce((a, b) => a + b, 0) / windowMonths;
+  const priorAvg = priorWindow.reduce((a, b) => a + b, 0) / windowMonths;
+  if (priorAvg === 0) return { value: null, status: "undefined", inputs_used: { recentAvg, priorAvg, windowMonths }, warnings: [] };
+  const value = (recentAvg - priorAvg) / priorAvg;
+  return { value, status: value <= 0.05 ? "stable" : value <= 0.15 ? "rising" : "high_growth", inputs_used: { recentAvg, priorAvg, windowMonths }, warnings: [] };
+}
+function yearsToFI(currentInvestableNetWorth, annualSavingsAmount, annualEssentialExpenses, expectedRealReturn, withdrawalRate) {
+  expectedRealReturn = expectedRealReturn ?? 0.04;
+  withdrawalRate = withdrawalRate ?? 0.04;
+  const fiTarget = safeDiv(annualEssentialExpenses, withdrawalRate);
+  if (currentInvestableNetWorth >= fiTarget) {
+    return { value: 0, status: "achieved", inputs_used: { fiTarget, currentInvestableNetWorth }, warnings: [] };
+  }
+  if (annualSavingsAmount <= 0) {
+    return { value: Infinity, status: "not_progressing", inputs_used: { fiTarget, currentInvestableNetWorth, annualSavingsAmount }, warnings: ["No positive annual savings — cannot project FI date"] };
+  }
+  let balance = currentInvestableNetWorth;
+  let years = 0;
+  const maxYears = 100;
+  while (balance < fiTarget && years < maxYears) {
+    balance = balance * (1 + expectedRealReturn) + annualSavingsAmount;
+    years++;
+  }
+  return {
+    value: years >= maxYears ? null : years,
+    status: years <= 15 ? "on_track" : years <= 30 ? "moderate" : "long_horizon",
+    inputs_used: { fiTarget, currentInvestableNetWorth, annualSavingsAmount, expectedRealReturn, withdrawalRate },
+    warnings: years >= maxYears ? ["Projection exceeded 100 years — check inputs"] : []
+  };
+}
+// Splits one month's expenses into fixed (core) vs variable (non-core) totals
+// using each category's own `core` flag — reuses the same fixed/variable
+// distinction CORE_EXPENSE_KEYS already draws, no separate lookup table.
+function categorySplitForRecord(record, categories) {
+  let fixed = 0, variable = 0;
+  (categories.expense || []).filter(c => !c.archived).forEach(c => {
+    const v = catVal(record, c);
+    if (c.core) fixed += v; else variable += v;
+  });
+  return { fixed, variable };
+}
+// Assembles every Dashboard ratio card (the 12 metrics-spec.md functions,
+// plus the couple of pre-existing simple ratios wrapped in the same
+// { value, status, warnings } envelope) into one object keyed by RATIO_META's
+// `key`. Plain function, no React — the App-level call site is just data
+// assembly from already-computed state/memos.
+function buildDashboardMetrics({
+  current, currentRecord, records, trendData, categories,
+  grossMonthlyIncome, housingPayment, carPayment,
+  annualInsurancePremiumsTotal, annualInsurancePremiumsExclEndowmentsTotal,
+  householdLegacyCover, cpfContributionThisMonth, financialPlanning
+}) {
+  const annualGrossIncome = grossMonthlyIncome * 12;
+  const monthlyExpensesSeries = trendData.slice(-12).map(d => ({ month: d.month, total: d.expenses }));
+  const netWorthSeries = trendData.filter(d => d.netWorth !== null).map(d => ({ month: d.month, netWorth: d.netWorth }));
+  const last12Records = records.slice(-12);
+  const avgMonthlyEssential = last12Records.length
+    ? last12Records.reduce((a, r) => a + categorySplitForRecord(r, categories).fixed, 0) / last12Records.length
+    : 0;
+  const annualEssentialExpenses = avgMonthlyEssential * 12;
+  const currentSplit = categorySplitForRecord(currentRecord, categories);
+  const discretionarySeries = records.map(r => ({ month: r.month, total: categorySplitForRecord(r, categories).variable }));
+
+  const dti = debtToIncome([
+    { category: "mortgage", amount: housingPayment },
+    { category: "car", amount: carPayment }
+  ], grossMonthlyIncome);
+
+  const liquidToNetWorthValue = current.ratios.liquidToNetWorth;
+  const insPremiumLoadValue = safeDiv(annualInsurancePremiumsTotal, annualGrossIncome);
+
+  return {
+    emergencyFund: emergencyFundRatio(current.totalLiquidCash, monthlyExpensesSeries),
+    netEmergencyFund: emergencyFundRatio(current.currentLiquidCashNetCC, monthlyExpensesSeries),
+    liquidToNetWorth: {
+      value: liquidToNetWorthValue,
+      status: liquidToNetWorthValue >= 0.1 && liquidToNetWorthValue <= 0.2 ? "good" : liquidToNetWorthValue >= 0.05 && liquidToNetWorthValue <= 0.3 ? "watch" : "attention",
+      warnings: []
+    },
+    savingsRateCash: savingsRate(current.totalIncome, current.totalExpenses, cpfContributionThisMonth, false),
+    savingsRateCpf: savingsRate(current.totalIncome, current.totalExpenses, cpfContributionThisMonth, true),
+    netWorthGrowth: netWorthGrowthRate(netWorthSeries, 12),
+    yearsToFI: yearsToFI(
+      current.totalLiquidCash + current.totalInvestments,
+      (current.totalIncome - current.totalExpenses) * 12,
+      annualEssentialExpenses,
+      financialPlanning.expectedRealReturn,
+      financialPlanning.withdrawalRate
+    ),
+    debtToAsset: debtToAssetRatio(current.totalLiabilities, current.totalAssets),
+    housingDTI: { ...dti.housingDTI, warnings: dti.warnings },
+    totalDTI: { ...dti.totalDTI, warnings: dti.warnings },
+    insPremiumLoad: {
+      value: insPremiumLoadValue,
+      status: insPremiumLoadValue >= 0.03 && insPremiumLoadValue <= 0.05 ? "good" : insPremiumLoadValue >= 0.01 && insPremiumLoadValue <= 0.08 ? "watch" : "attention",
+      warnings: []
+    },
+    insPremiumLoadExclEnd: insuranceCostRatio(annualInsurancePremiumsExclEndowmentsTotal, annualGrossIncome),
+    lifeCoverage: lifeCoverageRatio(householdLegacyCover, annualGrossIncome),
+    incomeReplacementGap: incomeReplacementGap(
+      current.totalLiabilities,
+      financialPlanning.dependentSupportYears,
+      annualEssentialExpenses,
+      householdLegacyCover,
+      current.totalLiquidCash
+    ),
+    fixedVariable: fixedVsVariableRatio(currentSplit.fixed, currentSplit.variable),
+    housingCost: housingCostRatio(housingPayment, grossMonthlyIncome),
+    discretionaryTrend: discretionarySpendTrend(discretionarySeries, 3)
+  };
+}
 const RATIO_STATUS_COLORS = {
   good: "#0F5D52",
   watch: "#C88A2E",
-  attention: "#A6402B"
+  attention: "#A6402B",
+  neutral: "#8A8F98"
 };
+// Maps every status string the 12 metric functions (and the two simple
+// passthrough ratios below) can return onto the 4 colors above. Plain
+// "good"/"watch"/"attention"/"neutral" pass through unchanged so a metric
+// can either emit spec vocabulary (e.g. "healthy") or a tier directly.
+const STATUS_TIER = {
+  good: "good",
+  watch: "watch",
+  attention: "attention",
+  neutral: "neutral",
+  healthy: "good",
+  adequate: "watch",
+  low: "attention",
+  caution: "watch",
+  high: "attention",
+  covered: "good",
+  minor_gap: "watch",
+  significant_gap: "attention",
+  growing: "good",
+  flat: "watch",
+  declining: "attention",
+  achieved: "good",
+  on_track: "good",
+  moderate: "watch",
+  long_horizon: "attention",
+  not_progressing: "attention",
+  stable: "good",
+  rising: "watch",
+  high_growth: "attention",
+  flexible: "good",
+  rigid: "attention",
+  no_income_data: "neutral",
+  no_asset_data: "neutral",
+  no_spend_data: "neutral",
+  insufficient_data: "neutral",
+  undefined: "neutral"
+};
+const fmtYears = v => v === null || v === undefined ? DASH : v === Infinity ? "Not progressing" : v.toFixed(1) + " yrs";
 const RATIO_META = [{
-  key: "basicLiquidity",
-  label: "Basic liquidity ratio",
+  key: "emergencyFund",
+  label: "Emergency fund ratio",
   fmt: fmtRatio,
-  bench: "≥ 6.0x is good",
-  what: "How many months of expenses your liquid cash alone could cover.",
-  group: "liquidity",
-  status: v => v >= 6 ? "good" : v >= 3 ? "watch" : "attention"
+  bench: "≥ 6.0x healthy, ≥ 3.0x adequate",
+  source: "MAS/MoneySense Basic Financial Planning Guide (with ABS, FAA, LIA): 3–6 months of expenses; 12 months if income is irregular.",
+  what: "Liquid cash ÷ your worst rolling 3-month average spend across the last 12 months — a harder test than a flat monthly average, since it sizes your buffer to the worst stretch you've actually had.",
+  group: "liquidity"
 }, {
-  key: "netLiquidity",
-  label: "Net liquidity ratio",
+  key: "netEmergencyFund",
+  label: "Net emergency fund ratio",
   fmt: fmtRatio,
-  bench: "≥ 3.0x is adequate",
-  what: "Same as above, after subtracting what's owed on the credit card.",
-  group: "liquidity",
-  status: v => v >= 3 ? "good" : v >= 1.5 ? "watch" : "attention"
+  bench: "≥ 6.0x healthy, ≥ 3.0x adequate",
+  source: "Same MAS/MoneySense guideline as above (3–6 months of expenses).",
+  what: "Same worst-case test, after subtracting what's owed on short-term liabilities like the credit card.",
+  group: "liquidity"
 }, {
   key: "liquidToNetWorth",
   label: "Liquid assets / net worth",
   fmt: v => fmtPct(v),
   bench: "10–20% healthy",
+  source: "Classic financial-planning ratio (personal finance planning literature) — no official Singapore benchmark.",
   what: "How much of your total wealth is sitting in easily-accessible cash.",
-  group: "liquidity",
-  status: v => v >= 0.1 && v <= 0.2 ? "good" : v >= 0.05 && v <= 0.3 ? "watch" : "attention"
+  group: "liquidity"
 }, {
-  key: "savingsRatio",
-  label: "Savings ratio",
+  key: "savingsRateCash",
+  label: "Savings rate (cash)",
   fmt: v => fmtPct(v),
-  bench: "Target 28%",
-  what: "The share of your gross income you're actually keeping each month.",
-  group: "wealth",
-  status: v => v >= 0.28 ? "good" : v >= 0.15 ? "watch" : "attention"
+  bench: "≥ 20% healthy, ≥ 10% adequate",
+  source: "MoneySense: invest at least 10% of income (after CPF) for retirement/goals — the adequate floor here. 20% is common general budgeting guidance (e.g. the 50/30/20 rule), not an official SG figure.",
+  what: "Share of gross income actually kept this month, cash only.",
+  group: "wealth"
+}, {
+  key: "savingsRateCpf",
+  label: "Savings rate (incl. CPF)",
+  fmt: v => fmtPct(v),
+  bench: "≥ 20% healthy, ≥ 10% adequate",
+  source: "Same as Savings rate (cash) above.",
+  what: "Same, counting this month's CPF contributions (yours + employer's) as savings too.",
+  group: "wealth"
+}, {
+  key: "netWorthGrowth",
+  label: "Net worth growth (YoY)",
+  fmt: v => fmtPct(v),
+  bench: "Growing is healthy",
+  what: "Change in net worth over the trailing 12 months.",
+  group: "wealth"
+}, {
+  key: "yearsToFI",
+  label: "Years to Financial Independence",
+  fmt: fmtYears,
+  bench: "≤ 15 yrs on track",
+  source: "Assumes a 4% safe withdrawal rate (Bengen 1994 / the \"Trinity Study\") — change the assumption below if you'd rather use a different rate.",
+  what: "Years until investable net worth (excl. CPF and the property you live in), growing at your assumed return plus savings, covers essential expenses at your assumed withdrawal rate.",
+  group: "wealth"
 }, {
   key: "debtToAsset",
   label: "Debt to asset ratio",
   fmt: v => fmtPct(v),
-  bench: "< 40% healthy",
+  bench: "≤ 40% healthy, ≤ 60% caution",
+  source: "Classic financial-planning ratio (personal finance planning literature) — no official Singapore benchmark.",
   what: "How much of everything you own is financed by debt.",
-  group: "debt",
-  status: v => v < 0.4 ? "good" : v < 0.6 ? "watch" : "attention"
+  group: "debt"
 }, {
-  key: "debtServicing",
-  label: "Debt servicing ratio (car)",
+  key: "housingDTI",
+  label: "Housing DTI (MSR)",
   fmt: v => fmtPct(v),
-  bench: "MAS TDSR guideline < 60%",
-  what: "How much of your take-home pay goes to the car loan alone.",
-  group: "debt",
-  status: v => v < 0.6 ? "good" : v < 0.7 ? "watch" : "attention"
+  bench: "MAS MSR guideline ≤ 30%",
+  source: "MAS Mortgage Servicing Ratio (MSR) framework — caps housing loan repayments at 30% of gross monthly income for HDB flats and ECs bought directly from a developer.",
+  what: "Mortgage payment as a share of gross monthly income.",
+  group: "debt"
+}, {
+  key: "totalDTI",
+  label: "Total DTI (TDSR)",
+  fmt: v => fmtPct(v),
+  bench: "MAS TDSR ceiling ≤ 55%",
+  source: "MAS Total Debt Servicing Ratio (TDSR) framework — caps total debt repayments at 55% of gross monthly income for all property loans.",
+  what: "All debt repayments (mortgage + car) as a share of gross monthly income.",
+  group: "debt"
 }, {
   key: "insPremiumLoad",
   label: "Insurance premium load",
   fmt: v => fmtPct(v),
   bench: "benchmark 3–5%",
-  what: "The share of your income spent on insurance premiums, endowments included.",
-  group: "debt",
-  status: v => v >= 0.03 && v <= 0.05 ? "good" : v >= 0.01 && v <= 0.08 ? "watch" : "attention"
+  source: "No fixed ceiling for this one — bundled/investment-linked products (e.g. whole life, endowments) routinely exceed the protection-only guideline below, since they mix savings with cover. See Ins. load excl. endowments for the sourced figure.",
+  what: "Share of gross income spent on insurance premiums, endowments included.",
+  group: "debt"
 }, {
   key: "insPremiumLoadExclEnd",
   label: "Ins. load excl. endowments",
   fmt: v => fmtPct(v),
-  bench: "benchmark 2–3%",
-  what: "Same, stripping out endowment/investment-linked premiums to isolate pure protection cost.",
-  group: "debt",
-  status: v => v >= 0.02 && v <= 0.03 ? "good" : v >= 0.01 && v <= 0.05 ? "watch" : "attention"
+  bench: "≤ 10% healthy, ≤ 15% caution",
+  source: "MAS/MoneySense/LIA Basic Financial Planning Guide: spend at most 15% of income (after CPF) on insurance protection.",
+  what: "Same, protection-only premiums (endowments excluded) against gross income.",
+  group: "debt"
 }, {
-  key: "coverageToIncome",
-  label: "Coverage to income (primary earner)",
+  key: "lifeCoverage",
+  label: "Life coverage / income (household)",
   fmt: fmtRatio,
-  bench: "benchmark ≥ 10x",
-  what: "How many years of the primary earner's income the death/TPD payout would replace.",
-  group: "debt",
-  status: v => v >= 10 ? "good" : v >= 5 ? "watch" : "attention"
+  bench: "≥ 9x healthy, ≥ 4.5x adequate",
+  source: "Life Insurance Association (LIA) Singapore: recommends 9x annual income for Death & Total Permanent Disability coverage.",
+  what: "Household Death/TPD sum assured as a multiple of annual gross income.",
+  group: "debt"
+}, {
+  key: "incomeReplacementGap",
+  label: "Income replacement gap",
+  fmt: v => fmt(v),
+  bench: "≤ $0 covered",
+  source: "Built from the Life coverage and Emergency fund figures above — no separate official benchmark.",
+  what: "Outstanding debt plus years of essential expenses for dependents, minus existing life cover and liquid assets. Positive means underinsured by this amount.",
+  group: "debt"
+}, {
+  key: "fixedVariable",
+  label: "Fixed vs variable spend",
+  fmt: v => fmtPct(v),
+  bench: "≤ 50% flexible",
+  source: "No official Singapore benchmark — ~50% needs is a common reference point (e.g. the 50/30/20 rule).",
+  what: "Share of this month's expenses that are fixed (core) categories vs variable/discretionary — how much flexibility exists if income drops.",
+  group: "spending"
+}, {
+  key: "housingCost",
+  label: "Housing cost ratio",
+  fmt: v => fmtPct(v),
+  bench: "≤ 28% healthy (the \"28% rule\")",
+  source: "US mortgage-industry convention, not Singapore-specific. For an SG-official figure on this same payment, see Housing DTI (MSR) above (MAS caps it at 30%).",
+  what: "Mortgage payment as a share of gross monthly income.",
+  group: "spending"
+}, {
+  key: "discretionaryTrend",
+  label: "Discretionary spend trend",
+  fmt: v => fmtPct(v),
+  bench: "≤ 5% stable",
+  source: "Heuristic threshold (this app's own default, per metrics-spec.md) — no official benchmark.",
+  what: "Change in average discretionary (non-core) spend, last 3 months vs the 3 months before that — an early-warning signal for lifestyle creep.",
+  group: "spending"
 }];
 const RATIO_GROUPS = [{
   key: "liquidity",
@@ -561,6 +893,9 @@ const RATIO_GROUPS = [{
 }, {
   key: "wealth",
   label: "Wealth mix"
+}, {
+  key: "spending",
+  label: "Spending flexibility"
 }];
 const LABELS = {
   bankAccount1: "Bank Account 1",
@@ -776,6 +1111,7 @@ const blankHouseholdDoc = () => ({
   records: [],
   ledgerStart: monthStartISO(isoToMonthLabel(todayISO())),
   assumptions: DEFAULT_ASSUMPTIONS,
+  financialPlanning: DEFAULT_FINANCIAL_PLANNING,
   budgets: {},
   policies: [],
   recurring: [],
@@ -3361,6 +3697,7 @@ function App() {
   // derived from transactions and cannot be hand-edited.
   const [ledgerStart, setLedgerStart] = useState(null);
   const [assumptions, setAssumptions] = useState(DEFAULT_ASSUMPTIONS);
+  const [financialPlanning, setFinancialPlanning] = useState(DEFAULT_FINANCIAL_PLANNING);
   const [budgets, setBudgets] = useState({});
   const [policiesRaw, setPolicies] = useState([]);
   const policies = useMemo(() => reconcilePolicies(policiesRaw), [policiesRaw]);
@@ -3384,6 +3721,10 @@ function App() {
   const annualInsurancePremiumsTotal = useMemo(() => policies.filter(p => !isPolicyLapsed(p)).reduce((a, p) => a + (Number(p.amount) || 0) * occurrencesPerYear(p.interval, p.unit), 0), [policies]);
   const annualInsurancePremiumsExclEndowmentsTotal = useMemo(() => policies.filter(p => !isPolicyLapsed(p) && p.type !== "Endowment").reduce((a, p) => a + (Number(p.amount) || 0) * occurrencesPerYear(p.interval, p.unit), 0), [policies]);
   const primaryEarnerLegacyCover = useMemo(() => policies.filter(p => p.type === "Death/TPD" && p.person === primaryEarner && !isPolicyLapsed(p)).reduce((a, p) => a + (Number(p.coverage) || 0), 0), [policies, primaryEarner]);
+  // Whole-household Death/TPD cover (all family members, not just the primary
+  // earner) — used by the Life coverage ratio and Income replacement gap
+  // metrics, which are deliberately household-wide rather than primary-earner-only.
+  const householdLegacyCover = useMemo(() => policies.filter(p => p.type === "Death/TPD" && !isPolicyLapsed(p)).reduce((a, p) => a + (Number(p.coverage) || 0), 0), [policies]);
   const effectiveAssumptions = useMemo(() => ({
     ...assumptions,
     monthlyGrossIncome: (cpfSettings.person1Salary || 0) + (cpfSettings.person2Salary || 0),
@@ -3451,6 +3792,10 @@ function App() {
           setAssumptions({
             ...DEFAULT_ASSUMPTIONS,
             ...(p.assumptions || {})
+          });
+          setFinancialPlanning({
+            ...DEFAULT_FINANCIAL_PLANNING,
+            ...(p.financialPlanning || {})
           });
           setBudgets(p.budgets || {});
           setPolicies(p.policies || []);
@@ -3543,6 +3888,7 @@ function App() {
       records: patch.records ?? sealedRecords,
       ledgerStart: patch.ledgerStart ?? ledgerStart,
       assumptions: patch.assumptions ?? assumptions,
+      financialPlanning: patch.financialPlanning ?? financialPlanning,
       budgets: patch.budgets ?? budgets,
       policies: patch.policies ?? policies,
       recurring: patch.recurring ?? recurring,
@@ -3559,6 +3905,7 @@ function App() {
     if (patch.records) setSealedRecords(patch.records);
     if (patch.ledgerStart) setLedgerStart(patch.ledgerStart);
     if (patch.assumptions) setAssumptions(patch.assumptions);
+    if (patch.financialPlanning) setFinancialPlanning(patch.financialPlanning);
     if (patch.budgets) setBudgets(patch.budgets);
     if (patch.policies) setPolicies(patch.policies);
     if (patch.recurring) setRecurring(patch.recurring);
@@ -4309,6 +4656,21 @@ function App() {
   }, "Loading ledger\u2026");
   const current = derivedByMonth[selectedMonth];
   const currentRecord = records.find(r => r.month === selectedMonth);
+  const dashboardMetrics = current.hasBalances ? buildDashboardMetrics({
+    current,
+    currentRecord,
+    records,
+    trendData,
+    categories,
+    grossMonthlyIncome: effectiveAssumptions.monthlyGrossIncome,
+    housingPayment: housingAmort.payment || 0,
+    carPayment: carAmort.payment || 0,
+    annualInsurancePremiumsTotal,
+    annualInsurancePremiumsExclEndowmentsTotal,
+    householdLegacyCover,
+    cpfContributionThisMonth: (cpfResult.totalContribution || 0) + (cpfResultPerson2.totalContribution || 0),
+    financialPlanning
+  }) : null;
   const selectedIdx = records.findIndex(r => r.month === selectedMonth);
   const ytdRecords = records.slice(0, selectedIdx + 1);
   const trailingBaselineRecords = records.slice(Math.max(0, selectedIdx - 3), selectedIdx);
@@ -5124,8 +5486,10 @@ function App() {
       marginBottom: 6
     }
   }, g.label), RATIO_META.filter(m => m.group === g.key).map(m => {
-    const value = current.ratios[m.key];
-    const status = m.status(value);
+    const metric = dashboardMetrics[m.key];
+    const value = metric.value;
+    const status = STATUS_TIER[metric.status] || "watch";
+    const hasWarning = metric.warnings && metric.warnings.length > 0;
     return /*#__PURE__*/React.createElement("div", {
       key: m.key,
       onClick: () => setRatioHint(m.key),
@@ -5166,7 +5530,10 @@ function App() {
         textDecorationColor: "var(--hair-strong)",
         textUnderlineOffset: 3
       }
-    }, m.label)), /*#__PURE__*/React.createElement("span", {
+    }, m.label), hasWarning && /*#__PURE__*/React.createElement("span", {
+      title: metric.warnings.join(" "),
+      style: { fontSize: 11, color: "var(--warn, #C88A2E)", flexShrink: 0 }
+    }, "⚠")), /*#__PURE__*/React.createElement("span", {
       style: {
         fontFamily: "var(--mono)",
         fontSize: 12.5,
@@ -5174,7 +5541,7 @@ function App() {
         color: "var(--ink-1)",
         whiteSpace: "nowrap"
       }
-    }, m.fmt(value)));
+    }, value === null || value === undefined ? DASH : m.fmt(value)));
   }))))), ratioHint && /*#__PURE__*/React.createElement("div", {
     onClick: () => setRatioHint(null),
     style: {
@@ -5202,8 +5569,10 @@ function App() {
   }, (() => {
     const m = RATIO_META.find(rm => rm.key === ratioHint);
     if (!m) return null;
-    const value = current.ratios[m.key];
-    const status = m.status(value);
+    const metric = dashboardMetrics[m.key];
+    const value = metric.value;
+    const status = STATUS_TIER[metric.status] || "watch";
+    const warnings = metric.warnings || [];
     return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
@@ -5233,7 +5602,7 @@ function App() {
         color: "var(--ink-1)",
         marginBottom: 10
       }
-    }, m.fmt(value)), /*#__PURE__*/React.createElement("div", {
+    }, value === null || value === undefined ? DASH : m.fmt(value)), /*#__PURE__*/React.createElement("div", {
       style: {
         fontFamily: "var(--sans)",
         fontSize: 13,
@@ -5247,7 +5616,45 @@ function App() {
         fontSize: 12,
         color: "var(--ink-3)"
       }
-    }, "Benchmark: ", m.bench), /*#__PURE__*/React.createElement("button", {
+    }, "Benchmark: ", m.bench), m.source && /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 11,
+        color: "var(--ink-3)",
+        fontStyle: "italic",
+        marginTop: 4,
+        lineHeight: 1.4
+      }
+    }, "Source: ", m.source), warnings.length > 0 && /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 10,
+        padding: "8px 10px",
+        background: "#FBF3E4",
+        border: "1px solid #E8CFA0",
+        borderRadius: 6,
+        fontFamily: "var(--sans)",
+        fontSize: 11.5,
+        color: "#8A5A1E",
+        lineHeight: 1.4
+      }
+    }, warnings.join(" ")), m.key === "incomeReplacementGap" && /*#__PURE__*/React.createElement("div", {
+      style: { marginTop: 14, paddingTop: 12, borderTop: "1px solid var(--hair)" }
+    }, rc(NumberField, {
+      label: "Years of support for dependents",
+      value: financialPlanning.dependentSupportYears,
+      onChange: v => persistAll({ financialPlanning: { ...financialPlanning, dependentSupportYears: v } }),
+      hint: "Years until dependents reach financial independence — used to size the future-need portion of this gap."
+    })), m.key === "yearsToFI" && /*#__PURE__*/React.createElement("div", {
+      style: { marginTop: 14, paddingTop: 12, borderTop: "1px solid var(--hair)", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }
+    }, rc(NumberField, {
+      label: "Expected real return (%)",
+      value: financialPlanning.expectedRealReturn * 100,
+      onChange: v => persistAll({ financialPlanning: { ...financialPlanning, expectedRealReturn: v / 100 } })
+    }), rc(NumberField, {
+      label: "Withdrawal rate (%)",
+      value: financialPlanning.withdrawalRate * 100,
+      onChange: v => persistAll({ financialPlanning: { ...financialPlanning, withdrawalRate: v / 100 } })
+    })), /*#__PURE__*/React.createElement("button", {
       className: "btn-secondary",
       style: {
         marginTop: 16,
