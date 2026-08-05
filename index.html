@@ -898,6 +898,16 @@ const RATIO_GROUPS = [{
   key: "spending",
   label: "Spending flexibility"
 }];
+// Absence of a household's `dashboardMetricsConfig` field (not merely a falsy
+// value) means "never configured" — the Dashboard shows an empty-state CTA
+// instead of any ratio cards until the household explicitly visits Settings
+// > Metrics at least once. This is the working state that screen starts from
+// (everything on) so a first-time visit reads as "here's everything, prune
+// what you don't want" rather than an intimidating blank checklist.
+const fullDashboardMetricsConfig = () => ({
+  groups: Object.fromEntries(RATIO_GROUPS.map(g => [g.key, true])),
+  metrics: Object.fromEntries(RATIO_META.map(m => [m.key, true]))
+});
 const LABELS = {
   bankAccount1: "Bank Account 1",
   bankAccount2: "Bank Account 2",
@@ -3709,6 +3719,10 @@ function App() {
   const [ledgerStart, setLedgerStart] = useState(null);
   const [assumptions, setAssumptions] = useState(DEFAULT_ASSUMPTIONS);
   const [financialPlanning, setFinancialPlanning] = useState(DEFAULT_FINANCIAL_PLANNING);
+  // null = this household has never visited Settings > Metrics — the Dashboard
+  // shows a one-time empty-state CTA instead of ratio cards until they do,
+  // rather than defaulting to any particular set of cards being pre-chosen.
+  const [dashboardMetricsConfig, setDashboardMetricsConfig] = useState(null);
   const [budgets, setBudgets] = useState({});
   const [policiesRaw, setPolicies] = useState([]);
   const policies = useMemo(() => reconcilePolicies(policiesRaw), [policiesRaw]);
@@ -3808,6 +3822,7 @@ function App() {
             ...DEFAULT_FINANCIAL_PLANNING,
             ...(p.financialPlanning || {})
           });
+          if (p.dashboardMetricsConfig) setDashboardMetricsConfig(p.dashboardMetricsConfig);
           setBudgets(p.budgets || {});
           setPolicies(p.policies || []);
           // One-time, idempotent fold of the old Contracts register into Recurring — matched
@@ -3900,6 +3915,7 @@ function App() {
       ledgerStart: patch.ledgerStart ?? ledgerStart,
       assumptions: patch.assumptions ?? assumptions,
       financialPlanning: patch.financialPlanning ?? financialPlanning,
+      dashboardMetricsConfig: patch.dashboardMetricsConfig ?? dashboardMetricsConfig,
       budgets: patch.budgets ?? budgets,
       policies: patch.policies ?? policies,
       recurring: patch.recurring ?? recurring,
@@ -3917,6 +3933,7 @@ function App() {
     if (patch.ledgerStart) setLedgerStart(patch.ledgerStart);
     if (patch.assumptions) setAssumptions(patch.assumptions);
     if (patch.financialPlanning) setFinancialPlanning(patch.financialPlanning);
+    if (patch.dashboardMetricsConfig) setDashboardMetricsConfig(patch.dashboardMetricsConfig);
     if (patch.budgets) setBudgets(patch.budgets);
     if (patch.policies) setPolicies(patch.policies);
     if (patch.recurring) setRecurring(patch.recurring);
@@ -5481,91 +5498,75 @@ function App() {
       color: "var(--ink-3)",
       marginTop: 8
     }
-  }, "Your current target of ", fmt(assumptions.emergencyBufferTarget), " came from your Targets sheet (", assumptions.bufferMonths, " months of expenses). Average monthly expenses across the ", records.length, " months tracked so far are ", fmt(avgMonthlyExpenses), ", which at ", assumptions.bufferMonths, " months implies ", fmt(avgMonthlyExpenses * assumptions.bufferMonths), ". That average is inflated by the April and May confinement spending, so recalculating now would overshoot \u2014 worth revisiting once you have a few clean months."))), tab === "dashboard" && current.hasBalances && /*#__PURE__*/React.createElement(Section, {
-    title: "Financial health ratios",
-    eyebrow: selectedMonth
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-      gap: 10
+  }, "Your current target of ", fmt(assumptions.emergencyBufferTarget), " came from your Targets sheet (", assumptions.bufferMonths, " months of expenses). Average monthly expenses across the ", records.length, " months tracked so far are ", fmt(avgMonthlyExpenses), ", which at ", assumptions.bufferMonths, " months implies ", fmt(avgMonthlyExpenses * assumptions.bufferMonths), ". That average is inflated by the April and May confinement spending, so recalculating now would overshoot \u2014 worth revisiting once you have a few clean months."))), tab === "dashboard" && current.hasBalances && (() => {
+    const emptyCta = msg => rc(Section, { title: "Financial health ratios", eyebrow: selectedMonth },
+      rc("div", {
+        onClick: () => { setTab("settings"); setSettingsView("metrics"); },
+        style: {
+          background: "#fff",
+          border: "1px dashed var(--hair-strong)",
+          borderRadius: 10,
+          padding: "22px 18px",
+          textAlign: "center",
+          cursor: "pointer"
+        }
+      },
+        rc("div", { style: { fontFamily: "var(--serif)", fontSize: 15, color: "var(--ink-1)", marginBottom: 4 } }, "No ratios shown"),
+        rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)" } }, msg)
+      )
+    );
+    // Absence of dashboardMetricsConfig (not merely an empty one) means this
+    // household has never visited Settings > Metrics — one-time CTA.
+    if (!dashboardMetricsConfig) {
+      return emptyCta("Tap to choose which financial-health ratios you want to see here.");
     }
-  }, RATIO_GROUPS.map(g => /*#__PURE__*/React.createElement("div", {
-    key: g.key,
-    style: {
-      background: "#fff",
-      border: "1px solid var(--hair)",
-      borderRadius: 10,
-      padding: "10px 14px"
+    const cfg = dashboardMetricsConfig;
+    // `!== false` (not `=== true`) so a group/metric this app adds in a future
+    // update, which an already-configured household's saved doc has no entry
+    // for yet, defaults to visible instead of silently vanishing.
+    const visibleGroups = RATIO_GROUPS
+      .map(g => ({ group: g, metrics: RATIO_META.filter(m => m.group === g.key && cfg.metrics[m.key] !== false) }))
+      .filter(x => cfg.groups[x.group.key] !== false && x.metrics.length > 0);
+    if (!visibleGroups.length) {
+      return emptyCta("Every ratio is hidden right now — tap to turn some back on.");
     }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 11,
-      letterSpacing: "0.06em",
-      textTransform: "uppercase",
-      color: "var(--ink-3)",
-      fontWeight: 600,
-      marginBottom: 6
-    }
-  }, g.label), RATIO_META.filter(m => m.group === g.key).map(m => {
-    const metric = dashboardMetrics[m.key];
-    const value = metric.value;
-    const status = STATUS_TIER[metric.status] || "watch";
-    const hasWarning = metric.warnings && metric.warnings.length > 0;
-    return /*#__PURE__*/React.createElement("div", {
-      key: m.key,
-      onClick: () => setRatioHint(m.key),
-      style: {
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        gap: 8,
-        padding: "3px 0",
-        cursor: "pointer"
-      }
-    }, /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        alignItems: "center",
-        gap: 6,
-        minWidth: 0
-      }
-    }, /*#__PURE__*/React.createElement("span", {
-      style: {
-        width: 7,
-        height: 7,
-        borderRadius: "50%",
-        background: RATIO_STATUS_COLORS[status],
-        flexShrink: 0,
-        display: "inline-block"
-      }
-    }), /*#__PURE__*/React.createElement("span", {
-      style: {
-        fontFamily: "var(--sans)",
-        fontSize: 12,
-        color: "var(--ink-2)",
-        overflow: "hidden",
-        textOverflow: "ellipsis",
-        whiteSpace: "nowrap",
-        textDecoration: "underline",
-        textDecorationStyle: "dotted",
-        textDecorationColor: "var(--hair-strong)",
-        textUnderlineOffset: 3
-      }
-    }, m.label), hasWarning && /*#__PURE__*/React.createElement("span", {
-      title: metric.warnings.join(" "),
-      style: { fontSize: 11, color: "var(--warn, #C88A2E)", flexShrink: 0 }
-    }, "⚠")), /*#__PURE__*/React.createElement("span", {
-      style: {
-        fontFamily: "var(--mono)",
-        fontSize: 12.5,
-        fontWeight: 600,
-        color: "var(--ink-1)",
-        whiteSpace: "nowrap"
-      }
-    }, value === null || value === undefined ? DASH : m.fmt(value)));
-  }))))), ratioHint && /*#__PURE__*/React.createElement("div", {
+    return rc(Section, { title: "Financial health ratios", eyebrow: selectedMonth },
+      rc("div", {
+        style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10 }
+      }, visibleGroups.map(({ group: g, metrics }) => rc("div", {
+        key: g.key,
+        style: { background: "#fff", border: "1px solid var(--hair)", borderRadius: 10, padding: "10px 14px" }
+      },
+        rc("div", {
+          style: { fontFamily: "var(--sans)", fontSize: 11, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--ink-3)", fontWeight: 600, marginBottom: 8 }
+        }, g.label),
+        rc("div", {
+          style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(128px, 1fr))", gap: 6 }
+        }, metrics.map(m => {
+          const metric = dashboardMetrics[m.key];
+          const value = metric.value;
+          const status = STATUS_TIER[metric.status] || "watch";
+          const hasWarning = metric.warnings && metric.warnings.length > 0;
+          return rc("div", {
+            key: m.key,
+            onClick: () => setRatioHint(m.key),
+            style: { border: "1px solid var(--hair)", borderRadius: 8, padding: "8px 10px", cursor: "pointer", background: "#FAFAF8" }
+          },
+            rc("div", { style: { display: "flex", alignItems: "center", gap: 5, marginBottom: 4 } },
+              rc("span", { style: { width: 6, height: 6, borderRadius: "50%", background: RATIO_STATUS_COLORS[status], flexShrink: 0, display: "inline-block" } }),
+              rc("span", {
+                style: { fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }
+              }, m.label),
+              hasWarning && rc("span", { title: metric.warnings.join(" "), style: { fontSize: 10, color: "#C88A2E", flexShrink: 0 } }, "⚠")
+            ),
+            rc("div", { style: { fontFamily: "var(--mono)", fontSize: 15, fontWeight: 600, color: "var(--ink-1)" } },
+              value === null || value === undefined ? DASH : m.fmt(value)
+            )
+          );
+        }))
+      )))
+    );
+  })(), ratioHint && /*#__PURE__*/React.createElement("div", {
     onClick: () => setRatioHint(null),
     style: {
       position: "fixed",
@@ -7358,6 +7359,28 @@ function App() {
         style: {
           textAlign: "left",
           padding: 16,
+          minHeight: 96
+        },
+        onClick: () => setSettingsView("metrics")
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontWeight: 600,
+          fontSize: 14,
+          color: "var(--ink-1)",
+          marginBottom: 4
+        }
+      }, "Metrics"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 12,
+          color: "var(--ink-3)"
+        }
+      }, "Choose which Dashboard financial-health ratios and groups are shown.")), /*#__PURE__*/React.createElement("button", {
+        className: "btn-secondary",
+        style: {
+          textAlign: "left",
+          padding: 16,
           minHeight: 96,
           gridColumn: "1 / -1"
         },
@@ -7377,6 +7400,64 @@ function App() {
           color: "var(--ink-3)"
         }
       }, "Current household name, and switching to a different one."))));
+    }
+    if (settingsView === "metrics") {
+      // The working state this screen edits: whatever's saved, or — the very
+      // first time — everything on, so it reads as "here's everything, prune
+      // what you don't want" rather than a blank checklist. Nothing is
+      // written to Firestore until a checkbox is actually touched.
+      const editingConfig = dashboardMetricsConfig || fullDashboardMetricsConfig();
+      const toggleGroup = (key, checked) => persistAll({
+        dashboardMetricsConfig: { ...editingConfig, groups: { ...editingConfig.groups, [key]: checked } }
+      });
+      const toggleMetric = (key, checked) => persistAll({
+        dashboardMetricsConfig: { ...editingConfig, metrics: { ...editingConfig.metrics, [key]: checked } }
+      });
+      return /*#__PURE__*/React.createElement(Section, {
+        title: "Metrics",
+        eyebrow: "Settings",
+        right: /*#__PURE__*/React.createElement(IconBtn, {
+          onClick: () => setSettingsView("menu")
+        }, "← Back to Settings")
+      }, /*#__PURE__*/React.createElement("div", {
+        style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 16, lineHeight: 1.5 }
+      }, "Turn a whole group off, or pick individual ratios within a group you're keeping. A group with nothing checked inside it is skipped on the Dashboard automatically."),
+      RATIO_GROUPS.map(g => {
+        const groupOn = editingConfig.groups[g.key] !== false;
+        return rc(Card, { key: g.key, style: { marginBottom: 12 } },
+          rc("label", {
+            style: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer", marginBottom: 10 }
+          },
+            rc("input", {
+              type: "checkbox",
+              checked: groupOn,
+              onChange: e => toggleGroup(g.key, e.target.checked)
+            }),
+            rc("span", {
+              style: { fontFamily: "var(--serif)", fontSize: 15, color: "var(--ink-1)" }
+            }, g.label)
+          ),
+          rc("div", {
+            style: {
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+              gap: "4px 12px",
+              paddingLeft: 26,
+              opacity: groupOn ? 1 : 0.45
+            }
+          }, RATIO_META.filter(m => m.group === g.key).map(m => rc("label", {
+            key: m.key,
+            style: { display: "flex", alignItems: "center", gap: 6, fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", cursor: "pointer", padding: "2px 0" }
+          },
+            rc("input", {
+              type: "checkbox",
+              checked: editingConfig.metrics[m.key] !== false,
+              onChange: e => toggleMetric(m.key, e.target.checked)
+            }),
+            m.label
+          )))
+        );
+      }));
     }
     if (settingsView === "household") {
       return /*#__PURE__*/React.createElement(Section, {
