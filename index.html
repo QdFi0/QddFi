@@ -109,7 +109,8 @@
 const {
   useState,
   useEffect,
-  useMemo
+  useMemo,
+  useRef
 } = React;
 const {
   AreaChart,
@@ -1642,6 +1643,14 @@ function NumberField({
   disabled
 }) {
   const [focused, setFocused] = useState(false);
+  // Selecting the existing value (e.g. the default 0) on focus only sticks if the
+  // click that caused the focus doesn't get to finish — the browser's own mouseup
+  // handler otherwise re-collapses the selection to the click position right after,
+  // so the very first keystroke after clicking in still just appended instead of
+  // replacing. Suppressing that one mouseup (guarded by this ref so it only fires
+  // for the click that just focused the field, not later repositioning clicks)
+  // lets the select() from onFocus stick.
+  const justFocusedRef = useRef(false);
   const showHint = hint && (hintOnFocus ? focused : true);
   return /*#__PURE__*/React.createElement("label", {
     style: {
@@ -1658,10 +1667,15 @@ function NumberField({
     value: value,
     disabled: disabled,
     onFocus: e => {
-      // Select the existing value (e.g. the default 0) so the first
-      // keystroke replaces it instead of appending to it.
       e.target.select();
+      justFocusedRef.current = true;
       setFocused(true);
+    },
+    onMouseUp: e => {
+      if (justFocusedRef.current) {
+        e.preventDefault();
+        justFocusedRef.current = false;
+      }
     },
     onBlur: () => setFocused(false),
     onChange: e => onChange(e.target.value === "" ? 0 : parseFloat(e.target.value)),
@@ -2940,13 +2954,12 @@ function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate
   const catList = item.type === "income" ? categories.income : categories.expense;
   const canPost = !!item.account && (isTransfer ? !!item.toAccount : !!item.category) && Number(item.amount) > 0;
   const lapsed = !!item.lapseDate && item.lapseDate < todayISO();
-  const isPaused = item.active === false;
-  const overdue = !isPaused && !lapsed && canPost && item.nextDueDate <= todayISO();
+  // No Pause/Resume — an item is assumed live once it's complete (account +
+  // category/toAccount + amount); give it an End date instead to stop it for good.
+  const overdue = !lapsed && canPost && item.nextDueDate <= todayISO();
 
   const status = lapsed
     ? { label: "Ended", bg: "#F3F2EE", color: "var(--ink-3)" }
-    : isPaused
-    ? { label: "Paused", bg: "#F3F2EE", color: "var(--ink-3)" }
     : !canPost
     ? { label: "Incomplete — won't auto-post", bg: "#FBF3E6", color: "var(--amber)" }
     : overdue
@@ -2994,7 +3007,6 @@ function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate
         }, status.label),
         rc("span", { style: { fontFamily: "var(--mono)", fontSize: 13, fontWeight: 600, color: "var(--ink-1)" } },
           `${fmt(item.amount)} / ${item.interval} ${RECUR_UNIT_LABELS[item.unit]}`),
-        rc(IconBtn, { onClick: () => set({ active: isPaused }) }, isPaused ? "Resume" : "Pause"),
         rc("button", {
           className: "btn-secondary", style: { padding: "5px 10px", fontSize: 12 },
           onClick: () => set({ locked: false })
@@ -3013,7 +3025,6 @@ function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate
         }
       }, status.label),
       rc("div", { style: { display: "flex", gap: 6 } },
-        rc(IconBtn, { onClick: () => set({ active: isPaused }) }, isPaused ? "Resume" : "Pause"),
         rc(IconBtn, { onClick: () => onRemove(item.id) }, "Remove")
       )
     ),
@@ -4138,8 +4149,7 @@ function App() {
   // Built off policiesRaw (not the reconciled `policies`), so editing one field doesn't
   // freeze `active`'s derived canPost value into storage before the rest of the required
   // fields are filled in — otherwise a policy that becomes postable after this edit would
-  // stay stuck "Paused" until the user notices and clicks Resume by hand. Explicit
-  // Pause/Resume clicks still stick, since those always pass `active` in the patch itself.
+  // stay stuck "Incomplete" until the user happens to touch it again.
   const updatePolicy = (id, patch) => {
     const next = policiesRaw.map(p => p.id === id ? {
       ...p,
@@ -4231,6 +4241,18 @@ function App() {
       recurring: next
     });
   };
+  // Tracks the index of a just-added family member so its input can be
+  // auto-focused and pre-selected, letting the user immediately type over
+  // the "New member" placeholder name instead of having to clear it by hand.
+  const newFamilyMemberIndexRef = useRef(null);
+  const familyMemberInputRefs = useRef([]);
+  useEffect(() => {
+    const i = newFamilyMemberIndexRef.current;
+    if (i == null) return;
+    newFamilyMemberIndexRef.current = null;
+    const el = familyMemberInputRefs.current[i];
+    if (el) el.select();
+  }, [familyMembers]);
   const addFamilyMember = () => {
     let name = "New member";
     let n = 1;
@@ -4239,6 +4261,7 @@ function App() {
       name = `New member ${n}`;
     }
     const next = [...familyMembers, name];
+    newFamilyMemberIndexRef.current = next.length - 1;
     setFamilyMembers(next);
     persistAll({
       familyMembers: next
@@ -5879,11 +5902,7 @@ function App() {
     })));
   })(), tab === "insurance" && /*#__PURE__*/React.createElement(Section, {
     title: "Family coverage",
-    eyebrow: "Insurance",
-    right: /*#__PURE__*/React.createElement("button", {
-      className: "btn-primary",
-      onClick: addPolicy
-    }, "Add policy")
+    eyebrow: "Insurance"
   }, /*#__PURE__*/React.createElement(Card, {
     style: {
       marginBottom: 16
@@ -5913,6 +5932,8 @@ function App() {
   }, /*#__PURE__*/React.createElement("input", {
     type: "text",
     value: f,
+    ref: el => { familyMemberInputRefs.current[i] = el; },
+    onFocus: e => e.target.select(),
     onChange: e => renameFamilyMember(i, e.target.value),
     style: {
       fontFamily: "var(--sans)",
@@ -6023,7 +6044,9 @@ function App() {
       color: "var(--ink-3)",
       marginBottom: 10
     }
-  }, "Each policy premium posts to the ledger on its due date and feeds the Forecast automatically \u2014 no need to add it in Recurring yourself."), /*#__PURE__*/React.createElement("div", {
+  }, "Each policy premium posts to the ledger on its due date and feeds the Forecast automatically \u2014 no need to add it in Recurring yourself."),
+  rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13, color: "var(--ink-1)", marginBottom: 10 } }, "Policies"),
+  /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -6033,17 +6056,51 @@ function App() {
     const locked = !!p.locked;
     const lapsed = isPolicyLapsed(p);
     const canPost = !!p.account && !!p.category && Number(p.amount) > 0;
-    const isPaused = p.active === false;
-    const overdue = !isPaused && !lapsed && canPost && p.nextDueDate <= todayISO();
+    // No Pause/Resume for policies — a policy is assumed live the moment it's
+    // complete (account+category+premium filled in), so there's no separate
+    // "paused" state to show; incomplete is the only reason it wouldn't post.
+    const overdue = !lapsed && canPost && p.nextDueDate <= todayISO();
     const status = lapsed
       ? { label: "Lapsed", bg: "#F3F2EE", color: "var(--ink-3)" }
-      : isPaused
-      ? { label: "Paused", bg: "#F3F2EE", color: "var(--ink-3)" }
       : !canPost
       ? { label: "Incomplete \u2014 won't auto-post", bg: "#FBF3E6", color: "var(--amber)" }
       : overdue
       ? { label: "Posting on next visit", bg: "#FBEAF0", color: "var(--warn)" }
       : { label: `Next: ${isoToDayLabel(p.nextDueDate)}`, bg: "#E8F3EE", color: "var(--accent)" };
+    // Saved policies collapse to a compact row, same pattern as Recurring's
+    // locked items — keeps a household with several policies from turning into
+    // a wall of full forms the user has to scroll past to reach "Add policy".
+    if (locked) {
+      return rc("div", {
+        key: p.id,
+        style: {
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          padding: "10px 14px", background: "#FAF9F4", border: "1px solid var(--hair)",
+          borderRadius: 8, gap: 10, flexWrap: "wrap"
+        }
+      },
+        rc("div", { style: { minWidth: 0 } },
+          rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, fontWeight: 600, color: "var(--ink-1)" } },
+            `${p.insurer || "Untitled policy"} — ${p.person}`),
+          rc("div", { style: { fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)" } },
+            `${p.type}${p.product ? " · " + p.product : ""}`)),
+        rc("div", { style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } },
+          rc("span", {
+            style: {
+              fontFamily: "var(--sans)", fontSize: 11, fontWeight: 600,
+              padding: "3px 10px", borderRadius: 999, background: status.bg, color: status.color
+            }
+          }, status.label),
+          rc("span", { style: { fontFamily: "var(--mono)", fontSize: 13, fontWeight: 600, color: "var(--ink-1)" } },
+            `${fmt(p.amount)} / ${p.interval} ${RECUR_UNIT_LABELS[p.unit]}`),
+          rc("button", {
+            className: "btn-secondary", style: { padding: "5px 10px", fontSize: 12 },
+            onClick: () => togglePolicyLock(p.id)
+          }, "Edit"),
+          rc(IconBtn, { onClick: () => setConfirmRemovePolicyId(p.id) }, "Remove")
+        )
+      );
+    }
     return rc(Card, { key: p.id },
       rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 6 } },
         rc("span", {
@@ -6097,7 +6154,6 @@ function App() {
         rc(LedgerLabel, null, "Notes"),
         rc("input", { type: "text", value: p.notes || "", disabled: locked, placeholder: "optional", onChange: e => updatePolicy(p.id, { notes: e.target.value }), style: inputStyle })),
       rc("div", { style: { display: "flex", justifyContent: "flex-end", gap: 8 } },
-        rc(IconBtn, { onClick: () => updatePolicy(p.id, { active: isPaused }) }, isPaused ? "Resume" : "Pause"),
         rc("button", {
           className: locked ? "btn-secondary" : "btn-primary",
           disabled: !locked && !(p.insurer || "").trim(),
@@ -6105,13 +6161,12 @@ function App() {
           style: { padding: "5px 10px", fontSize: 12 }
         }, locked ? "Edit" : "Save"),
         rc(IconBtn, { onClick: () => setConfirmRemovePolicyId(p.id) }, "Remove")));
-  }))), tab === "recurring" && /*#__PURE__*/React.createElement(Section, {
+  })),
+  rc("div", { style: { display: "flex", justifyContent: "flex-end", marginTop: 12 } },
+    rc("button", { className: "btn-primary", onClick: addPolicy }, "Add policy"))
+  ), tab === "recurring" && /*#__PURE__*/React.createElement(Section, {
     title: "Recurring payments",
-    eyebrow: "Planning register",
-    right: /*#__PURE__*/React.createElement("button", {
-      className: "btn-primary",
-      onClick: addRecurring
-    }, "Add recurring item")
+    eyebrow: "Planning register"
   }, /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: "var(--sans)",
@@ -6119,7 +6174,7 @@ function App() {
       color: "var(--ink-3)",
       marginBottom: 14
     }
-  }, "Recurring items post a real transaction to the ledger on their due date, and project into the Forecast until then. Give each one an account and category so it has somewhere to post \u2014 items missing either stay marked \u201cIncomplete\u201d and won\u2019t post. Use Pause to stop one temporarily without losing its setup \u2014 or give it an End date so it stops on its own, e.g. a fixed-term contract. Insurance premiums post the same way, automatically, from the Insurance tab."), policies.filter(p => Number(p.amount) > 0 && !isPolicyLapsed(p)).length > 0 && /*#__PURE__*/React.createElement("div", {
+  }, "Recurring items post a real transaction to the ledger on their due date, and project into the Forecast until then. Give each one an account and category so it has somewhere to post \u2014 items missing either stay marked \u201cIncomplete\u201d and won\u2019t post. Give it an End date to stop it on its own, e.g. a fixed-term contract. Insurance premiums post the same way, automatically, from the Insurance tab."), policies.filter(p => Number(p.amount) > 0 && !isPolicyLapsed(p)).length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: 18
     }
@@ -6248,7 +6303,10 @@ function App() {
       fontSize: 13,
       color: "var(--ink-3)"
     }
-  }, "No recurring items yet."))), tab === "loans" && /*#__PURE__*/React.createElement(Section, {
+  }, "No recurring items yet.")),
+  rc("div", { style: { display: "flex", justifyContent: "flex-end", marginTop: 12 } },
+    rc("button", { className: "btn-primary", onClick: addRecurring }, "Add recurring item"))
+  ), tab === "loans" && /*#__PURE__*/React.createElement(Section, {
     title: "Loan amortisation",
     eyebrow: "Housing and car",
     right: /*#__PURE__*/React.createElement("div", {
