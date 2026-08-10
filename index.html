@@ -3593,7 +3593,7 @@ function LoginGate({ children }) {
         background: "transparent", border: "none", cursor: "pointer", padding: 4
       }
     }, "Sign out (" + (user.email || "") + ")"),
-    children
+    React.cloneElement(children, { user })
   );
 }
 
@@ -3672,15 +3672,55 @@ function HouseholdChooser({ onChoose }) {
 const PRIMARY_TABS = [["dashboard", "Dashboard"], ["daily", "Daily ledger"]];
 const OTHER_TABS = [["budgets", "Budgets"], ["insurance", "Insurance"], ["recurring", "Recurring"], ["loans", "Loans"], ["cpf", "CPF"], ["tax", "Tax"], ["forecast", "Forecast"], ["history", "History"], ["settings", "Settings"]];
 
-function App() {
+function App({ user } = {}) {
   const [householdName, setHouseholdName] = useState(() => localStorage.getItem("householdName") || "");
   if (householdName && !LEDGER_DOC) resolveHousehold(householdName);
+  // Remembers which household this signed-in account belongs to, keyed by uid,
+  // so a fresh device/browser (empty localStorage) resolves straight to the
+  // account's existing household instead of risking "Create a new household"
+  // spinning up an accidental, orphaned duplicate.
+  const rememberAccountHousehold = name => {
+    if (!user) return;
+    db.collection("users").doc(user.uid).set({ householdName: name, email: user.email || "" }, { merge: true }).catch(() => {});
+  };
+  const [householdLookupDone, setHouseholdLookupDone] = useState(!user);
+  const [accountHousehold, setAccountHousehold] = useState(null);
+  useEffect(() => {
+    if (!user) { setHouseholdLookupDone(true); return; }
+    let cancelled = false;
+    db.collection("users").doc(user.uid).get().then(doc => {
+      if (cancelled) return;
+      const mapped = normalizeHouseholdName(doc.exists ? doc.data().householdName : "");
+      if (mapped && mapped !== householdName) {
+        if (!householdName) {
+          // Nothing local yet — adopt the account's known household directly.
+          localStorage.setItem("householdName", mapped);
+          resolveHousehold(mapped);
+          setHouseholdName(mapped);
+        } else {
+          // This device is already on a different household — surface it
+          // rather than switching out from under an open session.
+          setAccountHousehold(mapped);
+        }
+      } else if (!mapped && householdName) {
+        // Pre-existing device from before this mapping existed: seed it from
+        // whatever's already active locally, so the next device this account
+        // signs into (which may be on a different household) gets flagged
+        // instead of silently diverging forever.
+        rememberAccountHousehold(householdName);
+      }
+      setHouseholdLookupDone(true);
+    }).catch(() => setHouseholdLookupDone(true));
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, [user && user.uid]);
   const chooseHousehold = raw => {
     const name = normalizeHouseholdName(raw);
     if (!name) return;
     localStorage.setItem("householdName", name);
     resolveHousehold(name);
     setHouseholdName(name);
+    rememberAccountHousehold(name);
   };
   // Switching households needs a fresh subscription to a different Firestore
   // doc/subcollection, so a full reload is simpler and safer than trying to
@@ -3689,6 +3729,7 @@ function App() {
     const name = normalizeHouseholdName(raw);
     if (!name || name === householdName) return;
     localStorage.setItem("householdName", name);
+    rememberAccountHousehold(name);
     location.reload();
   };
   const [householdSwitchInput, setHouseholdSwitchInput] = useState("");
@@ -4691,7 +4732,12 @@ function App() {
     }
     return rows;
   }, [records, effectiveAssumptions, recurring, policies, derivedByMonth, housingLoan, carLoan, housingAmort, carAmort]);
-  if (!householdName) return /*#__PURE__*/React.createElement(HouseholdChooser, { onChoose: chooseHousehold });
+  if (!householdName) {
+    if (!householdLookupDone) return /*#__PURE__*/React.createElement("div", {
+      style: { fontFamily: "sans-serif", padding: 40, color: "#3D4552" }
+    }, "Checking your account…");
+    return /*#__PURE__*/React.createElement(HouseholdChooser, { onChoose: chooseHousehold });
+  }
   if (loading || !records) return /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: "IBM Plex Sans, sans-serif",
@@ -4795,7 +4841,31 @@ function App() {
         select, input[type=date] { font-family: var(--sans); font-size: 13px; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--hair-strong); background: #fff; color: var(--ink-1); }
         .qty-keypad { display: none; }
         @media (max-width: 640px), (pointer: coarse) { .qty-keypad { display: grid; } }
-      `), syncError && /*#__PURE__*/React.createElement("div", {
+      `), accountHousehold && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 16,
+      fontFamily: "var(--sans)",
+      fontSize: 12.5,
+      color: "var(--ink-2)",
+      background: "#FBF3E6",
+      border: "1px solid var(--hair-strong)",
+      borderRadius: 8,
+      padding: "10px 14px",
+      lineHeight: 1.5,
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      flexWrap: "wrap",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("span", null,
+      `This account's saved household is "${accountHousehold}", but this browser is showing "${householdName}". `,
+      "You're likely seeing different data on different devices."),
+    /*#__PURE__*/React.createElement("button", {
+      className: "btn-secondary",
+      onClick: () => switchHousehold(accountHousehold)
+    }, `Switch to "${accountHousehold}"`)),
+    syncError && /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: 16,
       fontFamily: "var(--sans)",
