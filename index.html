@@ -4879,9 +4879,17 @@ function App({ user } = {}) {
   const resetHousehold = async () => {
     try {
       const snap = await TXN_COL.get();
-      if (snap.docs.length) {
+      const docs = snap.docs;
+      // A single Firestore write batch can hold at most 500 mutations — a household
+      // with more transactions than that (easily reached after months of daily entries
+      // plus the recurring/insurance/loan auto-posting engines) would blow past one
+      // batch's limit and reject the whole commit, aborting the reset before the
+      // household doc below is even touched, leaving every account/category/balance
+      // exactly as it was. Chunk deletes into batches of 500 so this scales regardless
+      // of how many transactions the household has accumulated.
+      for (let i = 0; i < docs.length; i += 500) {
         const batch = db.batch();
-        snap.docs.forEach(d => batch.delete(d.ref));
+        docs.slice(i, i + 500).forEach(d => batch.delete(d.ref));
         await batch.commit();
       }
       await LEDGER_DOC.set(blankHouseholdDoc());
