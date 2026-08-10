@@ -2527,8 +2527,13 @@ const acctLabel = (registry, key) => {
 const txnEffect = (t, categories) => {
   const NEUTRAL = { kind: "neutral", amount: 0 };
   if (!t || t.voided) return NEUTRAL;
-  if (t.type === "income") return { kind: "income", amount: Number(t.amount) || 0 };
-  if (t.type === "expense") return { kind: "expense", amount: Number(t.amount) || 0 };
+  // `credit` (set only by the import wizard today) flips an expense/income entry the
+  // other way — e.g. a refund the source file flagged as income, mapped onto an expense
+  // category so it nets against that category's spending instead of counting as separate
+  // income. `amount` itself always stays a positive magnitude in storage (same invariant
+  // the manual entry form enforces); the sign flip is applied here and in computeBalances.
+  if (t.type === "income") return { kind: "income", amount: (t.credit ? -1 : 1) * (Number(t.amount) || 0) };
+  if (t.type === "expense") return { kind: "expense", amount: (t.credit ? -1 : 1) * (Number(t.amount) || 0) };
   if (t.type === "adjustment") {
     const cat = t.category;
     if (!cat || cat === "balanceAdjustment") return NEUTRAL;
@@ -2561,8 +2566,8 @@ const computeBalances = (registry, opening, txns, asOf) => {
     }
     const amt = Number(t.amount) || 0;
     const from = acctByKey(registry, t.account);
-    if (t.type === "expense" && from) bal[t.account] += storedDelta(from.kind, -1, amt);
-    if (t.type === "income" && from) bal[t.account] += storedDelta(from.kind, +1, amt);
+    if (t.type === "expense" && from) bal[t.account] += storedDelta(from.kind, t.credit ? +1 : -1, amt);
+    if (t.type === "income" && from) bal[t.account] += storedDelta(from.kind, t.credit ? -1 : +1, amt);
     if (t.type === "transfer") {
       const to = acctByKey(registry, t.toAccount);
       if (from) bal[t.account] += storedDelta(from.kind, -1, amt);
@@ -3169,7 +3174,15 @@ function SetupWizard({
   const [categorySplitEnabled, setCategorySplitEnabled] = useState(false);
   const [accountMap, setAccountMap] = useState({});
   const [categoryMap, setCategoryMap] = useState({});
+  // Raw category value -> "expense"/"income" override — lets the user decide which
+  // umbrella a category belongs to independent of what the source file's Type column
+  // or amount sign said any given row was (see effectiveCategoryType below).
+  const [categoryTypeMap, setCategoryTypeMap] = useState({});
   const [subInputs, setSubInputs] = useState({});
+  // Raw category value -> whether its "peek at real rows" panel is expanded. Collapsed
+  // by default (same pattern as Filters/Loan events elsewhere) so a file with dozens of
+  // categories doesn't turn the mapping step into a wall of sample data.
+  const [previewOpenFor, setPreviewOpenFor] = useState({});
   const [importSummary, setImportSummary] = useState(null);
   const [balanceInputs, setBalanceInputs] = useState({});
   const [asOfDate, setAsOfDate] = useState(todayISO());
@@ -3196,6 +3209,7 @@ function SetupWizard({
         setTypeValueMap({});
         setAccountMap({});
         setCategoryMap({});
+        setCategoryTypeMap({});
         setStep("mapping");
       } catch (err) {
         console.error(err);
@@ -3293,18 +3307,42 @@ function SetupWizard({
   );
   const categoryDelimiter = useMemo(() => detectCategoryDelimiter(categoryValuesRaw), [categoryValuesRaw]);
 
+  // One entry per distinct raw category value regardless of which type its rows
+  // resolved to — a category can genuinely appear as both (e.g. "Food" mostly expense
+  // rows plus a few refunds the source file flagged as income). expenseCount/incomeCount
+  // drive the default target type (majority wins); effectiveCategoryType lets the user
+  // override it per value, so the source file's per-row direction never forces which of
+  // the household's own categories (or which pool) an imported category lands in.
   const distinctCategories = useMemo(() => {
-    const byType = { expense: new Map(), income: new Map() };
+    const m = new Map();
     intermediateRows.forEach(r => {
       if (r.isExpense !== true && r.isExpense !== false) return;
       if (!r.categoryRaw) return;
-      const bucket = r.isExpense ? byType.expense : byType.income;
-      bucket.set(r.categoryRaw, (bucket.get(r.categoryRaw) || 0) + 1);
+      const entry = m.get(r.categoryRaw) || { value: r.categoryRaw, expenseCount: 0, incomeCount: 0 };
+      if (r.isExpense) entry.expenseCount++; else entry.incomeCount++;
+      m.set(r.categoryRaw, entry);
     });
-    return {
-      expense: [...byType.expense.entries()].map(([value, count]) => ({ value, count })),
-      income: [...byType.income.entries()].map(([value, count]) => ({ value, count }))
-    };
+    return [...m.values()];
+  }, [intermediateRows]);
+
+  const naturalCategoryType = entry => entry.expenseCount >= entry.incomeCount ? "expense" : "income";
+  const effectiveCategoryType = value => {
+    if (categoryTypeMap[value]) return categoryTypeMap[value];
+    const entry = distinctCategories.find(e => e.value === value);
+    return entry ? naturalCategoryType(entry) : "expense";
+  };
+
+  // Raw category value -> its actual source rows (file order), so the Categories step can
+  // show a "peek at real rows" sample without re-scanning intermediateRows per category
+  // on every render.
+  const categoryRowsIndex = useMemo(() => {
+    const idx = new Map();
+    intermediateRows.forEach(r => {
+      if (!r.categoryRaw) return;
+      if (!idx.has(r.categoryRaw)) idx.set(r.categoryRaw, []);
+      idx.get(r.categoryRaw).push(r);
+    });
+    return idx;
   }, [intermediateRows]);
 
   const accountPool = useMemo(
@@ -3318,10 +3356,9 @@ function SetupWizard({
     return match ? { action: "existing", key: match.key } : { action: "createLiquid", key: null };
   };
 
-  const effectiveCategoryMapping = (rawValue, isExpenseType) => {
-    const stateKey = (isExpenseType ? "expense" : "income") + "|" + rawValue;
-    if (categoryMap[stateKey]) return categoryMap[stateKey];
-    const pool = (isExpenseType ? categories.expense : categories.income).filter(c => !c.archived);
+  const effectiveCategoryMapping = rawValue => {
+    if (categoryMap[rawValue]) return categoryMap[rawValue];
+    const pool = categories[effectiveCategoryType(rawValue)].filter(c => !c.archived);
     const lookupLabel = categorySplitEnabled && categoryDelimiter
       ? splitCategoryValue(rawValue, categoryDelimiter).group
       : rawValue;
@@ -3357,40 +3394,41 @@ function SetupWizard({
     // brand-new category being created in this same pass instead gets its subcat pushed
     // straight into its own `subcats` array below, no separate bucket needed for that case.
     const categorySubAdditions = {};
+    // Keyed by raw category value only now (not type|value) — a value has exactly one
+    // target category, and that target's own type (carried alongside key/subKey here)
+    // is what a row's written transaction type follows, not the row's source direction.
     const resolvedCategory = {};
-    ["expense", "income"].forEach(type => {
-      distinctCategories[type].forEach(({ value }) => {
-        const stateKey = type + "|" + value;
-        const m = effectiveCategoryMapping(value, type === "expense");
-        if (m.action === "skip") { resolvedCategory[stateKey] = null; return; }
-        const split = categorySplitEnabled && categoryDelimiter
-          ? splitCategoryValue(value, categoryDelimiter)
-          : { group: value, sub: "" };
-        // A typed subInput always wins over the delimiter-derived guess — the input field
-        // itself is pre-filled from split.sub, so leaving it alone still uses the guess.
-        const subRaw = (subInputs[stateKey] !== undefined ? subInputs[stateKey] : split.sub || "").trim();
-        if (m.action === "existing") {
-          let subKey = "";
-          if (subRaw) {
-            const targetCat = categories[type].find(c => c.key === m.key);
-            const existingSub = targetCat && fuzzyLabelMatch(subRaw, targetCat.subcats || []);
-            if (existingSub) subKey = existingSub.key;
-            else {
-              subKey = `sub_${uid()}`;
-              (categorySubAdditions[m.key] = categorySubAdditions[m.key] || []).push({ key: subKey, label: subRaw });
-            }
+    distinctCategories.forEach(({ value }) => {
+      const type = effectiveCategoryType(value);
+      const m = effectiveCategoryMapping(value);
+      if (m.action === "skip") { resolvedCategory[value] = null; return; }
+      const split = categorySplitEnabled && categoryDelimiter
+        ? splitCategoryValue(value, categoryDelimiter)
+        : { group: value, sub: "" };
+      // A typed subInput always wins over the delimiter-derived guess — the input field
+      // itself is pre-filled from split.sub, so leaving it alone still uses the guess.
+      const subRaw = (subInputs[value] !== undefined ? subInputs[value] : split.sub || "").trim();
+      if (m.action === "existing") {
+        let subKey = "";
+        if (subRaw) {
+          const targetCat = categories[type].find(c => c.key === m.key);
+          const existingSub = targetCat && fuzzyLabelMatch(subRaw, targetCat.subcats || []);
+          if (existingSub) subKey = existingSub.key;
+          else {
+            subKey = `sub_${uid()}`;
+            (categorySubAdditions[m.key] = categorySubAdditions[m.key] || []).push({ key: subKey, label: subRaw });
           }
-          resolvedCategory[stateKey] = { key: m.key, subKey };
-          return;
         }
-        const key = `cat_${uid()}`;
-        const subcats = subRaw ? [{ key: `sub_${uid()}`, label: subRaw }] : [];
-        const item = type === "expense"
-          ? { key, label: split.group, group: "variable", color: "#5F5E5A", subcats, archived: false, core: false }
-          : { key, label: split.group, subcats, archived: false, core: false, protected: false, cpfLinked: false };
-        newCategoriesByType[type].push(item);
-        resolvedCategory[stateKey] = { key, subKey: subcats[0] ? subcats[0].key : "" };
-      });
+        resolvedCategory[value] = { type, key: m.key, subKey };
+        return;
+      }
+      const key = `cat_${uid()}`;
+      const subcats = subRaw ? [{ key: `sub_${uid()}`, label: subRaw }] : [];
+      const item = type === "expense"
+        ? { key, label: split.group, group: "variable", color: "#5F5E5A", subcats, archived: false, core: false }
+        : { key, label: split.group, subcats, archived: false, core: false, protected: false, cpfLinked: false };
+      newCategoriesByType[type].push(item);
+      resolvedCategory[value] = { type, key, subKey: subcats[0] ? subcats[0].key : "" };
     });
 
     const txnsToWrite = [];
@@ -3401,14 +3439,20 @@ function SetupWizard({
       if (r.isExpense !== true && r.isExpense !== false) { skippedCount++; return; }
       const accountKey = r.accountRaw ? resolvedAccountKey[r.accountRaw] : null;
       if (!accountKey) { skippedCount++; return; }
-      const catStateKey = (r.isExpense ? "expense" : "income") + "|" + r.categoryRaw;
-      const catResolved = r.categoryRaw ? resolvedCategory[catStateKey] : null;
+      const catResolved = r.categoryRaw ? resolvedCategory[r.categoryRaw] : null;
       if (!catResolved) { skippedCount++; return; }
+      // The category's own type (chosen in the Categories step) decides where the row
+      // posts — not the row's source Type column / amount sign. When the two disagree
+      // (a refund the source flagged as income, mapped onto an expense category) it
+      // posts as a credit: same category, netted against it and against the account
+      // balance, instead of becoming a separate income line. See txnEffect/computeBalances.
+      const credit = catResolved.type === "expense" ? !r.isExpense : r.isExpense;
       txnsToWrite.push({
         id: "imp_" + hashRow(r.raw),
         date: r.date,
-        type: r.isExpense ? "expense" : "income",
+        type: catResolved.type,
         amount: r.amountAbs,
+        credit,
         account: accountKey,
         toAccount: null,
         category: catResolved.key,
@@ -3421,7 +3465,7 @@ function SetupWizard({
     });
 
     return { newAccountsByGroup, newCategoriesByType, categorySubAdditions, txnsToWrite, skippedCount, unparseableCount };
-  }, [distinctAccounts, distinctCategories, accountMap, categoryMap, subInputs, categorySplitEnabled, categoryDelimiter, intermediateRows, accountPool, categories]);
+  }, [distinctAccounts, distinctCategories, accountMap, categoryMap, categoryTypeMap, subInputs, categorySplitEnabled, categoryDelimiter, intermediateRows, accountPool, categories]);
 
   const dayBeforeISO = iso => {
     const d = new Date(iso + "T00:00:00");
@@ -3647,19 +3691,49 @@ function SetupWizard({
         rc("button", { className: "btn-primary", onClick: () => setStep("categories") }, "Next")));
   } else if (step === "categories") {
     const renderCatGroup = (type, label) => {
-      const list = distinctCategories[type];
+      // Membership is driven by effectiveCategoryType, not a fixed original bucket — a
+      // category shows up exactly once, under whichever pool it currently resolves to,
+      // and the Type selector below lets the user move it to the other pool.
+      const list = distinctCategories.filter(e => effectiveCategoryType(e.value) === type);
       if (!list.length) return null;
       const pool = categories[type].filter(c => !c.archived);
       return rc("div", { key: type, style: { marginBottom: 18 } },
         rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13, marginBottom: 8 } }, label),
-        list.map(({ value, count }) => {
-          const m = effectiveCategoryMapping(value, type === "expense");
-          const stateKey = type + "|" + value;
+        list.map(entry => {
+          const { value, expenseCount, incomeCount } = entry;
+          const m = effectiveCategoryMapping(value);
           const split = categorySplitEnabled && categoryDelimiter ? splitCategoryValue(value, categoryDelimiter) : { group: value, sub: "" };
-          const subValue = subInputs[stateKey] !== undefined ? subInputs[stateKey] : split.sub;
-          return rc("div", { key: value, style: { display: "flex", gap: 10, alignItems: "center", marginBottom: 8, paddingBottom: 8, borderBottom: "1px solid var(--hair)", flexWrap: "wrap" } },
-            rc("div", { style: { flex: "1 1 200px", fontFamily: "var(--mono)", fontSize: 12.5 } },
-              split.group, rc("span", { style: { color: "var(--ink-3)" } }, ` (${count})`)),
+          const subValue = subInputs[value] !== undefined ? subInputs[value] : split.sub;
+          const mixed = expenseCount > 0 && incomeCount > 0;
+          const totalRows = expenseCount + incomeCount;
+          const sampleRows = (categoryRowsIndex.get(value) || []).slice(0, 5);
+          const previewOpen = !!previewOpenFor[value];
+          return rc("div", { key: value, style: { marginBottom: 8, paddingBottom: 8, borderBottom: "1px solid var(--hair)" } },
+          rc("div", { style: { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" } },
+            rc("div", { style: { flex: "1 1 200px" } },
+              rc("div", { style: { fontFamily: "var(--mono)", fontSize: 12.5 } }, split.group),
+              rc("div", { style: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" } },
+                rc("span", { style: { fontFamily: "var(--sans)", fontSize: 11, color: mixed ? "#A6402B" : "var(--ink-3)" } },
+                  mixed ? `${expenseCount} as expense, ${incomeCount} as income in your file` : `${totalRows} row${totalRows === 1 ? "" : "s"}`),
+                rc("button", {
+                  type: "button",
+                  onClick: () => setPreviewOpenFor(p => ({ ...p, [value]: !p[value] })),
+                  style: { background: "none", border: "none", padding: 0, cursor: "pointer", fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", textDecoration: "underline" }
+                }, previewOpen ? "Hide sample rows" : "Peek at rows"))),
+            rc("select", {
+              value: type,
+              title: "Which of your umbrellas this category belongs to — independent of how the file flagged each row",
+              style: { ...inputStyle, flex: "0 1 110px" },
+              onChange: e => {
+                const nextType = e.target.value;
+                setCategoryTypeMap(tm => ({ ...tm, [value]: nextType }));
+                // The prior pick almost certainly belongs to the old pool — clear it so
+                // effectiveCategoryMapping re-guesses fresh against the new one.
+                setCategoryMap(cm => { const next = { ...cm }; delete next[value]; return next; });
+              }
+            },
+              rc("option", { value: "expense" }, "Expense"),
+              rc("option", { value: "income" }, "Income")),
             rc("select", {
               value: m.action === "existing" ? m.key : m.action,
               style: { ...inputStyle, flex: "1 1 220px" },
@@ -3667,7 +3741,7 @@ function SetupWizard({
                 const v = e.target.value;
                 setCategoryMap(cm => ({
                   ...cm,
-                  [stateKey]: v === "create" || v === "skip" ? { action: v, key: null, subKey: "" } : { action: "existing", key: v, subKey: "" }
+                  [value]: v === "create" || v === "skip" ? { action: v, key: null, subKey: "" } : { action: "existing", key: v, subKey: "" }
                 }));
               }
             },
@@ -3677,9 +3751,20 @@ function SetupWizard({
               rc("option", { value: "skip" }, "Skip these rows")),
             m.action !== "skip" && rc("input", {
               type: "text", value: subValue, placeholder: "Subcategory (optional)",
-              onChange: e => setSubInputs(si => ({ ...si, [stateKey]: e.target.value })),
+              onChange: e => setSubInputs(si => ({ ...si, [value]: e.target.value })),
               style: { ...inputStyle, flex: "1 1 160px" }
-            }));
+            })),
+          previewOpen && rc("div", { style: { marginTop: 6, padding: 8, background: "var(--paper-2, #F4F1EA)", borderRadius: 6 } },
+            sampleRows.map(r => rc("div", {
+              key: r.rowIndex,
+              style: { display: "flex", gap: 10, fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-2)", padding: "2px 0" }
+            },
+              rc("span", { style: { fontFamily: "var(--mono)", color: "var(--ink-3)", flex: "0 0 76px" } }, r.date || "—"),
+              rc("span", { style: { fontFamily: "var(--mono)", flex: "0 0 68px", textAlign: "right" } }, r.amountAbs != null ? r.amountAbs.toFixed(2) : "—"),
+              rc("span", { style: { flex: "0 0 60px", color: "var(--ink-3)" } }, r.isExpense === true ? "expense" : r.isExpense === false ? "income" : "—"),
+              rc("span", { style: { flex: "1 1 auto", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, r.payeeRaw || r.noteRaw || "—"))),
+            totalRows > sampleRows.length && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 10.5, color: "var(--ink-3)", marginTop: 2 } },
+              `+ ${totalRows - sampleRows.length} more`)));
         }));
     };
     body = rc("div", null,
@@ -3701,6 +3786,18 @@ function SetupWizard({
     const newSubcatsN = plan.newCategoriesByType.expense.reduce((a, c) => a + c.subcats.length, 0)
       + plan.newCategoriesByType.income.reduce((a, c) => a + c.subcats.length, 0)
       + Object.values(plan.categorySubAdditions).reduce((a, list) => a + list.length, 0);
+    // t.category/t.subcat are internal keys (existing, or freshly minted "cat_…"/"sub_…"
+    // ones for categories/subcats this same import will create) — resolve them against
+    // both the household's existing categories and the not-yet-persisted plan output so
+    // the preview shows real labels instead of opaque keys.
+    const previewCatLookup = (catKey, subKey) => {
+      const pool = [...categories.expense, ...categories.income, ...plan.newCategoriesByType.expense, ...plan.newCategoriesByType.income];
+      const c = pool.find(x => x.key === catKey);
+      if (!c) return { cat: catKey || "", sub: "" };
+      const extraSubs = plan.categorySubAdditions[catKey] || [];
+      const s = [...(c.subcats || []), ...extraSubs].find(x => x.key === subKey);
+      return { cat: c.label, sub: s ? s.label : "" };
+    };
     body = rc("div", null,
       rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-1)", marginBottom: 4 } },
         `${plan.txnsToWrite.length} transaction${plan.txnsToWrite.length === 1 ? "" : "s"} will be imported`),
@@ -3712,14 +3809,18 @@ function SetupWizard({
       rc("div", { style: { maxHeight: 260, overflowY: "auto", border: "1px solid var(--hair)", borderRadius: 8, marginBottom: 16 } },
         rc("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12 } },
           rc("thead", null, rc("tr", null,
-            ["Date", "Type", "Amount", "Category", "Note"].map(h =>
+            ["Date", "Type", "Amount", "Category", "Sub-category", "Note"].map(h =>
               rc("th", { key: h, style: { textAlign: "left", padding: "6px 8px", borderBottom: "1px solid var(--hair)", position: "sticky", top: 0, background: "#fff" } }, h)))),
-          rc("tbody", null, previewRows.map((t, i) => rc("tr", { key: i },
-            rc("td", { style: { padding: "4px 8px", fontFamily: "var(--mono)" } }, t.date),
-            rc("td", { style: { padding: "4px 8px" } }, t.type),
-            rc("td", { style: { padding: "4px 8px", fontFamily: "var(--mono)" } }, t.amount.toFixed(2)),
-            rc("td", { style: { padding: "4px 8px" } }, t.category),
-            rc("td", { style: { padding: "4px 8px", color: "var(--ink-3)" } }, t.note))))
+          rc("tbody", null, previewRows.map((t, i) => {
+            const cl = previewCatLookup(t.category, t.subcat);
+            return rc("tr", { key: i },
+              rc("td", { style: { padding: "4px 8px", fontFamily: "var(--mono)" } }, t.date),
+              rc("td", { style: { padding: "4px 8px" } }, t.type + (t.credit ? " (credit)" : "")),
+              rc("td", { style: { padding: "4px 8px", fontFamily: "var(--mono)" } }, t.amount.toFixed(2)),
+              rc("td", { style: { padding: "4px 8px" } }, cl.cat),
+              rc("td", { style: { padding: "4px 8px", color: "var(--ink-3)" } }, cl.sub),
+              rc("td", { style: { padding: "4px 8px", color: "var(--ink-3)" } }, t.note));
+          }))
         )),
       rc("div", { style: { display: "flex", justifyContent: "space-between" } },
         rc("button", { className: "btn-secondary", disabled: busy, onClick: () => setStep("categories") }, "Back"),
@@ -4223,13 +4324,18 @@ function TransactionsTab({
                 const destName = acctLabel(registry, t.toAccount);
                 const isAdj = t.type === "adjustment";
                 const amt = isAdj ? Number(t.storedDelta) || 0 : Number(t.amount) || 0;
+                // `credit` (import-only today) flips an expense/income entry the other
+                // way — e.g. a refund netting against an expense category — while `amount`
+                // itself stays stored as a positive magnitude, so the sign/colour flip
+                // lives here at render time rather than in the stored number.
                 const colour = isAdj ? (amt >= 0 ? "#2F6B4F" : "#A6402B")
-                  : t.type === "income" ? "#2F6B4F"
+                  : t.type === "income" ? (t.credit ? "#A6402B" : "#2F6B4F")
+                  : t.type === "expense" ? (t.credit ? "#2F6B4F" : "var(--ink-1)")
                   : t.type === "transfer" ? "var(--ink-3)" : "var(--ink-1)";
                 const signed = isAdj
                   ? (amt >= 0 ? "+" : "−") + fmt(Math.abs(amt), 2)
-                  : t.type === "income" ? "+" + fmt(amt, 2)
-                  : t.type === "expense" ? "−" + fmt(amt, 2)
+                  : t.type === "income" ? (t.credit ? "−" : "+") + fmt(amt, 2)
+                  : t.type === "expense" ? (t.credit ? "+" : "−") + fmt(amt, 2)
                   : fmt(amt, 2);
                 return rc("div", {
                   key: t.id,
@@ -4244,7 +4350,7 @@ function TransactionsTab({
                           ? c.cat + (c.sub ? " — " + c.sub : "") + "  (adjustment)"
                           : "Balance adjustment")
                         : t.type === "transfer" ? `Transfer → ${destName || "?"}`
-                        : c.cat + (c.sub ? " — " + c.sub : "")),
+                        : c.cat + (c.sub ? " — " + c.sub : "") + (t.credit ? "  (credit)" : "")),
                     rc("div", {
                       style: {
                         fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)",
