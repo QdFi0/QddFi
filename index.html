@@ -2811,6 +2811,191 @@ const exportXlsx = (rows, filename) => {
   XLSX.writeFile(wb, filename + ".xlsx");
 };
 
+/* ══════════════════════════════════════════════════════════════════
+   FIRST-RUN IMPORT — parsing + matching helpers
+   Deliberately source-agnostic: nothing here is keyed to any one
+   export app's column names or category vocabulary. Every guess made
+   below is only ever a pre-filled default in SetupWizard's UI — the
+   user always sees a real <select>/<input> and can override it.
+   ══════════════════════════════════════════════════════════════════ */
+
+// Reads any workbook the already-loaded xlsx.full.min.js can parse (.xls/.xlsx/.csv),
+// auto-selecting the sheet with the most non-blank data rows (skips an empty "Debts"-
+// style second sheet automatically) rather than prompting for a sheet up front.
+const parseImportWorkbook = arrayBuffer => {
+  if (typeof XLSX === "undefined") return null;
+  const wb = XLSX.read(arrayBuffer, { type: "array", cellDates: true });
+  let best = null;
+  wb.SheetNames.forEach(name => {
+    const aoa = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: "" });
+    const headers = (aoa[0] || []).map(h => String(h == null ? "" : h).trim());
+    const rows = aoa.slice(1).filter(r => r.some(c => c !== "" && c != null));
+    if (!best || rows.length > best.rows.length) best = { sheetName: name, headers, rows };
+  });
+  return best;
+};
+
+const pad2 = n => String(n).padStart(2, "0");
+
+// Matches numeric a/b/c dates with any of . / - as separator. Deliberately narrow —
+// just the shape that's genuinely common (and genuinely ambiguous between countries)
+// in tabular exports, not a general-purpose date parser.
+const NUMERIC_DATE_RE = /^(\d{1,4})[\/\-.](\d{1,2})[\/\-.](\d{1,4})/;
+
+// A date column is ambiguous (DD/MM vs MM/DD) only when some value's first two
+// components could each be either a day or a month (both <=12) AND the year is the
+// third component — "2026/07/31" is never ambiguous, "03/04/2026" always is. Checked
+// once per column so the wizard can ask a single question instead of guessing per row.
+const isDateColumnAmbiguous = values => values.some(v => {
+  const m = String(v == null ? "" : v).trim().match(NUMERIC_DATE_RE);
+  if (!m) return false;
+  const [, a, b, c] = m;
+  if (a.length === 4 || c.length !== 4) return false;
+  return Number(a) >= 1 && Number(a) <= 12 && Number(b) >= 1 && Number(b) <= 12;
+});
+
+// formatHint: "DMY" or "MDY" (default) — only consulted for the ambiguous a/b/YYYY shape;
+// a value where one component is unambiguously >12 self-corrects regardless of the hint.
+const parseFlexibleDate = (v, formatHint) => {
+  if (v == null || v === "") return null;
+  if (v instanceof Date) {
+    if (isNaN(v.getTime())) return null;
+    return `${v.getFullYear()}-${pad2(v.getMonth() + 1)}-${pad2(v.getDate())}`;
+  }
+  const s = String(v).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const m = s.match(NUMERIC_DATE_RE);
+  if (m) {
+    const [, a, b, c] = m;
+    if (a.length === 4) return `${a}-${pad2(b)}-${pad2(c)}`;
+    const year = c.length === 4 ? c : pad2(c);
+    const yearFull = c.length === 4 ? c : `20${year}`;
+    let [month, day] = formatHint === "DMY" ? [b, a] : [a, b];
+    if (Number(month) > 12) [month, day] = [day, month];
+    return `${yearFull}-${pad2(month)}-${pad2(day)}`;
+  }
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  return null;
+};
+
+const parseFlexibleAmount = v => {
+  if (v == null || v === "") return null;
+  if (typeof v === "number") return isNaN(v) ? null : v;
+  let s = String(v).trim();
+  if (!s) return null;
+  const negParen = /^\(.*\)$/.test(s);
+  if (negParen) s = s.slice(1, -1);
+  s = s.replace(/[^0-9.\-]/g, "");
+  if (!s || s === "-" || s === ".") return null;
+  const n = Number(s);
+  if (isNaN(n)) return null;
+  return negParen ? -Math.abs(n) : n;
+};
+
+// Ordered, most-specific-first keyword lists per target field, tried exact-match-first
+// across every header, then startsWith, then includes. Each header can only be claimed
+// once, so e.g. "custom_category" never also satisfies plain "category" once the real
+// "category" header has already matched. Debit/credit are checked before the generic
+// "amount" so a bank-style export with both a plain Amount column and separate
+// Debit/Credit columns still resolves sensibly either way.
+const COLUMN_FIELD_KEYWORDS = [
+  ["date", ["date"]],
+  ["debit", ["debit", "withdrawal", "money out", "paid out", "outflow"]],
+  ["credit", ["credit", "deposit", "money in", "paid in", "inflow"]],
+  ["amount", ["amount", "value", "sum"]],
+  ["type", ["type", "direction"]],
+  ["account", ["account", "wallet", "source"]],
+  ["category", ["category"]],
+  ["payee", ["payee", "merchant", "vendor", "description"]],
+  ["note", ["note", "memo", "notes", "comment"]]
+];
+
+const guessColumnMap = headers => {
+  const claimed = new Set();
+  const norm = h => String(h || "").trim().toLowerCase();
+  const map = {};
+  COLUMN_FIELD_KEYWORDS.forEach(([field, keywords]) => {
+    let found = null;
+    for (const pass of ["exact", "startsWith", "includes"]) {
+      if (found) break;
+      for (const kw of keywords) {
+        const hit = headers.find(h => !claimed.has(h) &&
+          (pass === "exact" ? norm(h) === kw : pass === "startsWith" ? norm(h).startsWith(kw) : norm(h).includes(kw)));
+        if (hit) { found = hit; break; }
+      }
+    }
+    if (found) { map[field] = found; claimed.add(found); }
+  });
+  return map;
+};
+
+const normalizeForMatch = s => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+// Best-effort string similarity only — deliberately not a hardcoded synonym table (no
+// baked-in "Eat Out -> F&B" style rule). That kind of table quietly encodes one source
+// app's vocabulary; every non-obvious mapping stays the user's explicit call.
+const fuzzyLabelMatch = (value, existingItems) => {
+  const target = normalizeForMatch(value);
+  if (!target) return null;
+  const exact = existingItems.find(it => normalizeForMatch(it.label) === target);
+  if (exact) return exact;
+  return existingItems.find(it => {
+    const n = normalizeForMatch(it.label);
+    return n && (target.includes(n) || n.includes(target));
+  }) || null;
+};
+
+const CATEGORY_SPLIT_DELIMS = [":", "/", ">"];
+
+// Looks for one delimiter that splits a clear majority of distinct category values into
+// exactly two non-empty parts — a real "Group: Category" hierarchy, not a category that
+// just happens to contain a colon once. Returns the delimiter, or null.
+const detectCategoryDelimiter = distinctValues => {
+  if (!distinctValues.length) return null;
+  let bestDelim = null, bestScore = 0;
+  CATEGORY_SPLIT_DELIMS.forEach(delim => {
+    const hits = distinctValues.filter(v => {
+      const parts = String(v || "").split(delim);
+      return parts.length === 2 && parts[0].trim() && parts[1].trim();
+    }).length;
+    if (hits > bestScore) { bestScore = hits; bestDelim = delim; }
+  });
+  return bestScore >= Math.max(2, Math.ceil(distinctValues.length * 0.6)) ? bestDelim : null;
+};
+
+const splitCategoryValue = (value, delim) => {
+  const parts = String(value || "").split(delim);
+  return parts.length === 2
+    ? { group: parts[0].trim(), sub: parts[1].trim() }
+    : { group: String(value || "").trim(), sub: "" };
+};
+
+const EXPENSE_TYPE_HINTS = ["expense", "debit", "outflow", "withdrawal", "spend", "paid out"];
+const INCOME_TYPE_HINTS = ["income", "credit", "inflow", "deposit", "earn", "paid in"];
+
+// null = ambiguous, the wizard asks the user once per distinct value.
+const inferTypeFromValue = raw => {
+  const v = String(raw || "").trim().toLowerCase();
+  if (!v) return null;
+  if (EXPENSE_TYPE_HINTS.some(h => v.includes(h))) return "expense";
+  if (INCOME_TYPE_HINTS.some(h => v.includes(h))) return "income";
+  return null;
+};
+
+// Deterministic FNV-1a hash over a row's raw source values (not the mapped/parsed
+// result) — used only so an accidental double-submit of "Confirm import" can't create
+// duplicate transactions (same id -> same Firestore doc -> overwrite, not a duplicate).
+const hashRow = rawRowArray => {
+  const str = rawRowArray.map(v => v instanceof Date ? v.toISOString() : String(v == null ? "" : v)).join("");
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
+};
+
 /* ───────────── small shared inputs ───────────── */
 
 function LedgerLabel({ children }) {
@@ -2950,6 +3135,605 @@ function ReconcileDialog({ account, computed, onCancel, onConfirm, categories })
         onClick: () => onConfirm({ storedDelta: diff, note, date, category: counterCat || "balanceAdjustment" })
       }, "Record adjustment")
     )
+  ));
+}
+
+/* ───────────── first-run setup wizard ───────────── */
+
+// Tracker shows 5 stages, not the 6 internal step values — "welcome" (file picker)
+// and "mapping" (column mapping) are both part of one visible "Import" stage so the
+// tracker doesn't get crowded with two bubbles for what's really one file-upload flow.
+const SETUP_TRACKER_STAGES = ["Import", "Account mapping", "Categories mapping", "Review", "Balances"];
+const SETUP_STEP_GROUP = { welcome: 0, mapping: 0, accounts: 1, categories: 2, preview: 3, balances: 4 };
+const SETUP_STEP_COPY = {
+  welcome: { title: "Import", instruction: "Upload a file to bring in historical transactions, or start fresh." },
+  mapping: { title: "Import", instruction: "Match each column in your file to what QddFi needs." },
+  accounts: { title: "Account mapping", instruction: "Match each account found in your file to one of yours, or create a new one." },
+  categories: { title: "Categories mapping", instruction: "Match each category found in your file to one of yours, or create a new one." },
+  preview: { title: "Review", instruction: "Check the counts and preview, then confirm to import." },
+  balances: { title: "Balances", instruction: "Enter what each account actually holds today." }
+};
+
+function SetupWizard({
+  registry, categories, accounts, familyMembers, txns, liveBalances,
+  onSaveTxn, onReconcileAccount, persistAll, onClose, onFinish
+}) {
+  const [step, setStep] = useState("welcome");
+  const [parsed, setParsed] = useState(null);
+  const [parseError, setParseError] = useState("");
+  const [columnMap, setColumnMap] = useState({});
+  const [amountMode, setAmountMode] = useState("single");
+  const [negativeIsExpense, setNegativeIsExpense] = useState(true);
+  const [dateFormatHint, setDateFormatHint] = useState("MDY");
+  const [typeValueMap, setTypeValueMap] = useState({});
+  const [categorySplitEnabled, setCategorySplitEnabled] = useState(false);
+  const [accountMap, setAccountMap] = useState({});
+  const [categoryMap, setCategoryMap] = useState({});
+  const [importSummary, setImportSummary] = useState(null);
+  const [balanceInputs, setBalanceInputs] = useState({});
+  const [asOfDate, setAsOfDate] = useState(todayISO());
+  const [busy, setBusy] = useState(false);
+
+  const setCol = (field, value) => setColumnMap(m => ({ ...m, [field]: value }));
+
+  const onFile = e => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    setParseError("");
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const result = parseImportWorkbook(ev.target.result);
+        if (!result || !result.rows.length) {
+          setParseError("Couldn't find any data rows in that file.");
+          return;
+        }
+        const guess = guessColumnMap(result.headers);
+        setParsed(result);
+        setColumnMap(guess);
+        setAmountMode((guess.debit || guess.credit) && !guess.amount ? "debitCredit" : "single");
+        setTypeValueMap({});
+        setAccountMap({});
+        setCategoryMap({});
+        setStep("mapping");
+      } catch (err) {
+        console.error(err);
+        setParseError("Couldn't read that file — check it's a valid CSV/XLS/XLSX export.");
+      }
+    };
+    reader.readAsArrayBuffer(f);
+  };
+
+  const dateAmbiguous = useMemo(() => {
+    if (!parsed || !columnMap.date) return false;
+    const idx = parsed.headers.indexOf(columnMap.date);
+    if (idx < 0) return false;
+    return isDateColumnAmbiguous(parsed.rows.map(r => r[idx]));
+  }, [parsed, columnMap.date]);
+
+  const intermediateRows = useMemo(() => {
+    if (!parsed) return [];
+    const idx = h => (h ? parsed.headers.indexOf(h) : -1);
+    const dateIdx = idx(columnMap.date);
+    const amountIdx = idx(columnMap.amount);
+    const debitIdx = idx(columnMap.debit);
+    const creditIdx = idx(columnMap.credit);
+    const typeIdx = idx(columnMap.type);
+    const accountIdx = idx(columnMap.account);
+    const categoryIdx = idx(columnMap.category);
+    const payeeIdx = idx(columnMap.payee);
+    const noteIdx = idx(columnMap.note);
+    return parsed.rows.map((row, i) => {
+      const date = dateIdx >= 0 ? parseFlexibleDate(row[dateIdx], dateFormatHint) : null;
+      let amountAbs = null, isExpense = null;
+      if (amountMode === "debitCredit") {
+        const d = debitIdx >= 0 ? parseFlexibleAmount(row[debitIdx]) : null;
+        const c = creditIdx >= 0 ? parseFlexibleAmount(row[creditIdx]) : null;
+        if (d) { amountAbs = Math.abs(d); isExpense = true; }
+        else if (c) { amountAbs = Math.abs(c); isExpense = false; }
+      } else {
+        const raw = amountIdx >= 0 ? parseFlexibleAmount(row[amountIdx]) : null;
+        if (raw != null) {
+          amountAbs = Math.abs(raw);
+          if (typeIdx >= 0) {
+            const rawType = String(row[typeIdx] ?? "").trim();
+            const override = typeValueMap[rawType];
+            const inferred = inferTypeFromValue(rawType);
+            if (override === "skip") isExpense = "skip";
+            else if (override) isExpense = override === "expense";
+            else if (inferred) isExpense = inferred === "expense";
+            else isExpense = null;
+          } else {
+            isExpense = negativeIsExpense ? raw < 0 : raw >= 0;
+          }
+        }
+      }
+      return {
+        rowIndex: i,
+        raw: row,
+        date,
+        amountAbs,
+        isExpense,
+        accountRaw: accountIdx >= 0 ? (String(row[accountIdx] ?? "").trim() || "__ALL__") : "__ALL__",
+        categoryRaw: categoryIdx >= 0 ? String(row[categoryIdx] ?? "").trim() : "",
+        payeeRaw: payeeIdx >= 0 ? String(row[payeeIdx] ?? "").trim() : "",
+        noteRaw: noteIdx >= 0 ? String(row[noteIdx] ?? "").trim() : ""
+      };
+    });
+  }, [parsed, columnMap, amountMode, negativeIsExpense, dateFormatHint, typeValueMap]);
+
+  const distinctTypeValues = useMemo(() => {
+    if (amountMode !== "single" || !columnMap.type || !parsed) return [];
+    const idx = parsed.headers.indexOf(columnMap.type);
+    if (idx < 0) return [];
+    const seen = new Map();
+    parsed.rows.forEach(r => {
+      const v = String(r[idx] ?? "").trim();
+      if (!v) return;
+      seen.set(v, (seen.get(v) || 0) + 1);
+    });
+    return [...seen.entries()].map(([value, count]) => ({ value, count, inferred: inferTypeFromValue(value) }));
+  }, [amountMode, columnMap.type, parsed]);
+
+  const ambiguousTypeValues = distinctTypeValues.filter(t => !t.inferred && !typeValueMap[t.value]);
+
+  const distinctAccounts = useMemo(() => {
+    const m = new Map();
+    intermediateRows.forEach(r => {
+      if (!r.accountRaw) return;
+      m.set(r.accountRaw, (m.get(r.accountRaw) || 0) + 1);
+    });
+    return [...m.entries()].map(([value, count]) => ({ value, count }));
+  }, [intermediateRows]);
+
+  const categoryValuesRaw = useMemo(
+    () => [...new Set(intermediateRows.map(r => r.categoryRaw).filter(Boolean))],
+    [intermediateRows]
+  );
+  const categoryDelimiter = useMemo(() => detectCategoryDelimiter(categoryValuesRaw), [categoryValuesRaw]);
+
+  const distinctCategories = useMemo(() => {
+    const byType = { expense: new Map(), income: new Map() };
+    intermediateRows.forEach(r => {
+      if (r.isExpense !== true && r.isExpense !== false) return;
+      if (!r.categoryRaw) return;
+      const bucket = r.isExpense ? byType.expense : byType.income;
+      bucket.set(r.categoryRaw, (bucket.get(r.categoryRaw) || 0) + 1);
+    });
+    return {
+      expense: [...byType.expense.entries()].map(([value, count]) => ({ value, count })),
+      income: [...byType.income.entries()].map(([value, count]) => ({ value, count }))
+    };
+  }, [intermediateRows]);
+
+  const accountPool = useMemo(
+    () => registry.filter(a => a.group === "liquidCash" || a.group === "investments" || a.group === "property"),
+    [registry]
+  );
+
+  const effectiveAccountMapping = value => {
+    if (accountMap[value]) return accountMap[value];
+    const match = fuzzyLabelMatch(value === "__ALL__" ? "" : value, accountPool);
+    return match ? { action: "existing", key: match.key } : { action: "createLiquid", key: null };
+  };
+
+  const effectiveCategoryMapping = (rawValue, isExpenseType) => {
+    const stateKey = (isExpenseType ? "expense" : "income") + "|" + rawValue;
+    if (categoryMap[stateKey]) return categoryMap[stateKey];
+    const pool = (isExpenseType ? categories.expense : categories.income).filter(c => !c.archived);
+    const lookupLabel = categorySplitEnabled && categoryDelimiter
+      ? splitCategoryValue(rawValue, categoryDelimiter).group
+      : rawValue;
+    const match = fuzzyLabelMatch(lookupLabel, pool);
+    return match ? { action: "existing", key: match.key, subKey: "" } : { action: "create", key: null, subKey: "" };
+  };
+
+  const plan = useMemo(() => {
+    const newAccountsByGroup = { liquidCash: [], investments: [], property: [] };
+    const resolvedAccountKey = {};
+    distinctAccounts.forEach(({ value }) => {
+      const m = effectiveAccountMapping(value);
+      if (m.action === "skip") { resolvedAccountKey[value] = null; return; }
+      if (m.action === "existing") { resolvedAccountKey[value] = m.key; return; }
+      const key = `acct_${uid()}`;
+      const label = value === "__ALL__" ? "Imported account" : value;
+      // registry keys are "<group>.<raw key>" (buildRegistry, index.html) — resolvedAccountKey
+      // feeds straight into each transaction's `account` field, so it must match that prefixed
+      // form, not the raw key stored in accounts[group][].key, or the transaction ends up
+      // pointing at nothing once this new account is merged in and re-derived into registry.
+      if (m.action === "createCreditCard") {
+        newAccountsByGroup.property.push({ key, label, type: "liability", shortTermLiability: true, owner: "Joint" });
+        resolvedAccountKey[value] = `property.${key}`;
+      } else {
+        const group = m.action === "createInvest" ? "investments" : "liquidCash";
+        newAccountsByGroup[group].push({ key, label, owner: "Joint" });
+        resolvedAccountKey[value] = `${group}.${key}`;
+      }
+    });
+
+    const newCategoriesByType = { expense: [], income: [] };
+    const resolvedCategory = {};
+    ["expense", "income"].forEach(type => {
+      distinctCategories[type].forEach(({ value }) => {
+        const stateKey = type + "|" + value;
+        const m = effectiveCategoryMapping(value, type === "expense");
+        if (m.action === "skip") { resolvedCategory[stateKey] = null; return; }
+        if (m.action === "existing") { resolvedCategory[stateKey] = { key: m.key, subKey: m.subKey || "" }; return; }
+        const split = categorySplitEnabled && categoryDelimiter
+          ? splitCategoryValue(value, categoryDelimiter)
+          : { group: value, sub: "" };
+        const key = `cat_${uid()}`;
+        const item = type === "expense"
+          ? { key, label: split.group, group: "variable", color: "#5F5E5A", subcats: [], archived: false, core: false }
+          : { key, label: split.group, subcats: [], archived: false, core: false, protected: false, cpfLinked: false };
+        newCategoriesByType[type].push(item);
+        resolvedCategory[stateKey] = { key, subKey: "" };
+      });
+    });
+
+    const txnsToWrite = [];
+    let skippedCount = 0, unparseableCount = 0;
+    intermediateRows.forEach(r => {
+      if (!r.date) { unparseableCount++; return; }
+      if (r.amountAbs == null || r.amountAbs === 0) { skippedCount++; return; }
+      if (r.isExpense !== true && r.isExpense !== false) { skippedCount++; return; }
+      const accountKey = r.accountRaw ? resolvedAccountKey[r.accountRaw] : null;
+      if (!accountKey) { skippedCount++; return; }
+      const catStateKey = (r.isExpense ? "expense" : "income") + "|" + r.categoryRaw;
+      const catResolved = r.categoryRaw ? resolvedCategory[catStateKey] : null;
+      if (!catResolved) { skippedCount++; return; }
+      txnsToWrite.push({
+        id: "imp_" + hashRow(r.raw),
+        date: r.date,
+        type: r.isExpense ? "expense" : "income",
+        amount: r.amountAbs,
+        account: accountKey,
+        toAccount: null,
+        category: catResolved.key,
+        subcat: catResolved.subKey || null,
+        payee: r.payeeRaw || "",
+        note: r.noteRaw || "",
+        who: "Joint",
+        createdAt: new Date().toISOString()
+      });
+    });
+
+    return { newAccountsByGroup, newCategoriesByType, txnsToWrite, skippedCount, unparseableCount };
+  }, [distinctAccounts, distinctCategories, accountMap, categoryMap, categorySplitEnabled, categoryDelimiter, intermediateRows, accountPool, categories]);
+
+  const dayBeforeISO = iso => {
+    const d = new Date(iso + "T00:00:00");
+    d.setDate(d.getDate() - 1);
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  };
+
+  // Reads plan.txnsToWrite directly rather than the just-set importSummary state —
+  // this runs synchronously inside confirmImport right after setImportSummary(...),
+  // and React state updates aren't visible in the same closure until the next render,
+  // so importSummary would still read as its pre-update value here.
+  const goToBalances = () => {
+    const dates = plan.txnsToWrite.map(t => t.date).filter(Boolean).sort();
+    setAsOfDate(dates.length ? dayBeforeISO(dates[0]) : todayISO());
+    setStep("balances");
+  };
+
+  const confirmImport = async () => {
+    setBusy(true);
+    const hasNewAccounts = plan.newAccountsByGroup.liquidCash.length || plan.newAccountsByGroup.investments.length || plan.newAccountsByGroup.property.length;
+    const hasNewCategories = plan.newCategoriesByType.expense.length || plan.newCategoriesByType.income.length;
+    if (hasNewAccounts || hasNewCategories) {
+      const nextAccounts = {
+        ...accounts,
+        liquidCash: [...accounts.liquidCash, ...plan.newAccountsByGroup.liquidCash],
+        investments: [...accounts.investments, ...plan.newAccountsByGroup.investments],
+        property: [...accounts.property, ...plan.newAccountsByGroup.property]
+      };
+      const nextCategories = {
+        ...categories,
+        expense: [...categories.expense, ...plan.newCategoriesByType.expense],
+        income: [...categories.income, ...plan.newCategoriesByType.income]
+      };
+      await persistAll({
+        ...(hasNewAccounts ? { accounts: nextAccounts } : {}),
+        ...(hasNewCategories ? { categories: nextCategories } : {})
+      });
+    }
+    const chunkSize = 20;
+    for (let i = 0; i < plan.txnsToWrite.length; i += chunkSize) {
+      const chunk = plan.txnsToWrite.slice(i, i + chunkSize);
+      await Promise.allSettled(chunk.map(t => onSaveTxn(t)));
+    }
+    setImportSummary({
+      importedCount: plan.txnsToWrite.length,
+      skippedCount: plan.skippedCount,
+      unparseableCount: plan.unparseableCount,
+      newAccountsCount: plan.newAccountsByGroup.liquidCash.length + plan.newAccountsByGroup.investments.length + plan.newAccountsByGroup.property.length,
+      newCategoriesCount: plan.newCategoriesByType.expense.length + plan.newCategoriesByType.income.length
+    });
+    setBusy(false);
+    goToBalances();
+  };
+
+  const finishSetup = async () => {
+    setBusy(true);
+    const writes = [];
+    registry.forEach(a => {
+      const raw = balanceInputs[a.key];
+      if (raw === undefined || raw === "") return;
+      const entered = Number(raw);
+      if (isNaN(entered)) return;
+      const sd = entered - (liveBalances[a.key] || 0);
+      if (sd === 0) return;
+      writes.push(onReconcileAccount(a, sd, "Starting balance (setup)", asOfDate, "balanceAdjustment"));
+    });
+    await Promise.allSettled(writes);
+    setBusy(false);
+    onFinish();
+  };
+
+  const trackerIdx = SETUP_STEP_GROUP[step];
+  const stepCopy = SETUP_STEP_COPY[step];
+  const stepIndicator = rc("div", { style: { marginBottom: 18 } },
+    rc("div", { style: { display: "flex", alignItems: "center" } },
+      SETUP_TRACKER_STAGES.map((label, i) => rc(React.Fragment, { key: label },
+        rc("div", { style: { display: "flex", flexDirection: "column", alignItems: "center", gap: 6 } },
+          rc("div", {
+            style: {
+              width: i === trackerIdx ? 24 : 22, height: i === trackerIdx ? 24 : 22, borderRadius: "50%",
+              display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+              fontFamily: "var(--sans)", fontSize: 12, fontWeight: 600,
+              background: i <= trackerIdx ? "var(--accent)" : "transparent",
+              color: i <= trackerIdx ? "#fff" : "var(--ink-3)",
+              border: i > trackerIdx ? "1.5px solid var(--hair-strong)" : "none",
+              boxShadow: i === trackerIdx ? "0 0 0 3px #EFF6F3" : "none"
+            }
+          }, i < trackerIdx ? "✓" : String(i + 1)),
+          rc("div", {
+            style: {
+              fontFamily: "var(--sans)", fontSize: 10.5, whiteSpace: "nowrap",
+              color: i === trackerIdx ? "var(--ink-1)" : "var(--ink-3)",
+              fontWeight: i === trackerIdx ? 600 : 400
+            }
+          }, label)
+        ),
+        i < SETUP_TRACKER_STAGES.length - 1 && rc("div", {
+          style: { flex: 1, height: 2, marginBottom: 18, background: i < trackerIdx ? "var(--accent)" : "var(--hair)" }
+        })
+      ))),
+    rc("div", {
+      style: {
+        marginTop: 14, paddingTop: 12, borderTop: "1px solid var(--hair)",
+        display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12, flexWrap: "wrap"
+      }
+    },
+      rc("div", { style: { fontFamily: "var(--serif)", fontSize: 15, color: "var(--ink-1)" } },
+        `Step ${trackerIdx + 1} of ${SETUP_TRACKER_STAGES.length} — ${stepCopy.title}`),
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12, color: "var(--ink-2)" } }, stepCopy.instruction)));
+
+  const fieldRow = (label, children) => rc("div", { style: { marginBottom: 14 } },
+    rc(LedgerLabel, null, label), children);
+
+  const headerSelect = (field, value) => rc("select", {
+    value: columnMap[field] || "",
+    onChange: e => setCol(field, e.target.value),
+    style: inputStyle
+  },
+    rc("option", { value: "" }, value ? "— none —" : "— not in this file —"),
+    (parsed ? parsed.headers : []).map(h => rc("option", { key: h, value: h }, h)));
+
+  let body;
+
+  if (step === "welcome") {
+    body = rc("div", null,
+      rc("div", { style: { fontFamily: "var(--serif)", fontSize: 19, color: "var(--ink-1)", marginBottom: 8 } },
+        "Bring in your data"),
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-2)", lineHeight: 1.5, marginBottom: 18 } },
+        "You can import historical transactions from a CSV, XLS, or XLSX export of another app — you'll map its accounts and categories onto your own before anything is saved. Either way, next you'll set each account's starting balance."),
+      parseError && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "#A6402B", marginBottom: 12 } }, parseError),
+      rc("div", { style: { display: "flex", gap: 10, flexWrap: "wrap" } },
+        rc("label", { className: "btn-primary", style: { padding: "8px 16px", fontSize: 13, cursor: "pointer" } },
+          "Upload a file…",
+          rc("input", { type: "file", accept: ".csv,.xls,.xlsx", onChange: onFile, style: { display: "none" } })),
+        rc("button", { className: "btn-secondary", style: { padding: "8px 16px", fontSize: 13 }, onClick: goToBalances },
+          "Start fresh — no import")));
+  } else if (step === "mapping") {
+    body = rc("div", null,
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 14 } },
+        `Reading "${parsed.sheetName}" — ${parsed.rows.length} rows. Match each field below to a column from your file; leave optional ones blank if you don't have them.`),
+      fieldRow("Date column", headerSelect("date")),
+      dateAmbiguous && fieldRow("This date column could be read two ways — which is it?",
+        rc("div", { style: { display: "flex", gap: 8 } },
+          rc("button", { className: dateFormatHint === "MDY" ? "btn-primary" : "btn-secondary", onClick: () => setDateFormatHint("MDY") }, "Month/Day/Year"),
+          rc("button", { className: dateFormatHint === "DMY" ? "btn-primary" : "btn-secondary", onClick: () => setDateFormatHint("DMY") }, "Day/Month/Year"))),
+      fieldRow("Amount format", rc("div", { style: { display: "flex", gap: 8 } },
+        rc("button", { className: amountMode === "single" ? "btn-primary" : "btn-secondary", onClick: () => setAmountMode("single") }, "One amount column"),
+        rc("button", { className: amountMode === "debitCredit" ? "btn-primary" : "btn-secondary", onClick: () => setAmountMode("debitCredit") }, "Separate debit/credit columns"))),
+      amountMode === "single"
+        ? rc("div", null,
+            fieldRow("Amount column", headerSelect("amount")),
+            fieldRow("Type column (Expense/Income) — optional", headerSelect("type")),
+            !columnMap.type && fieldRow("Sign convention", rc("label", { style: { fontFamily: "var(--sans)", fontSize: 12.5, display: "flex", gap: 8, alignItems: "center" } },
+              rc("input", { type: "checkbox", checked: negativeIsExpense, onChange: e => setNegativeIsExpense(e.target.checked) }),
+              "Negative amounts are expenses")),
+            ambiguousTypeValues.length > 0 && fieldRow(`What do these Type values mean? (${ambiguousTypeValues.length} unresolved)`,
+              rc("div", null, ambiguousTypeValues.map(t => rc("div", { key: t.value, style: { display: "flex", gap: 8, alignItems: "center", marginBottom: 6 } },
+                rc("span", { style: { fontFamily: "var(--mono)", fontSize: 12.5, minWidth: 120 } }, `"${t.value}" (${t.count})`),
+                ["expense", "income", "skip"].map(opt => rc("button", {
+                  key: opt,
+                  className: typeValueMap[t.value] === opt ? "btn-primary" : "btn-secondary",
+                  style: { padding: "3px 10px", fontSize: 11.5 },
+                  onClick: () => setTypeValueMap(m => ({ ...m, [t.value]: opt }))
+                }, opt))))))
+          )
+        : rc("div", null,
+            fieldRow("Debit / expense amount column", headerSelect("debit")),
+            fieldRow("Credit / income amount column", headerSelect("credit"))),
+      fieldRow("Account column — leave blank if this whole file is one account", headerSelect("account")),
+      fieldRow("Category column", headerSelect("category")),
+      fieldRow("Payee / merchant column — optional", headerSelect("payee")),
+      fieldRow("Note column — optional", headerSelect("note")),
+      rc("div", { style: { display: "flex", justifyContent: "space-between", marginTop: 18 } },
+        rc("button", { className: "btn-secondary", onClick: () => setStep("welcome") }, "Back"),
+        rc("button", {
+          className: "btn-primary",
+          disabled: !columnMap.date || (amountMode === "single" ? !columnMap.amount : !columnMap.debit && !columnMap.credit) || ambiguousTypeValues.length > 0,
+          onClick: () => setStep("accounts")
+        }, "Next")));
+  } else if (step === "accounts") {
+    body = rc("div", null,
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 14 } },
+        distinctAccounts.length === 1 && distinctAccounts[0].value === "__ALL__"
+          ? "Your file doesn't have a per-row account — pick which account every row belongs to."
+          : `${distinctAccounts.length} distinct account${distinctAccounts.length === 1 ? "" : "s"} found — match each to one of your accounts, or create a new one.`),
+      distinctAccounts.map(({ value, count }) => {
+        const m = effectiveAccountMapping(value);
+        return rc("div", { key: value, style: { display: "flex", gap: 10, alignItems: "center", marginBottom: 8, paddingBottom: 8, borderBottom: "1px solid var(--hair)" } },
+          rc("div", { style: { flex: "1 1 200px", fontFamily: "var(--mono)", fontSize: 12.5 } },
+            value === "__ALL__" ? "All rows" : value, rc("span", { style: { color: "var(--ink-3)" } }, ` (${count})`)),
+          rc("select", {
+            value: m.action === "existing" ? m.key : m.action,
+            style: { ...inputStyle, flex: "1 1 220px" },
+            onChange: e => {
+              const v = e.target.value;
+              setAccountMap(am => ({
+                ...am,
+                [value]: v === "createLiquid" || v === "createInvest" || v === "createCreditCard" || v === "skip"
+                  ? { action: v, key: null }
+                  : { action: "existing", key: v }
+              }));
+            }
+          },
+            rc("optgroup", { label: "Liquid cash" },
+              accountPool.filter(a => a.group === "liquidCash").map(a => rc("option", { key: a.key, value: a.key }, a.label))),
+            rc("optgroup", { label: "Investments" },
+              accountPool.filter(a => a.group === "investments").map(a => rc("option", { key: a.key, value: a.key }, a.label))),
+            rc("optgroup", { label: "Property and loans" },
+              accountPool.filter(a => a.group === "property").map(a => rc("option", { key: a.key, value: a.key }, a.label + (a.kind === "liability" ? " (liability)" : "")))),
+            rc("option", { value: "createLiquid" }, "+ Create new (Liquid cash)"),
+            rc("option", { value: "createInvest" }, "+ Create new (Investments)"),
+            rc("option", { value: "createCreditCard" }, "+ Create new (Credit card)"),
+            rc("option", { value: "skip" }, "Skip these rows")));
+      }),
+      rc("div", { style: { display: "flex", justifyContent: "space-between", marginTop: 18 } },
+        rc("button", { className: "btn-secondary", onClick: () => setStep("mapping") }, "Back"),
+        rc("button", { className: "btn-primary", onClick: () => setStep("categories") }, "Next")));
+  } else if (step === "categories") {
+    const renderCatGroup = (type, label) => {
+      const list = distinctCategories[type];
+      if (!list.length) return null;
+      const pool = categories[type].filter(c => !c.archived);
+      return rc("div", { key: type, style: { marginBottom: 18 } },
+        rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13, marginBottom: 8 } }, label),
+        list.map(({ value, count }) => {
+          const m = effectiveCategoryMapping(value, type === "expense");
+          const stateKey = type + "|" + value;
+          const shown = categorySplitEnabled && categoryDelimiter ? splitCategoryValue(value, categoryDelimiter).group : value;
+          return rc("div", { key: value, style: { display: "flex", gap: 10, alignItems: "center", marginBottom: 8, paddingBottom: 8, borderBottom: "1px solid var(--hair)" } },
+            rc("div", { style: { flex: "1 1 200px", fontFamily: "var(--mono)", fontSize: 12.5 } },
+              shown, rc("span", { style: { color: "var(--ink-3)" } }, ` (${count})`)),
+            rc("select", {
+              value: m.action === "existing" ? m.key : m.action,
+              style: { ...inputStyle, flex: "1 1 220px" },
+              onChange: e => {
+                const v = e.target.value;
+                setCategoryMap(cm => ({
+                  ...cm,
+                  [stateKey]: v === "create" || v === "skip" ? { action: v, key: null, subKey: "" } : { action: "existing", key: v, subKey: "" }
+                }));
+              }
+            },
+              rc("optgroup", { label: "Existing categories" },
+                pool.map(c => rc("option", { key: c.key, value: c.key }, c.label))),
+              rc("option", { value: "create" }, "+ Create new category"),
+              rc("option", { value: "skip" }, "Skip these rows")));
+        }));
+    };
+    body = rc("div", null,
+      categoryDelimiter && rc("div", { style: { marginBottom: 14, padding: 10, background: "var(--paper-2, #F4F1EA)", borderRadius: 8 } },
+        rc("label", { style: { fontFamily: "var(--sans)", fontSize: 12.5, display: "flex", gap: 8, alignItems: "center" } },
+          rc("input", { type: "checkbox", checked: categorySplitEnabled, onChange: e => setCategorySplitEnabled(e.target.checked) }),
+          `Your categories look like they contain a group split (e.g. "Food${categoryDelimiter} Groceries") — divide automatically?`)),
+      renderCatGroup("expense", "Expense categories"),
+      renderCatGroup("income", "Income categories"),
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)", marginBottom: 10 } },
+        "You can always merge or archive categories afterward in Settings → Categories."),
+      rc("div", { style: { display: "flex", justifyContent: "space-between", marginTop: 8 } },
+        rc("button", { className: "btn-secondary", onClick: () => setStep("accounts") }, "Back"),
+        rc("button", { className: "btn-primary", onClick: () => setStep("preview") }, "Next")));
+  } else if (step === "preview") {
+    const previewRows = plan.txnsToWrite.slice(0, 50);
+    const newAccountsN = plan.newAccountsByGroup.liquidCash.length + plan.newAccountsByGroup.investments.length + plan.newAccountsByGroup.property.length;
+    const newCategoriesN = plan.newCategoriesByType.expense.length + plan.newCategoriesByType.income.length;
+    body = rc("div", null,
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-1)", marginBottom: 4 } },
+        `${plan.txnsToWrite.length} transaction${plan.txnsToWrite.length === 1 ? "" : "s"} will be imported`),
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12, color: "var(--ink-3)", marginBottom: 14 } },
+        `${plan.skippedCount} skipped by your mapping, ${plan.unparseableCount} had an unreadable date.` +
+        ((newAccountsN + newCategoriesN) > 0
+          ? ` Will create ${newAccountsN} account(s) and ${newCategoriesN} categor${newCategoriesN === 1 ? "y" : "ies"}.`
+          : "")),
+      rc("div", { style: { maxHeight: 260, overflowY: "auto", border: "1px solid var(--hair)", borderRadius: 8, marginBottom: 16 } },
+        rc("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12 } },
+          rc("thead", null, rc("tr", null,
+            ["Date", "Type", "Amount", "Category", "Note"].map(h =>
+              rc("th", { key: h, style: { textAlign: "left", padding: "6px 8px", borderBottom: "1px solid var(--hair)", position: "sticky", top: 0, background: "#fff" } }, h)))),
+          rc("tbody", null, previewRows.map((t, i) => rc("tr", { key: i },
+            rc("td", { style: { padding: "4px 8px", fontFamily: "var(--mono)" } }, t.date),
+            rc("td", { style: { padding: "4px 8px" } }, t.type),
+            rc("td", { style: { padding: "4px 8px", fontFamily: "var(--mono)" } }, t.amount.toFixed(2)),
+            rc("td", { style: { padding: "4px 8px" } }, t.category),
+            rc("td", { style: { padding: "4px 8px", color: "var(--ink-3)" } }, t.note))))
+        )),
+      rc("div", { style: { display: "flex", justifyContent: "space-between" } },
+        rc("button", { className: "btn-secondary", disabled: busy, onClick: () => setStep("categories") }, "Back"),
+        rc("button", { className: "btn-primary", disabled: busy || plan.txnsToWrite.length === 0, onClick: confirmImport },
+          busy ? "Importing…" : `Confirm import (${plan.txnsToWrite.length})`)));
+  } else if (step === "balances") {
+    const groupDefs = [["liquidCash", "Liquid cash"], ["investments", "Investments"], ["property", "Property & loans"]];
+    body = rc("div", null,
+      importSummary && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", marginBottom: 14 } },
+        `Imported ${importSummary.importedCount} transactions.`),
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 14, lineHeight: 1.5 } },
+        "Enter what each account actually holds. Leave any blank to skip it — you can always adjust it later. For a liability (like a credit card), enter the amount currently owed as a positive number."),
+      fieldRow("As of", rc("input", { type: "date", value: asOfDate, onChange: e => setAsOfDate(e.target.value), style: { ...inputStyle, width: 160 } })),
+      groupDefs.map(([group, label]) => {
+        const items = registry.filter(a => a.group === group);
+        if (!items.length) return null;
+        return rc("div", { key: group, style: { marginBottom: 16 } },
+          rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13, marginBottom: 8 } }, label),
+          items.map(a => rc("div", { key: a.key, style: { display: "flex", gap: 10, alignItems: "center", marginBottom: 6 } },
+            rc("div", { style: { flex: "1 1 200px", fontFamily: "var(--sans)", fontSize: 12.5 } },
+              a.label, a.kind === "liability" && rc("span", { style: { color: "var(--ink-3)" } }, " (liability)")),
+            rc("input", {
+              type: "text", inputMode: "decimal", placeholder: "0.00",
+              value: balanceInputs[a.key] || "",
+              onFocus: e => e.target.select(),
+              onChange: e => setBalanceInputs(bi => ({ ...bi, [a.key]: e.target.value.replace(/[^0-9.]/g, "") })),
+              style: { ...inputStyle, width: 120, fontFamily: "var(--mono)", textAlign: "right" }
+            }),
+            (liveBalances[a.key] || 0) !== 0 && rc("span", { style: { fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)" } },
+              `currently tracked: ${fmt(liveBalances[a.key] || 0)}`))));
+      }),
+      rc("div", { style: { display: "flex", justifyContent: "space-between", marginTop: 8 } },
+        rc("button", { className: "btn-secondary", disabled: busy, onClick: onFinish }, "Skip this step"),
+        rc("button", { className: "btn-primary", disabled: busy, onClick: finishSetup }, busy ? "Saving…" : "Finish")));
+  }
+
+  return rc("div", {
+    onClick: onClose,
+    style: {
+      position: "fixed", inset: 0, background: "rgba(27,36,48,0.45)",
+      display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1300, padding: 20
+    }
+  }, rc("div", {
+    onClick: e => e.stopPropagation(),
+    style: { background: "#fff", borderRadius: 12, padding: 24, width: 760, maxWidth: "95vw", maxHeight: "85vh", overflowY: "auto" }
+  },
+    rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 } },
+      rc("div", { style: { fontFamily: "var(--serif)", fontSize: 15, color: "var(--ink-3)" } }, "First-time setup"),
+      rc(IconBtn, { onClick: onClose }, "Close")),
+    stepIndicator,
+    body
   ));
 }
 
@@ -3108,7 +3892,8 @@ function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate
 
 function TransactionsTab({
   registry, txns, categories, familyMembers,
-  onSave, onDelete, txnError, orphans
+  onSave, onDelete, txnError, orphans,
+  dismissedHints, onDismissHint, onOpenSetupWizard
 }) {
   const blank = {
     id: null, date: todayISO(), type: "expense", amount: "",
@@ -3215,6 +4000,14 @@ function TransactionsTab({
     (orphans || []).length > 0 && rc(Card, { style: { marginBottom: 14, background: "#FBF3E6" } },
       rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", lineHeight: 1.5 } },
         `${orphans.length} entr${orphans.length === 1 ? "y is" : "ies are"} pointing at an account that no longer exists. They are excluded from balances and from monthly totals. Re-create the account in Settings, or edit each entry onto a live account.`)),
+
+    (txns || []).length === 0 && !(dismissedHints || {}).setupWizard && rc(Card, { style: { marginBottom: 14, background: "#EFF6F3" } },
+      rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 } },
+        rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)" } },
+          "New here? Import your transaction history and set starting balances."),
+        rc("div", { style: { display: "flex", gap: 8, flexShrink: 0 } },
+          rc("button", { className: "btn-primary", style: { padding: "6px 12px", fontSize: 12.5 }, onClick: onOpenSetupWizard }, "Set up"),
+          rc(IconBtn, { onClick: () => onDismissHint("setupWizard") }, "No thanks")))),
 
     /* ── quick add ── */
     rc(Card, null,
@@ -3817,6 +4610,7 @@ function App({ user } = {}) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showLiveBalances, setShowLiveBalances] = useState(false);
   const [reconcileTarget, setReconcileTarget] = useState(null);
+  const [showSetupWizard, setShowSetupWizard] = useState(false);
   const [loanSub, setLoanSub] = useState("housing");
   const [historyPeriod, setHistoryPeriod] = useState("monthly");
   const [expenseView, setExpenseView] = useState("month");
@@ -5005,7 +5799,19 @@ function App({ user } = {}) {
       width: "100%",
       padding: "10px 12px"
     }
-  }, label)))), tab === "dashboard" && current && /*#__PURE__*/React.createElement(React.Fragment, null,
+  }, label)))), showSetupWizard && rc(SetupWizard, {
+    registry: registry,
+    categories: categories,
+    accounts: accounts,
+    familyMembers: familyMembers,
+    txns: txns,
+    liveBalances: liveBalances,
+    onSaveTxn: saveTxn,
+    onReconcileAccount: reconcileAccount,
+    persistAll: persistAll,
+    onClose: () => setShowSetupWizard(false),
+    onFinish: () => { dismissHint("setupWizard"); setShowSetupWizard(false); }
+  }), tab === "dashboard" && current && /*#__PURE__*/React.createElement(React.Fragment, null,
     rc("div", { style: { marginTop: 20 } },
       rc("button", {
         onClick: () => setShowLiveBalances(s => !s),
@@ -5771,7 +6577,10 @@ function App({ user } = {}) {
     txnError: txnError,
     onSave: saveTxn,
     onDelete: deleteTxn,
-    orphans: orphanTxns(registry, txns)
+    orphans: orphanTxns(registry, txns),
+    dismissedHints: dismissedHints,
+    onDismissHint: dismissHint,
+    onOpenSetupWizard: () => setShowSetupWizard(true)
   }), tab === "budgets" && (() => {
     const budgetedKeys = Object.keys(budgets);
     const unbudgetedCats = categories.expense.filter(c => !c.archived && !budgetedKeys.includes(c.key));
@@ -7728,7 +8537,15 @@ function App({ user } = {}) {
         color: "var(--ink-3)",
         marginBottom: 14
       }
-    }, `Rename, add, or remove the accounts under Liquid cash, Investments, and Property and loans. For property accounts, mark whether each is an asset or a liability, and whether a liability is short-term (like a credit card) \u2014 short-term liabilities are subtracted from your emergency buffer. CPF sub-accounts (OA/SA/MA for ${(familyMembers[0]) || "Person 1"} and ${(familyMembers[1]) || "Person 2"}) are fixed to match CPF Board rules and can't be renamed or removed here.`), accountGroups.map(([group, label]) => /*#__PURE__*/React.createElement(Card, {
+    }, `Rename, add, or remove the accounts under Liquid cash, Investments, and Property and loans. For property accounts, mark whether each is an asset or a liability, and whether a liability is short-term (like a credit card) \u2014 short-term liabilities are subtracted from your emergency buffer. CPF sub-accounts (OA/SA/MA for ${(familyMembers[0]) || "Person 1"} and ${(familyMembers[1]) || "Person 2"}) are fixed to match CPF Board rules and can't be renamed or removed here.`),
+    (txns || []).length === 0 && !(dismissedHints || {}).setupWizard && rc(Card, { style: { marginBottom: 16, background: "#EFF6F3" } },
+      rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 } },
+        rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)" } },
+          "New here? Import your transaction history and set starting balances."),
+        rc("div", { style: { display: "flex", gap: 8, flexShrink: 0 } },
+          rc("button", { className: "btn-primary", style: { padding: "6px 12px", fontSize: 12.5 }, onClick: () => setShowSetupWizard(true) }, "Set up"),
+          rc(IconBtn, { onClick: () => dismissHint("setupWizard") }, "No thanks")))),
+    accountGroups.map(([group, label]) => /*#__PURE__*/React.createElement(Card, {
       key: group,
       style: {
         marginBottom: 16
