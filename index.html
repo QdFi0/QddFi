@@ -2335,7 +2335,8 @@ function ConfirmDialog({
   confirmLabel = "Remove",
   cancelLabel = "Cancel",
   onConfirm,
-  onCancel
+  onCancel,
+  zIndex = 1000
 }) {
   return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -2348,7 +2349,7 @@ function ConfirmDialog({
       display: "flex",
       alignItems: "center",
       justifyContent: "center",
-      zIndex: 1000,
+      zIndex,
       padding: 20
     },
     onClick: onCancel
@@ -3173,12 +3174,26 @@ function SetupWizard({
   const [typeValueMap, setTypeValueMap] = useState({});
   const [categorySplitEnabled, setCategorySplitEnabled] = useState(false);
   const [accountMap, setAccountMap] = useState({});
+  // Raw account value -> user-typed rename for a newly-created account. Defaults to the
+  // imported value itself (see accounts-step render) — just lets the user confirm or
+  // override that default before anything is written.
+  const [accountNameInputs, setAccountNameInputs] = useState({});
   const [categoryMap, setCategoryMap] = useState({});
   // Raw category value -> "expense"/"income" override — lets the user decide which
   // umbrella a category belongs to independent of what the source file's Type column
   // or amount sign said any given row was (see effectiveCategoryType below).
   const [categoryTypeMap, setCategoryTypeMap] = useState({});
   const [subInputs, setSubInputs] = useState({});
+  // Raw category value -> user-typed rename for a newly-created category, same
+  // default-then-override pattern as accountNameInputs above.
+  const [catNameInputs, setCatNameInputs] = useState({});
+  // Casing/whitespace-only collisions between two category or subcategory names (e.g.
+  // "Dining" vs "dining", or a typed "food" vs the real "Food" category) are never
+  // auto-merged — each is resolved once via a popup (see plan.pendingCaseConfirm below)
+  // and recorded here as "merge" or "separate", keyed so a decision naturally goes stale
+  // if the user edits the colliding text again.
+  const [categoryCaseDecisions, setCategoryCaseDecisions] = useState({});
+  const [subcatCaseDecisions, setSubcatCaseDecisions] = useState({});
   // Raw category value -> whether its "peek at real rows" panel is expanded. Collapsed
   // by default (same pattern as Filters/Loan events elsewhere) so a file with dozens of
   // categories doesn't turn the mapping step into a wall of sample data.
@@ -3187,6 +3202,9 @@ function SetupWizard({
   const [balanceInputs, setBalanceInputs] = useState({});
   const [asOfDate, setAsOfDate] = useState(todayISO());
   const [busy, setBusy] = useState(false);
+  // Count of transactions actually attempted so far during confirmImport — drives the
+  // Preview step's progress bar so a large import doesn't look stuck.
+  const [importProgress, setImportProgress] = useState(0);
 
   const setCol = (field, value) => setColumnMap(m => ({ ...m, [field]: value }));
 
@@ -3208,8 +3226,12 @@ function SetupWizard({
         setAmountMode((guess.debit || guess.credit) && !guess.amount ? "debitCredit" : "single");
         setTypeValueMap({});
         setAccountMap({});
+        setAccountNameInputs({});
         setCategoryMap({});
         setCategoryTypeMap({});
+        setCatNameInputs({});
+        setCategoryCaseDecisions({});
+        setSubcatCaseDecisions({});
         setStep("mapping");
       } catch (err) {
         console.error(err);
@@ -3369,24 +3391,47 @@ function SetupWizard({
   const plan = useMemo(() => {
     const newAccountsByGroup = { liquidCash: [], investments: [], property: [] };
     const resolvedAccountKey = {};
+    // Lets two raw account values that resolve to the same "create new" name AND the same
+    // create action (e.g. two mis-spelled source accounts both renamed "HSBC Savings")
+    // merge into one new account instead of creating duplicates — keyed by action +
+    // case/whitespace-normalized label so an "HSBC" liquid-cash create never merges with
+    // an unrelated "HSBC" credit-card create.
+    const newAccountByLabel = new Map();
     distinctAccounts.forEach(({ value }) => {
       const m = effectiveAccountMapping(value);
       if (m.action === "skip") { resolvedAccountKey[value] = null; return; }
       if (m.action === "existing") { resolvedAccountKey[value] = m.key; return; }
+      const importedName = value === "__ALL__" ? "Imported account" : value;
+      const label = (accountNameInputs[value] || "").trim() || importedName;
+      const normLabel = label.trim().toLowerCase();
+      // A typed/renamed "create new" name might exactly match an account the household
+      // already has — reuse that real account instead of creating a same-named duplicate.
+      // Scoped to the same kind of account the create action would have produced (liquid
+      // cash/investments/a property-group liability) so a rename never silently merges
+      // into an unrelated real account that just happens to share a label.
+      const realGroupMatch = m.action === "createCreditCard"
+        ? accountPool.find(a => a.group === "property" && a.kind === "liability" && a.label.trim().toLowerCase() === normLabel)
+        : accountPool.find(a => a.group === (m.action === "createInvest" ? "investments" : "liquidCash") && a.label.trim().toLowerCase() === normLabel);
+      if (realGroupMatch) { resolvedAccountKey[value] = realGroupMatch.key; return; }
+      const labelKey = `${m.action}|${normLabel}`;
+      const existingNew = newAccountByLabel.get(labelKey);
+      if (existingNew) { resolvedAccountKey[value] = existingNew; return; }
       const key = `acct_${uid()}`;
-      const label = value === "__ALL__" ? "Imported account" : value;
       // registry keys are "<group>.<raw key>" (buildRegistry, index.html) — resolvedAccountKey
       // feeds straight into each transaction's `account` field, so it must match that prefixed
       // form, not the raw key stored in accounts[group][].key, or the transaction ends up
       // pointing at nothing once this new account is merged in and re-derived into registry.
+      let resolvedKey;
       if (m.action === "createCreditCard") {
         newAccountsByGroup.property.push({ key, label, type: "liability", shortTermLiability: true, owner: "Joint" });
-        resolvedAccountKey[value] = `property.${key}`;
+        resolvedKey = `property.${key}`;
       } else {
         const group = m.action === "createInvest" ? "investments" : "liquidCash";
         newAccountsByGroup[group].push({ key, label, owner: "Joint" });
-        resolvedAccountKey[value] = `${group}.${key}`;
+        resolvedKey = `${group}.${key}`;
       }
+      resolvedAccountKey[value] = resolvedKey;
+      newAccountByLabel.set(labelKey, resolvedKey);
     });
 
     const newCategoriesByType = { expense: [], income: [] };
@@ -3394,10 +3439,60 @@ function SetupWizard({
     // brand-new category being created in this same pass instead gets its subcat pushed
     // straight into its own `subcats` array below, no separate bucket needed for that case.
     const categorySubAdditions = {};
+    // Lets two raw category values that resolve to the same "create new" name (e.g. two
+    // mis-spelled source categories both renamed "Food") merge into one new category
+    // instead of creating duplicates — keyed by type + case/whitespace-normalized label,
+    // populated as each "create" row below is resolved. Always keeps the FIRST-seen
+    // spelling even once a later, differently-cased row is confirmed to merge into it —
+    // every subsequent variant is compared against that same first one, never the most
+    // recent, so the popup below always reads "same as «first spelling»?".
+    const newCategoryByLabel = new Map();
     // Keyed by raw category value only now (not type|value) — a value has exactly one
     // target category, and that target's own type (carried alongside key/subKey here)
     // is what a row's written transaction type follows, not the row's source direction.
     const resolvedCategory = {};
+    // Casing/whitespace-only collisions (category or subcategory) are never auto-merged —
+    // each is queued here as the next question for the user, one at a time, and the row
+    // that triggered it defaults to "keep separate" until a decision exists. Whichever
+    // collision is found FIRST while walking the rows below wins for this render; once
+    // it's resolved (categoryCaseDecisions/subcatCaseDecisions), the next render either
+    // finds the next one or none.
+    let pendingCaseConfirm = null;
+    const queuePending = info => { if (!pendingCaseConfirm) pendingCaseConfirm = info; };
+    // Exact text match (no ambiguity) vs. same-once-normalized-but-differently-spelled
+    // match (needs a decision before use) — used for both category and subcategory names.
+    const findLabelMatch = (label, pool, normalize) => {
+      const exact = pool.find(c => c.label === label);
+      if (exact) return { match: exact, needsConfirm: false };
+      const norm = normalize(label);
+      const caseOnly = pool.find(c => normalize(c.label) === norm);
+      return caseOnly ? { match: caseOnly, needsConfirm: true } : { match: null, needsConfirm: false };
+    };
+    const normCat = s => s.trim().toLowerCase();
+    // Shared by all three "does this subcategory already exist here" checks below (an
+    // existing real category, a real category matched via rename, or a category this
+    // same import already queued) — reuses a matched subcat's key, mints a new one, or
+    // (for a casing-only match still awaiting a decision) queues the popup and mints a
+    // new one anyway for now, same "default to separate until confirmed" rule as above.
+    // A genuinely fuzzy SUBSTRING match (e.g. "Food" vs "Foods", fuzzyLabelMatch's own
+    // fallback tier) is untouched by any of this and keeps its existing silent behavior —
+    // only a pure casing/punctuation/whitespace difference is gated behind a popup.
+    const resolveSubKey = (subRaw, subcatsList, decisionKey) => {
+      if (!subRaw) return { subKey: "", newSub: null };
+      const list = subcatsList || [];
+      const { match, needsConfirm } = findLabelMatch(subRaw, list, normalizeForMatch);
+      if (match && !needsConfirm) return { subKey: match.key, newSub: null };
+      if (match && needsConfirm) {
+        const decision = subcatCaseDecisions[decisionKey];
+        if (decision === "merge") return { subKey: match.key, newSub: null };
+        if (decision !== "separate") queuePending({ kind: "subcat", decisionKey, firstLabel: match.label, thisLabel: subRaw });
+      } else {
+        const fuzzy = fuzzyLabelMatch(subRaw, list);
+        if (fuzzy) return { subKey: fuzzy.key, newSub: null };
+      }
+      const subKey = `sub_${uid()}`;
+      return { subKey, newSub: { key: subKey, label: subRaw } };
+    };
     distinctCategories.forEach(({ value }) => {
       const type = effectiveCategoryType(value);
       const m = effectiveCategoryMapping(value);
@@ -3409,25 +3504,73 @@ function SetupWizard({
       // itself is pre-filled from split.sub, so leaving it alone still uses the guess.
       const subRaw = (subInputs[value] !== undefined ? subInputs[value] : split.sub || "").trim();
       if (m.action === "existing") {
-        let subKey = "";
-        if (subRaw) {
-          const targetCat = categories[type].find(c => c.key === m.key);
-          const existingSub = targetCat && fuzzyLabelMatch(subRaw, targetCat.subcats || []);
-          if (existingSub) subKey = existingSub.key;
-          else {
-            subKey = `sub_${uid()}`;
-            (categorySubAdditions[m.key] = categorySubAdditions[m.key] || []).push({ key: subKey, label: subRaw });
-          }
-        }
+        const targetCat = categories[type].find(c => c.key === m.key);
+        // Pool includes subcats this same import already staged onto this category (an
+        // earlier raw value hitting the same target) — checking only the persisted
+        // targetCat.subcats would miss those and mint a second, differently-cased
+        // duplicate for what should be one shared subcat.
+        const stagedSubs = categorySubAdditions[m.key] || [];
+        const { subKey, newSub } = resolveSubKey(subRaw, [...(targetCat ? targetCat.subcats || [] : []), ...stagedSubs], `cat:${m.key}|${value}`);
+        if (newSub) (categorySubAdditions[m.key] = stagedSubs).push(newSub);
         resolvedCategory[value] = { type, key: m.key, subKey };
+        return;
+      }
+      const catLabel = (catNameInputs[value] || "").trim() || split.group;
+
+      // A typed/renamed "create new" label might match a category the household already
+      // has — reuse that real category instead of creating a same-named duplicate, same
+      // principle as the two branches above/below. Archived categories are excluded,
+      // same as the target-category dropdown/fuzzy-match pool elsewhere in this wizard —
+      // an archived category is never a valid merge target through the UI. An exact-text
+      // match merges silently; a casing/whitespace-only match needs a decision first.
+      const realPool = categories[type].filter(c => !c.archived);
+      const realFind = findLabelMatch(catLabel, realPool, normCat);
+      let realMatch = realFind.match;
+      if (realMatch && realFind.needsConfirm) {
+        const decisionKey = `cat:${value}|real:${realMatch.key}`;
+        const decision = categoryCaseDecisions[decisionKey];
+        if (decision !== "merge") {
+          if (decision !== "separate") queuePending({ kind: "category", decisionKey, firstLabel: realMatch.label, thisLabel: catLabel });
+          realMatch = null;
+        }
+      }
+      if (realMatch) {
+        // Same staged-subs pool reasoning as the existing-category branch above — an
+        // earlier raw value in this same import may have already queued a subcat here.
+        const stagedSubs = categorySubAdditions[realMatch.key] || [];
+        const { subKey, newSub } = resolveSubKey(subRaw, [...(realMatch.subcats || []), ...stagedSubs], `cat:${realMatch.key}|${value}`);
+        if (newSub) (categorySubAdditions[realMatch.key] = stagedSubs).push(newSub);
+        resolvedCategory[value] = { type, key: realMatch.key, subKey };
+        return;
+      }
+
+      // Collision against a category this same import already queued to create (first-
+      // seen spelling wins the map slot — see the comment on newCategoryByLabel above).
+      const labelKey = `${type}|${normCat(catLabel)}`;
+      let existingNew = newCategoryByLabel.get(labelKey);
+      if (existingNew && existingNew.label !== catLabel) {
+        const decisionKey = `cat:${value}|new:${labelKey}`;
+        const decision = categoryCaseDecisions[decisionKey];
+        if (decision !== "merge") {
+          if (decision !== "separate") queuePending({ kind: "category", decisionKey, firstLabel: existingNew.label, thisLabel: catLabel });
+          existingNew = null;
+        }
+      }
+      if (existingNew) {
+        // Same reuse-or-append behavior as the branches above, just against a category
+        // this same import already queued a moment ago instead of one already saved.
+        const { subKey, newSub } = resolveSubKey(subRaw, existingNew.subcats, `cat:${existingNew.key}|${value}`);
+        if (newSub) existingNew.subcats.push(newSub);
+        resolvedCategory[value] = { type, key: existingNew.key, subKey };
         return;
       }
       const key = `cat_${uid()}`;
       const subcats = subRaw ? [{ key: `sub_${uid()}`, label: subRaw }] : [];
       const item = type === "expense"
-        ? { key, label: split.group, group: "variable", color: "#5F5E5A", subcats, archived: false, core: false }
-        : { key, label: split.group, subcats, archived: false, core: false, protected: false, cpfLinked: false };
+        ? { key, label: catLabel, group: "variable", color: "#5F5E5A", subcats, archived: false, core: false }
+        : { key, label: catLabel, subcats, archived: false, core: false, protected: false, cpfLinked: false };
       newCategoriesByType[type].push(item);
+      if (!newCategoryByLabel.has(labelKey)) newCategoryByLabel.set(labelKey, item);
       resolvedCategory[value] = { type, key, subKey: subcats[0] ? subcats[0].key : "" };
     });
 
@@ -3464,8 +3607,8 @@ function SetupWizard({
       });
     });
 
-    return { newAccountsByGroup, newCategoriesByType, categorySubAdditions, txnsToWrite, skippedCount, unparseableCount };
-  }, [distinctAccounts, distinctCategories, accountMap, categoryMap, categoryTypeMap, subInputs, categorySplitEnabled, categoryDelimiter, intermediateRows, accountPool, categories]);
+    return { newAccountsByGroup, newCategoriesByType, categorySubAdditions, txnsToWrite, skippedCount, unparseableCount, pendingCaseConfirm };
+  }, [distinctAccounts, distinctCategories, accountMap, accountNameInputs, categoryMap, categoryTypeMap, subInputs, catNameInputs, categorySplitEnabled, categoryDelimiter, intermediateRows, accountPool, categories, categoryCaseDecisions, subcatCaseDecisions]);
 
   const dayBeforeISO = iso => {
     const d = new Date(iso + "T00:00:00");
@@ -3485,6 +3628,7 @@ function SetupWizard({
 
   const confirmImport = async () => {
     setBusy(true);
+    setImportProgress(0);
     const hasNewAccounts = plan.newAccountsByGroup.liquidCash.length || plan.newAccountsByGroup.investments.length || plan.newAccountsByGroup.property.length;
     const hasSubAdditions = Object.keys(plan.categorySubAdditions).length > 0;
     const hasNewCategories = plan.newCategoriesByType.expense.length || plan.newCategoriesByType.income.length || hasSubAdditions;
@@ -3513,7 +3657,7 @@ function SetupWizard({
     const chunkSize = 20;
     for (let i = 0; i < plan.txnsToWrite.length; i += chunkSize) {
       const chunk = plan.txnsToWrite.slice(i, i + chunkSize);
-      await Promise.allSettled(chunk.map(t => onSaveTxn(t)));
+      await Promise.allSettled(chunk.map(async t => { await onSaveTxn(t); setImportProgress(p => p + 1); }));
     }
     setImportSummary({
       importedCount: plan.txnsToWrite.length,
@@ -3659,32 +3803,43 @@ function SetupWizard({
           : `${distinctAccounts.length} distinct account${distinctAccounts.length === 1 ? "" : "s"} found — match each to one of your accounts, or create a new one.`),
       distinctAccounts.map(({ value, count }) => {
         const m = effectiveAccountMapping(value);
-        return rc("div", { key: value, style: { display: "flex", gap: 10, alignItems: "center", marginBottom: 8, paddingBottom: 8, borderBottom: "1px solid var(--hair)" } },
-          rc("div", { style: { flex: "1 1 200px", fontFamily: "var(--mono)", fontSize: 12.5 } },
-            value === "__ALL__" ? "All rows" : value, rc("span", { style: { color: "var(--ink-3)" } }, ` (${count})`)),
-          rc("select", {
-            value: m.action === "existing" ? m.key : m.action,
-            style: { ...inputStyle, flex: "1 1 220px" },
-            onChange: e => {
-              const v = e.target.value;
-              setAccountMap(am => ({
-                ...am,
-                [value]: v === "createLiquid" || v === "createInvest" || v === "createCreditCard" || v === "skip"
-                  ? { action: v, key: null }
-                  : { action: "existing", key: v }
-              }));
-            }
-          },
-            rc("optgroup", { label: "Liquid cash" },
-              accountPool.filter(a => a.group === "liquidCash").map(a => rc("option", { key: a.key, value: a.key }, a.label))),
-            rc("optgroup", { label: "Investments" },
-              accountPool.filter(a => a.group === "investments").map(a => rc("option", { key: a.key, value: a.key }, a.label))),
-            rc("optgroup", { label: "Property and loans" },
-              accountPool.filter(a => a.group === "property").map(a => rc("option", { key: a.key, value: a.key }, a.label + (a.kind === "liability" ? " (liability)" : "")))),
-            rc("option", { value: "createLiquid" }, "+ Create new (Liquid cash)"),
-            rc("option", { value: "createInvest" }, "+ Create new (Investments)"),
-            rc("option", { value: "createCreditCard" }, "+ Create new (Credit card)"),
-            rc("option", { value: "skip" }, "Skip these rows")));
+        const isCreate = m.action === "createLiquid" || m.action === "createInvest" || m.action === "createCreditCard";
+        const importedName = value === "__ALL__" ? "Imported account" : value;
+        return rc("div", { key: value, style: { marginBottom: 8, paddingBottom: 8, borderBottom: "1px solid var(--hair)" } },
+          rc("div", { style: { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" } },
+            rc("div", { style: { flex: "1 1 200px", fontFamily: "var(--mono)", fontSize: 12.5 } },
+              value === "__ALL__" ? "All rows" : value, rc("span", { style: { color: "var(--ink-3)" } }, ` (${count})`)),
+            rc("select", {
+              value: m.action === "existing" ? m.key : m.action,
+              style: { ...inputStyle, flex: "1 1 220px" },
+              onChange: e => {
+                const v = e.target.value;
+                setAccountMap(am => ({
+                  ...am,
+                  [value]: v === "createLiquid" || v === "createInvest" || v === "createCreditCard" || v === "skip"
+                    ? { action: v, key: null }
+                    : { action: "existing", key: v }
+                }));
+              }
+            },
+              rc("optgroup", { label: "Liquid cash" },
+                accountPool.filter(a => a.group === "liquidCash").map(a => rc("option", { key: a.key, value: a.key }, a.label))),
+              rc("optgroup", { label: "Investments" },
+                accountPool.filter(a => a.group === "investments").map(a => rc("option", { key: a.key, value: a.key }, a.label))),
+              rc("optgroup", { label: "Property and loans" },
+                accountPool.filter(a => a.group === "property").map(a => rc("option", { key: a.key, value: a.key }, a.label + (a.kind === "liability" ? " (liability)" : "")))),
+              rc("option", { value: "createLiquid" }, "+ Create new (Liquid cash)"),
+              rc("option", { value: "createInvest" }, "+ Create new (Investments)"),
+              rc("option", { value: "createCreditCard" }, "+ Create new (Credit card)"),
+              rc("option", { value: "skip" }, "Skip these rows"))),
+          isCreate && rc("div", { style: { display: "flex", gap: 8, alignItems: "center", marginTop: 6 } },
+            rc("span", { style: { fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)", whiteSpace: "nowrap" } }, "Will be created as"),
+            rc("input", {
+              type: "text",
+              value: accountNameInputs[value] !== undefined ? accountNameInputs[value] : importedName,
+              onChange: e => setAccountNameInputs(a => ({ ...a, [value]: e.target.value })),
+              style: { ...inputStyle, flex: "1 1 200px", fontSize: 12.5, padding: "4px 8px" }
+            })));
       }),
       rc("div", { style: { display: "flex", justifyContent: "space-between", marginTop: 18 } },
         rc("button", { className: "btn-secondary", onClick: () => setStep("mapping") }, "Back"),
@@ -3704,6 +3859,7 @@ function SetupWizard({
           const m = effectiveCategoryMapping(value);
           const split = categorySplitEnabled && categoryDelimiter ? splitCategoryValue(value, categoryDelimiter) : { group: value, sub: "" };
           const subValue = subInputs[value] !== undefined ? subInputs[value] : split.sub;
+          const catNameValue = catNameInputs[value] !== undefined ? catNameInputs[value] : split.group;
           const mixed = expenseCount > 0 && incomeCount > 0;
           const totalRows = expenseCount + incomeCount;
           const sampleRows = (categoryRowsIndex.get(value) || []).slice(0, 5);
@@ -3753,6 +3909,14 @@ function SetupWizard({
               type: "text", value: subValue, placeholder: "Subcategory (optional)",
               onChange: e => setSubInputs(si => ({ ...si, [value]: e.target.value })),
               style: { ...inputStyle, flex: "1 1 160px" }
+            })),
+          m.action === "create" && rc("div", { style: { display: "flex", gap: 8, alignItems: "center", marginTop: 6 } },
+            rc("span", { style: { fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)", whiteSpace: "nowrap" } }, "New category name"),
+            rc("input", {
+              type: "text",
+              value: catNameValue,
+              onChange: e => setCatNameInputs(ni => ({ ...ni, [value]: e.target.value })),
+              style: { ...inputStyle, flex: "1 1 200px", fontSize: 12.5, padding: "4px 8px" }
             })),
           previewOpen && rc("div", { style: { marginTop: 6, padding: 8, background: "var(--paper-2, #F4F1EA)", borderRadius: 6 } },
             sampleRows.map(r => rc("div", {
@@ -3822,10 +3986,21 @@ function SetupWizard({
               rc("td", { style: { padding: "4px 8px", color: "var(--ink-3)" } }, t.note));
           }))
         )),
-      rc("div", { style: { display: "flex", justifyContent: "space-between" } },
+      rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16 } },
         rc("button", { className: "btn-secondary", disabled: busy, onClick: () => setStep("categories") }, "Back"),
-        rc("button", { className: "btn-primary", disabled: busy || plan.txnsToWrite.length === 0, onClick: confirmImport },
-          busy ? "Importing…" : `Confirm import (${plan.txnsToWrite.length})`)));
+        busy
+          ? rc("div", { style: { flex: "1 1 auto", maxWidth: 280 } },
+              rc("div", { style: { fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)", marginBottom: 4, textAlign: "right" } },
+                `Importing ${importProgress} of ${plan.txnsToWrite.length}…`),
+              rc("div", { style: { height: 8, borderRadius: 999, background: "var(--hair)", overflow: "hidden" } },
+                rc("div", { style: {
+                  height: "100%",
+                  width: `${plan.txnsToWrite.length ? Math.round(importProgress / plan.txnsToWrite.length * 100) : 0}%`,
+                  background: "var(--accent)",
+                  transition: "width 150ms ease"
+                } })))
+          : rc("button", { className: "btn-primary", disabled: plan.txnsToWrite.length === 0, onClick: confirmImport },
+              `Confirm import (${plan.txnsToWrite.length})`)));
   } else if (step === "balances") {
     const groupDefs = [["liquidCash", "Liquid cash"], ["investments", "Investments"], ["property", "Property & loans"]];
     body = rc("div", null,
@@ -3857,22 +4032,44 @@ function SetupWizard({
         rc("button", { className: "btn-primary", disabled: busy, onClick: finishSetup }, busy ? "Saving…" : "Finish")));
   }
 
-  return rc("div", {
-    onClick: onClose,
-    style: {
-      position: "fixed", inset: 0, background: "rgba(27,36,48,0.45)",
-      display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1300, padding: 20
-    }
-  }, rc("div", {
-    onClick: e => e.stopPropagation(),
-    style: { background: "#fff", borderRadius: 12, padding: 24, width: 760, maxWidth: "95vw", maxHeight: "85vh", overflowY: "auto" }
-  },
-    rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 } },
-      rc("div", { style: { fontFamily: "var(--serif)", fontSize: 15, color: "var(--ink-3)" } }, "First-time setup"),
-      rc(IconBtn, { onClick: onClose }, "Close")),
-    stepIndicator,
-    body
-  ));
+  // A casing/whitespace-only collision (e.g. "Dining" vs "dining") between two category
+  // or subcategory names found while building `plan` — never auto-merged, confirmed one
+  // at a time here instead. Recording either answer into categoryCaseDecisions/
+  // subcatCaseDecisions triggers `plan` to recompute, which then either merges or keeps
+  // the row separate and surfaces the next pending collision, if any.
+  const pcc = plan.pendingCaseConfirm;
+  const answerCaseConfirm = decision => {
+    const setDecisions = pcc.kind === "category" ? setCategoryCaseDecisions : setSubcatCaseDecisions;
+    setDecisions(d => ({ ...d, [pcc.decisionKey]: decision }));
+  };
+
+  return rc(React.Fragment, null,
+    rc("div", {
+      onClick: onClose,
+      style: {
+        position: "fixed", inset: 0, background: "rgba(27,36,48,0.45)",
+        display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1300, padding: 20
+      }
+    }, rc("div", {
+      onClick: e => e.stopPropagation(),
+      style: { background: "#fff", borderRadius: 12, padding: 24, width: 760, maxWidth: "95vw", maxHeight: "85vh", overflowY: "auto" }
+    },
+      rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 } },
+        rc("div", { style: { fontFamily: "var(--serif)", fontSize: 15, color: "var(--ink-3)" } }, "First-time setup"),
+        rc(IconBtn, { onClick: onClose }, "Close")),
+      stepIndicator,
+      body
+    )),
+    pcc && rc(ConfirmDialog, {
+      zIndex: 1400,
+      title: pcc.kind === "category" ? "Same category?" : "Same subcategory?",
+      message: `You typed "${pcc.thisLabel}" — is this the same ${pcc.kind === "category" ? "category" : "subcategory"} as "${pcc.firstLabel}"?`,
+      confirmLabel: "Yes, same",
+      cancelLabel: "No, keep separate",
+      onConfirm: () => answerCaseConfirm("merge"),
+      onCancel: () => answerCaseConfirm("separate")
+    })
+  );
 }
 
 // Recurring item editor card. Account/category drive the actual transaction
