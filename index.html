@@ -3169,6 +3169,7 @@ function SetupWizard({
   const [categorySplitEnabled, setCategorySplitEnabled] = useState(false);
   const [accountMap, setAccountMap] = useState({});
   const [categoryMap, setCategoryMap] = useState({});
+  const [subInputs, setSubInputs] = useState({});
   const [importSummary, setImportSummary] = useState(null);
   const [balanceInputs, setBalanceInputs] = useState({});
   const [asOfDate, setAsOfDate] = useState(todayISO());
@@ -3352,22 +3353,43 @@ function SetupWizard({
     });
 
     const newCategoriesByType = { expense: [], income: [] };
+    // Subcats to append onto an EXISTING category (keyed by that category's own key) — a
+    // brand-new category being created in this same pass instead gets its subcat pushed
+    // straight into its own `subcats` array below, no separate bucket needed for that case.
+    const categorySubAdditions = {};
     const resolvedCategory = {};
     ["expense", "income"].forEach(type => {
       distinctCategories[type].forEach(({ value }) => {
         const stateKey = type + "|" + value;
         const m = effectiveCategoryMapping(value, type === "expense");
         if (m.action === "skip") { resolvedCategory[stateKey] = null; return; }
-        if (m.action === "existing") { resolvedCategory[stateKey] = { key: m.key, subKey: m.subKey || "" }; return; }
         const split = categorySplitEnabled && categoryDelimiter
           ? splitCategoryValue(value, categoryDelimiter)
           : { group: value, sub: "" };
+        // A typed subInput always wins over the delimiter-derived guess — the input field
+        // itself is pre-filled from split.sub, so leaving it alone still uses the guess.
+        const subRaw = (subInputs[stateKey] !== undefined ? subInputs[stateKey] : split.sub || "").trim();
+        if (m.action === "existing") {
+          let subKey = "";
+          if (subRaw) {
+            const targetCat = categories[type].find(c => c.key === m.key);
+            const existingSub = targetCat && fuzzyLabelMatch(subRaw, targetCat.subcats || []);
+            if (existingSub) subKey = existingSub.key;
+            else {
+              subKey = `sub_${uid()}`;
+              (categorySubAdditions[m.key] = categorySubAdditions[m.key] || []).push({ key: subKey, label: subRaw });
+            }
+          }
+          resolvedCategory[stateKey] = { key: m.key, subKey };
+          return;
+        }
         const key = `cat_${uid()}`;
+        const subcats = subRaw ? [{ key: `sub_${uid()}`, label: subRaw }] : [];
         const item = type === "expense"
-          ? { key, label: split.group, group: "variable", color: "#5F5E5A", subcats: [], archived: false, core: false }
-          : { key, label: split.group, subcats: [], archived: false, core: false, protected: false, cpfLinked: false };
+          ? { key, label: split.group, group: "variable", color: "#5F5E5A", subcats, archived: false, core: false }
+          : { key, label: split.group, subcats, archived: false, core: false, protected: false, cpfLinked: false };
         newCategoriesByType[type].push(item);
-        resolvedCategory[stateKey] = { key, subKey: "" };
+        resolvedCategory[stateKey] = { key, subKey: subcats[0] ? subcats[0].key : "" };
       });
     });
 
@@ -3398,8 +3420,8 @@ function SetupWizard({
       });
     });
 
-    return { newAccountsByGroup, newCategoriesByType, txnsToWrite, skippedCount, unparseableCount };
-  }, [distinctAccounts, distinctCategories, accountMap, categoryMap, categorySplitEnabled, categoryDelimiter, intermediateRows, accountPool, categories]);
+    return { newAccountsByGroup, newCategoriesByType, categorySubAdditions, txnsToWrite, skippedCount, unparseableCount };
+  }, [distinctAccounts, distinctCategories, accountMap, categoryMap, subInputs, categorySplitEnabled, categoryDelimiter, intermediateRows, accountPool, categories]);
 
   const dayBeforeISO = iso => {
     const d = new Date(iso + "T00:00:00");
@@ -3420,7 +3442,8 @@ function SetupWizard({
   const confirmImport = async () => {
     setBusy(true);
     const hasNewAccounts = plan.newAccountsByGroup.liquidCash.length || plan.newAccountsByGroup.investments.length || plan.newAccountsByGroup.property.length;
-    const hasNewCategories = plan.newCategoriesByType.expense.length || plan.newCategoriesByType.income.length;
+    const hasSubAdditions = Object.keys(plan.categorySubAdditions).length > 0;
+    const hasNewCategories = plan.newCategoriesByType.expense.length || plan.newCategoriesByType.income.length || hasSubAdditions;
     if (hasNewAccounts || hasNewCategories) {
       const nextAccounts = {
         ...accounts,
@@ -3428,10 +3451,15 @@ function SetupWizard({
         investments: [...accounts.investments, ...plan.newAccountsByGroup.investments],
         property: [...accounts.property, ...plan.newAccountsByGroup.property]
       };
+      // A subcategory typed against an EXISTING category (as opposed to one being created
+      // fresh in this same import) patches that category's subcats array in place — it isn't
+      // a new category, so it can't just be appended like newCategoriesByType is.
+      const withSubAdditions = list => list.map(c =>
+        plan.categorySubAdditions[c.key] ? { ...c, subcats: [...(c.subcats || []), ...plan.categorySubAdditions[c.key]] } : c);
       const nextCategories = {
         ...categories,
-        expense: [...categories.expense, ...plan.newCategoriesByType.expense],
-        income: [...categories.income, ...plan.newCategoriesByType.income]
+        expense: [...withSubAdditions(categories.expense), ...plan.newCategoriesByType.expense],
+        income: [...withSubAdditions(categories.income), ...plan.newCategoriesByType.income]
       };
       await persistAll({
         ...(hasNewAccounts ? { accounts: nextAccounts } : {}),
@@ -3627,10 +3655,11 @@ function SetupWizard({
         list.map(({ value, count }) => {
           const m = effectiveCategoryMapping(value, type === "expense");
           const stateKey = type + "|" + value;
-          const shown = categorySplitEnabled && categoryDelimiter ? splitCategoryValue(value, categoryDelimiter).group : value;
-          return rc("div", { key: value, style: { display: "flex", gap: 10, alignItems: "center", marginBottom: 8, paddingBottom: 8, borderBottom: "1px solid var(--hair)" } },
+          const split = categorySplitEnabled && categoryDelimiter ? splitCategoryValue(value, categoryDelimiter) : { group: value, sub: "" };
+          const subValue = subInputs[stateKey] !== undefined ? subInputs[stateKey] : split.sub;
+          return rc("div", { key: value, style: { display: "flex", gap: 10, alignItems: "center", marginBottom: 8, paddingBottom: 8, borderBottom: "1px solid var(--hair)", flexWrap: "wrap" } },
             rc("div", { style: { flex: "1 1 200px", fontFamily: "var(--mono)", fontSize: 12.5 } },
-              shown, rc("span", { style: { color: "var(--ink-3)" } }, ` (${count})`)),
+              split.group, rc("span", { style: { color: "var(--ink-3)" } }, ` (${count})`)),
             rc("select", {
               value: m.action === "existing" ? m.key : m.action,
               style: { ...inputStyle, flex: "1 1 220px" },
@@ -3645,7 +3674,12 @@ function SetupWizard({
               rc("optgroup", { label: "Existing categories" },
                 pool.map(c => rc("option", { key: c.key, value: c.key }, c.label))),
               rc("option", { value: "create" }, "+ Create new category"),
-              rc("option", { value: "skip" }, "Skip these rows")));
+              rc("option", { value: "skip" }, "Skip these rows")),
+            m.action !== "skip" && rc("input", {
+              type: "text", value: subValue, placeholder: "Subcategory (optional)",
+              onChange: e => setSubInputs(si => ({ ...si, [stateKey]: e.target.value })),
+              style: { ...inputStyle, flex: "1 1 160px" }
+            }));
         }));
     };
     body = rc("div", null,
@@ -3664,13 +3698,16 @@ function SetupWizard({
     const previewRows = plan.txnsToWrite.slice(0, 50);
     const newAccountsN = plan.newAccountsByGroup.liquidCash.length + plan.newAccountsByGroup.investments.length + plan.newAccountsByGroup.property.length;
     const newCategoriesN = plan.newCategoriesByType.expense.length + plan.newCategoriesByType.income.length;
+    const newSubcatsN = plan.newCategoriesByType.expense.reduce((a, c) => a + c.subcats.length, 0)
+      + plan.newCategoriesByType.income.reduce((a, c) => a + c.subcats.length, 0)
+      + Object.values(plan.categorySubAdditions).reduce((a, list) => a + list.length, 0);
     body = rc("div", null,
       rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-1)", marginBottom: 4 } },
         `${plan.txnsToWrite.length} transaction${plan.txnsToWrite.length === 1 ? "" : "s"} will be imported`),
       rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12, color: "var(--ink-3)", marginBottom: 14 } },
         `${plan.skippedCount} skipped by your mapping, ${plan.unparseableCount} had an unreadable date.` +
-        ((newAccountsN + newCategoriesN) > 0
-          ? ` Will create ${newAccountsN} account(s) and ${newCategoriesN} categor${newCategoriesN === 1 ? "y" : "ies"}.`
+        ((newAccountsN + newCategoriesN + newSubcatsN) > 0
+          ? ` Will create ${newAccountsN} account(s), ${newCategoriesN} categor${newCategoriesN === 1 ? "y" : "ies"}, and ${newSubcatsN} subcategor${newSubcatsN === 1 ? "y" : "ies"}.`
           : "")),
       rc("div", { style: { maxHeight: 260, overflowY: "auto", border: "1px solid var(--hair)", borderRadius: 8, marginBottom: 16 } },
         rc("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12 } },
