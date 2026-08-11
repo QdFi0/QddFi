@@ -1191,7 +1191,16 @@ const reconcilePolicies = list => (list || []).map(p => {
   const unit = RECUR_UNITS.includes(p.unit) ? p.unit : legacy.unit;
   const interval = Math.max(1, Math.round(Number(p.interval)) || legacy.interval);
   const amount = Number(p.amount) || (Number(p.annualPremium) || 0) / occurrencesPerYear(interval, unit);
-  const category = p.category || (p.type === "Endowment" ? "endowment" : "insurance");
+  // No hardcoded category fallback (matches reconcileRecurring) — this used to default to
+  // the literal "insurance"/"endowment" seeded category keys, which every household was
+  // guaranteed to have before categories stopped being pre-seeded. Now that a household can
+  // genuinely have zero categories, defaulting silently routed premiums to a category key
+  // that may not exist at all — the category dropdown stayed shown as unselected while a
+  // policy quietly became "postable" and, once posted, showed the raw key as its category
+  // in the ledger. type === "Endowment" already drives its own exclusion elsewhere
+  // (annualInsurancePremiumsExclEndowments) independently of this key, so nothing downstream
+  // depended on the specific "insurance"/"endowment" string.
+  const category = p.category || "";
   const account = p.account || "";
   const canPost = !!account && !!category;
   return {
