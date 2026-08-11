@@ -383,7 +383,12 @@ const DEFAULT_CPF_SETTINGS = {
   person2ManualMA: 0
 };
 const INITIAL_RECORDS = [];
-function computeDerived(record, assumptions, accounts) {
+// primaryIncomeKey is the key of whichever income category the user has flagged as
+// primary/take-home (Settings > Categories — categories no longer seed a hardcoded
+// "primaryIncome" key, see seedIncomeCategories) — resolved once by the caller and
+// passed in here. Empty/unset degrades to $0 rather than reading a key that no longer
+// means anything.
+function computeDerived(record, assumptions, accounts, primaryIncomeKey) {
   const totalIncome = sum(record.income);
   const totalFixedNonFinancial = sum(record.expenses.fixedNonFinancial);
   const totalFixedFinancial = sum(record.expenses.fixedFinancial);
@@ -391,7 +396,7 @@ function computeDerived(record, assumptions, accounts) {
   const totalVariableExclBigTicket = totalVariableGross - catTotal(record.expenses.variable.bigTicket);
   const totalExpenses = totalFixedNonFinancial + totalFixedFinancial + totalVariableGross;
   const netCashflow = totalIncome - totalExpenses;
-  const monthlyTakeHome = catTotal(record.income.primaryIncome);
+  const monthlyTakeHome = catTotal(primaryIncomeKey ? record.income[primaryIncomeKey] : undefined);
   const monthlySavings = monthlyTakeHome - totalExpenses;
   const annualTakeHome = monthlyTakeHome * 12;
   const base = {
@@ -1005,35 +1010,33 @@ const CATEGORY_HINTS = {
   },
   delete: {
     title: "Deleting a category",
-    body: "Deleting removes this category from the list going forward. Any past data already recorded under it stays in your history \u2014 it just won't show up as this category any more. Built-in categories can't be deleted."
+    body: "Deleting removes this category from the list going forward. Any past data already recorded under it stays in your history \u2014 it just won't show up as this category any more."
   },
   cpfLinked: {
     title: "CPF-linked income",
     body: "Marking an income category as CPF-linked adds its value to the reference figure on the CPF tab, which you can use to set your monthly salary for the CPF calculation."
+  },
+  primaryIncome: {
+    title: "Primary income",
+    body: "Marks this as your household's main take-home pay category \u2014 it drives the take-home/savings figures on the Dashboard and History, and the payroll reference figure on the Tax tab. Only one category can be marked at a time; marking a different one clears this one automatically."
+  },
+  core: {
+    title: "Essential expense",
+    body: "Marks this as an essential (fixed) expense rather than discretionary spending \u2014 it's counted toward the Emergency Fund ratio's essential-expenses figure and the Fixed vs Variable spending card, instead of as discretionary."
   }
 };
-const seedExpenseCategories = () => EXPENSE_CATS.map(c => ({
-  key: c.key,
-  label: EXPENSE_LABEL_OVERRIDES[c.key] || c.label,
-  group: c.sub,
-  color: c.color,
-  icon: "",
-  subcats: [],
-  archived: false,
-  core: CORE_EXPENSE_KEYS.includes(c.key)
-}));
-const INCOME_COLORS = ["#0F5D52", "#378ADD", "#993C1D", "#7F77DD"];
-const seedIncomeCategories = () => Object.keys(BLANK_INCOME).map((k, i) => ({
-  key: k,
-  label: LABELS[k] || k,
-  color: INCOME_COLORS[i % INCOME_COLORS.length],
-  icon: "",
-  subcats: [],
-  archived: false,
-  core: true,
-  protected: k === "primaryIncome",
-  cpfLinked: k === "primaryIncome"
-}));
+// New households start with zero categories in both umbrellas, same principle as
+// seedAccounts — a fixed list of 17 expense categories and a handful of income ones
+// meant deleting/renaming whatever didn't apply. EXPENSE_CATS/BLANK_INCOME/
+// CORE_EXPENSE_KEYS below are still real and still used by reconcileCategories, which
+// backfills `core`/`primaryIncome` onto households that were seeded before this change —
+// they're migration reference data now, not a seed. A brand-new household has no
+// category flagged `core`/`primaryIncome` until the user flags one via Settings >
+// Categories (see the "Essential expense"/"Primary income" toggles in
+// CategorySettingsList) — computeDerived/categorySplitForRecord both already degrade to
+// $0 rather than crash when nothing's flagged yet.
+const seedExpenseCategories = () => [];
+const seedIncomeCategories = () => [];
 const ORIGINAL_EXPENSE_KEYS = EXPENSE_CATS.map(c => c.key);
 const OLD_DEFAULT_EXPENSE_LABELS = {
   housingUtilities: "Housing & utilities",
@@ -1046,9 +1049,11 @@ const reconcileCategories = cats => {
     ...cats,
     expense: cats.expense.map(c => {
       if (!ORIGINAL_EXPENSE_KEYS.includes(c.key)) return c;
-      const patch = {
-        core: CORE_EXPENSE_KEYS.includes(c.key)
-      };
+      const patch = {};
+      // Only backfills a `core` flag that's genuinely missing (households seeded before
+      // the flag existed) — once it's a real boolean, a user's own Essential-expense
+      // toggle (Settings > Categories) must stick, not get silently reset on every load.
+      if (typeof c.core !== "boolean") patch.core = CORE_EXPENSE_KEYS.includes(c.key);
       if (OLD_DEFAULT_EXPENSE_LABELS[c.key] && c.label === OLD_DEFAULT_EXPENSE_LABELS[c.key]) {
         patch.label = EXPENSE_LABEL_OVERRIDES[c.key];
       }
@@ -1056,7 +1061,13 @@ const reconcileCategories = cats => {
         ...c,
         ...patch
       };
-    })
+    }),
+    // Backfills the old hardcoded-key convention (every household seeded before
+    // categories stopped being pre-populated had its take-home category literally
+    // keyed "primaryIncome") onto the new user-togglable `primaryIncome` flag, once —
+    // same only-while-missing rule as `core` above, so a later user choice always wins.
+    income: (cats.income || []).map(c =>
+      typeof c.primaryIncome === "boolean" ? c : { ...c, primaryIncome: c.key === "primaryIncome" })
   };
 };
 const EXPENSE_GROUPS = [{
@@ -1952,7 +1963,7 @@ function CategorySettingsList({
   const [pendingHint, setPendingHint] = React.useState(null);
   const [dontShowAgain, setDontShowAgain] = React.useState(false);
   const [openMenuKey, setOpenMenuKey] = React.useState(null);
-  const isFixedCat = c => type === "income" ? c.key === "primaryIncome" : CORE_EXPENSE_KEYS.includes(c.key);
+  const isFixedCat = c => type === "income" ? !!c.primaryIncome : !!c.core;
   const sortedList = [...list].sort((a, b) => {
     const af = isFixedCat(a),
       bf = isFixedCat(b);
@@ -1981,7 +1992,7 @@ function CategorySettingsList({
     const avatarBg = hexToRgba(c.color || "#5F5E5A", 0.18);
     const groupLabel = type === "expense" ? (EXPENSE_GROUPS.find(g => g.key === c.group) || {}).label : null;
     const subtitleParts = [];
-    if (isFixed) subtitleParts.push("Built-in");
+    if (isFixed) subtitleParts.push(type === "income" ? "Primary income" : "Essential");
     if (groupLabel) subtitleParts.push(groupLabel);
     if (type === "income" && c.cpfLinked) subtitleParts.push("CPF-linked");
     if (c.archived) subtitleParts.push("Archived");
@@ -2098,7 +2109,28 @@ function CategorySettingsList({
       setOpenMenuKey(null);
     },
     style: menuItemStyle
-  }, c.cpfLinked ? "CPF-linked: Yes" : "CPF-linked: No"), /*#__PURE__*/React.createElement("button", {
+  }, c.cpfLinked ? "CPF-linked: Yes" : "CPF-linked: No"), type === "income" && /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      // Take-home pay (Dashboard/History) and the Tax tab's payroll reference figure
+      // both look up whichever income category carries this flag \u2014 turning it on here
+      // clears it from any other category (updateCategory enforces the single-select).
+      runOrExplain("primaryIncome", () => onUpdate(c.key, {
+        primaryIncome: !c.primaryIncome
+      }));
+      setOpenMenuKey(null);
+    },
+    style: menuItemStyle
+  }, c.primaryIncome ? "Primary income: Yes" : "Primary income: No"), type === "expense" && /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      // Feeds the Emergency Fund and Fixed-vs-Variable ratio cards (categorySplitForRecord)
+      // \u2014 an "essential" expense counts as fixed spending there, everything else variable.
+      runOrExplain("core", () => onUpdate(c.key, {
+        core: !c.core
+      }));
+      setOpenMenuKey(null);
+    },
+    style: menuItemStyle
+  }, c.core ? "Essential expense: Yes" : "Essential expense: No"), /*#__PURE__*/React.createElement("button", {
     onClick: () => {
       runOrExplain("archive", () => onUpdate(c.key, {
         archived: !c.archived
@@ -3569,7 +3601,7 @@ function SetupWizard({
       const subcats = subRaw ? [{ key: `sub_${uid()}`, label: subRaw }] : [];
       const item = type === "expense"
         ? { key, label: catLabel, group: "variable", color: "#5F5E5A", subcats, archived: false, core: false }
-        : { key, label: catLabel, subcats, archived: false, core: false, protected: false, cpfLinked: false };
+        : { key, label: catLabel, subcats, archived: false, core: false, primaryIncome: false, cpfLinked: false };
       newCategoriesByType[type].push(item);
       if (!newCategoryByLabel.has(labelKey)) newCategoryByLabel.set(labelKey, item);
       resolvedCategory[value] = { type, key, subKey: subcats[0] ? subcats[0].key : "" };
@@ -4257,7 +4289,7 @@ function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate
 function TransactionsTab({
   registry, txns, categories, familyMembers,
   onSave, onDelete, txnError, orphans,
-  dismissedHints, onDismissHint, onOpenSetupWizard
+  dismissedHints, onDismissHint, onOpenSetupWizard, onAddCategory
 }) {
   const blank = {
     id: null, date: todayISO(), type: "expense", amount: "",
@@ -4272,6 +4304,10 @@ function TransactionsTab({
   const [showFilters, setShowFilters] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [showDetails, setShowDetails] = useState(false);
+  // Categories no longer seed a default list (see seedExpenseCategories/
+  // seedIncomeCategories) — this lets a category be created right from the entry form
+  // instead of the New Entry card being a dead end for a household with none yet.
+  const [newCatLabel, setNewCatLabel] = useState("");
 
   const set = patch => setForm(f => ({ ...f, ...patch }));
   const isTransfer = form.type === "transfer";
@@ -4450,7 +4486,24 @@ function TransactionsTab({
           return rc("div", { style: { display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 } },
             chip("All", !form.subcat, () => set({ subcat: "" }), "__allsub"),
             subs.map(s => chip(s.label, form.subcat === s.key, () => set({ subcat: s.key }), s.key)));
-        })()),
+        })(),
+        rc("div", { style: { display: "flex", gap: 8, alignItems: "center", marginTop: 8 } },
+          rc("input", {
+            type: "text",
+            placeholder: sortedCatList.length ? "New category" : "No categories yet — add your first one",
+            value: newCatLabel,
+            onChange: e => setNewCatLabel(e.target.value),
+            onKeyDown: e => {
+              if (e.key === "Enter" && newCatLabel.trim()) { onAddCategory(form.type, newCatLabel); setNewCatLabel(""); }
+            },
+            style: { ...inputStyle, flex: "1 1 180px", fontSize: 12.5, padding: "5px 9px" }
+          }),
+          rc("button", {
+            className: "btn-secondary",
+            style: { padding: "5px 12px", fontSize: 12.5 },
+            disabled: !newCatLabel.trim(),
+            onClick: () => { onAddCategory(form.type, newCatLabel); setNewCatLabel(""); }
+          }, "+ Add"))),
 
       !isTransfer && !showDetails && rc("button", {
         onClick: () => setShowDetails(true),
@@ -5012,6 +5065,14 @@ function App({ user } = {}) {
     income: seedIncomeCategories()
   });
   const categories = useMemo(() => reconcileCategories(categoriesRaw), [categoriesRaw]);
+  // Whichever income category the user has flagged as primary/take-home (Settings >
+  // Categories) — resolved once here so every computeDerived call shares the same
+  // lookup, and so a household with no categories yet (or none flagged) degrades to ""
+  // instead of depending on a hardcoded key.
+  const primaryIncomeKey = useMemo(
+    () => (categories.income.find(c => c.primaryIncome) || {}).key || "",
+    [categories.income]
+  );
   const [newCatLabel, setNewCatLabel] = useState("");
   const [newCatGroup, setNewCatGroup] = useState("variable");
   const [incomeNewCatLabel, setIncomeNewCatLabel] = useState("");
@@ -5236,10 +5297,10 @@ function App({ user } = {}) {
     if (!records) return {};
     const map = {};
     records.forEach(r => {
-      map[r.month] = computeDerived(r, effectiveAssumptions, accounts);
+      map[r.month] = computeDerived(r, effectiveAssumptions, accounts, primaryIncomeKey);
     });
     return map;
-  }, [records, effectiveAssumptions, accounts]);
+  }, [records, effectiveAssumptions, accounts, primaryIncomeKey]);
   const annualHistory = useMemo(
     () => aggregateAnnual(records, derivedByMonth),
     [records, derivedByMonth]
@@ -5593,7 +5654,7 @@ function App({ user } = {}) {
       subcats: [],
       archived: false,
       core: false,
-      protected: false,
+      primaryIncome: false,
       cpfLinked: !!groupOrCpfLinked
     };
     const next = {
@@ -5608,10 +5669,13 @@ function App({ user } = {}) {
   const updateCategory = (type, key, patch) => {
     const next = {
       ...categories,
-      [type]: categories[type].map(c => c.key === key ? {
-        ...c,
-        ...patch
-      } : c)
+      [type]: categories[type].map(c => {
+        if (c.key === key) return { ...c, ...patch };
+        // Primary income is single-select — computeDerived/the Tax tab both look up
+        // exactly one flagged category, so setting it on one clears it from any other.
+        if (type === "income" && patch.primaryIncome === true && c.primaryIncome) return { ...c, primaryIncome: false };
+        return c;
+      })
     };
     setCategories(next);
     persistAll({
@@ -5849,9 +5913,9 @@ function App({ user } = {}) {
     // Was hardcoded to a fixed set of income category keys, which silently
     // produced NaN if any of those were renamed and ignored any category added.
     const avgIncome = baseline.reduce((a, r) =>
-      a + computeDerived(r, effectiveAssumptions, accounts).totalIncome, 0) / baseline.length;
+      a + computeDerived(r, effectiveAssumptions, accounts, primaryIncomeKey).totalIncome, 0) / baseline.length;
     const avgExpense = baseline.reduce((a, r) =>
-      a + computeDerived(r, effectiveAssumptions, accounts).totalExpenses
+      a + computeDerived(r, effectiveAssumptions, accounts, primaryIncomeKey).totalExpenses
         - catTotal(r.expenses.variable.bigTicket), 0) / baseline.length;
     const lastRec = records[records.length - 1];
     const lastDerived = derivedByMonth[lastRec.month];
@@ -5996,7 +6060,7 @@ function App({ user } = {}) {
       variance
     };
   })() : null;
-  const avgMonthlyExpenses = records.length ? records.reduce((a, r) => a + computeDerived(r, effectiveAssumptions, accounts).totalExpenses, 0) / records.length : 0;
+  const avgMonthlyExpenses = records.length ? records.reduce((a, r) => a + computeDerived(r, effectiveAssumptions, accounts, primaryIncomeKey).totalExpenses, 0) / records.length : 0;
   return /*#__PURE__*/React.createElement("div", {
     style: {
       "--serif": "'Spectral', Georgia, serif",
@@ -6983,7 +7047,8 @@ function App({ user } = {}) {
     orphans: orphanTxns(registry, txns),
     dismissedHints: dismissedHints,
     onDismissHint: dismissHint,
-    onOpenSetupWizard: () => setShowSetupWizard(true)
+    onOpenSetupWizard: () => setShowSetupWizard(true),
+    onAddCategory: addCategory
   }), tab === "budgets" && (() => {
     const budgetedKeys = Object.keys(budgets);
     const unbudgetedCats = categories.expense.filter(c => !c.archived && !budgetedKeys.includes(c.key));
@@ -8244,7 +8309,7 @@ function App({ user } = {}) {
       }
     })
   })), (() => {
-    const payrollCat = categories.income.find(c => c.key === "primaryIncome");
+    const payrollCat = categories.income.find(c => c.primaryIncome);
     const payrollAnnual = currentRecord && payrollCat ? incomeCatVal(currentRecord, payrollCat) * 12 : 0;
     return /*#__PURE__*/React.createElement("div", {
       style: {
