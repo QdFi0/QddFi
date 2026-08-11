@@ -1169,6 +1169,9 @@ const reconcileRecurring = list => (list || []).map(r => {
     interval,
     unit,
     nextDueDate: r.nextDueDate || todayISO(),
+    // Distinguishes a real, user-set due date from the fallback just above — the
+    // posting effect must never treat a placeholder default as a real due occurrence.
+    hasExplicitNextDueDate: !!r.nextDueDate,
     lapseDate: r.lapseDate || "",
     active: typeof r.active === "boolean" ? r.active : canPost,
     lastPostedDate: r.lastPostedDate || null,
@@ -1206,6 +1209,9 @@ const reconcilePolicies = list => (list || []).map(p => {
     interval,
     unit,
     nextDueDate: p.nextDueDate || p.nextPaymentDate || todayISO(),
+    // Same distinction as reconcileRecurring's hasExplicitNextDueDate — a real value
+    // (including a migrated legacy nextPaymentDate) vs. the today fallback just above.
+    hasExplicitNextDueDate: !!(p.nextDueDate || p.nextPaymentDate),
     lapseDate: p.lapseDate || "",
     notes: p.notes || "",
     active: typeof p.active === "boolean" ? p.active : canPost,
@@ -4146,12 +4152,16 @@ function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate
   const lapsed = !!item.lapseDate && item.lapseDate < todayISO();
   // No Pause/Resume — an item is assumed live once it's complete (account +
   // category/toAccount + amount); give it an End date instead to stop it for good.
-  const overdue = !lapsed && canPost && item.nextDueDate <= todayISO();
+  // Also requires hasExplicitNextDueDate — a not-yet-saved item is still sitting on the
+  // reconcile layer's today default, not a real due date, so it can't be genuinely overdue.
+  const overdue = !lapsed && canPost && item.hasExplicitNextDueDate && item.nextDueDate <= todayISO();
 
   const status = lapsed
     ? { label: "Ended", bg: "#F3F2EE", color: "var(--ink-3)" }
     : !canPost
     ? { label: "Incomplete — won't auto-post", bg: "#FBF3E6", color: "var(--amber)" }
+    : !item.hasExplicitNextDueDate
+    ? { label: "Set a due date to activate", bg: "#FBF3E6", color: "var(--amber)" }
     : overdue
     ? { label: "Posting on next visit", bg: "#FBEAF0", color: "var(--warn)" }
     : { label: `Next: ${isoToDayLabel(item.nextDueDate)}`, bg: "#E8F3EE", color: "var(--accent)" };
@@ -4278,7 +4288,11 @@ function RecurringItemCard({ item, registry, categories, familyMembers, onUpdate
       rc("button", {
         className: "btn-primary",
         disabled: !(item.name || "").trim(),
-        onClick: () => set({ locked: true }),
+        // Also commits the currently-displayed next due date (real if the user set one,
+        // else today's default) as a real stored value — without this, an item the user
+        // never clicks into that one specific field for would stay on the reconcile-layer
+        // default forever and, per the hasExplicitNextDueDate gate above, never post at all.
+        onClick: () => set({ locked: true, nextDueDate: item.nextDueDate }),
         style: { padding: "6px 14px", fontSize: 12.5 }
       }, "Save"))
   );
@@ -5373,6 +5387,11 @@ function App({ user } = {}) {
       if (item.active === false) return;
       if (!item.account) return;
       if (item.type === "transfer" ? !item.toAccount : !item.category) return;
+      // A brand-new item's nextDueDate is a today-default the reconcile layer invented
+      // (see reconcileRecurring), not a date the user actually chose yet — posting
+      // against it would fire the moment account+category+amount complete, potentially
+      // before the user ever reaches the due-date field. Wait for a real stored value.
+      if (!item.hasExplicitNextDueDate) return;
       const cappedToday = item.lapseDate && item.lapseDate < today ? item.lapseDate : today;
       const next = postDueCadence(item, cappedToday, saveTxn, (it, cursor) => ({
         id: `rec_${it.id}_${cursor}`,
@@ -5417,6 +5436,10 @@ function App({ user } = {}) {
     policies.forEach(item => {
       if (item.active === false) return;
       if (!item.account || !item.category) return;
+      // Same guard as the Recurring posting effect — a policy that just became complete
+      // is still sitting on reconcilePolicies' today-default nextDueDate, not a value the
+      // user (or a migrated legacy nextPaymentDate) actually set. Wait for a real one.
+      if (!item.hasExplicitNextDueDate) return;
       const cappedToday = item.lapseDate && item.lapseDate < today ? item.lapseDate : today;
       const next = postDueCadence(item, cappedToday, saveTxn, (it, cursor) => ({
         id: `pol_${it.id}_${cursor}`,
@@ -5474,8 +5497,13 @@ function App({ user } = {}) {
   const togglePolicyLock = id => {
     const target = policies.find(p => p.id === id);
     if (!target) return;
+    // Locking (Save) also commits the currently-displayed next due date, same reason as
+    // Recurring's Save button — otherwise a policy the user never clicks into that one
+    // field for stays on the derived default forever and, per the hasExplicitNextDueDate
+    // gate in the posting effect, never posts at all.
     updatePolicy(id, {
-      locked: !target.locked
+      locked: !target.locked,
+      ...(!target.locked ? { nextDueDate: target.nextDueDate } : {})
     });
   };
   const removePolicy = id => {
@@ -5850,6 +5878,14 @@ function App({ user } = {}) {
     [["housing", housingLoan, setHousingLoan, housingAmort],
      ["car", carLoan, setCarLoan, carAmort]].forEach(([key, loan, setLoan, amort]) => {
       if (!loan.trackAsRecurring || !loan.account || !loan.category) return;
+      // amortize()'s payment figure is computed from principal/rate/tenure alone — it
+      // does NOT require startDate, so a loan can already be "complete" (trackAsRecurring
+      // + account + category + a real payment amount) while both nextDueDate and startDate
+      // are still blank. Without this guard, postDueCadence's own `item.nextDueDate || today`
+      // fallback would silently anchor the very first payment to today the moment the
+      // account field completes the trio — same class of bug as Recurring/Insurance's
+      // hasExplicitNextDueDate gate, just reached via a different missing field.
+      if (!loan.nextDueDate && !loan.startDate) return;
       let nextLoan = loan;
       let changed = false;
       if (amort.payment > 0) {
@@ -7412,11 +7448,14 @@ function App({ user } = {}) {
     // No Pause/Resume for policies — a policy is assumed live the moment it's
     // complete (account+category+premium filled in), so there's no separate
     // "paused" state to show; incomplete is the only reason it wouldn't post.
-    const overdue = !lapsed && canPost && p.nextDueDate <= todayISO();
+    // Also requires hasExplicitNextDueDate - see RecurringItemCard's identical check.
+    const overdue = !lapsed && canPost && p.hasExplicitNextDueDate && p.nextDueDate <= todayISO();
     const status = lapsed
       ? { label: "Lapsed", bg: "#F3F2EE", color: "var(--ink-3)" }
       : !canPost
       ? { label: "Incomplete \u2014 won't auto-post", bg: "#FBF3E6", color: "var(--amber)" }
+      : !p.hasExplicitNextDueDate
+      ? { label: "Set a due date to activate", bg: "#FBF3E6", color: "var(--amber)" }
       : overdue
       ? { label: "Posting on next visit", bg: "#FBEAF0", color: "var(--warn)" }
       : { label: `Next: ${isoToDayLabel(p.nextDueDate)}`, bg: "#E8F3EE", color: "var(--accent)" };
@@ -7755,7 +7794,10 @@ function App({ user } = {}) {
         const paidOff = activeAmort.payoffDate && activeAmort.payoffDate < todayISO();
         if (paidOff) return "Loan fully repaid — no more postings.";
         if (!canPost) return "Missing account/category — won't post yet.";
-        return `Next: ${isoToDayLabel(activeLoan.nextDueDate || activeLoan.startDate || todayISO())}`;
+        // Mirrors the posting effect's own hasNextDueDate-or-startDate guard — payment is
+        // computable without a start date, but there's nothing real to anchor postings to yet.
+        if (!activeLoan.nextDueDate && !activeLoan.startDate) return "Missing start date — won't post yet.";
+        return `Next: ${isoToDayLabel(activeLoan.nextDueDate || activeLoan.startDate)}`;
       })())))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
