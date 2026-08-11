@@ -936,6 +936,19 @@ const fullDashboardMetricsConfig = () => ({
   groups: Object.fromEntries(RATIO_GROUPS.map(g => [g.key, true])),
   metrics: Object.fromEntries(RATIO_META.map(m => [m.key, true]))
 });
+// The Dashboard's top "Live balances" summary row — same opt-in pattern as the ratio
+// cards above (dashboardCardsConfig null = never configured, shows everything so a
+// first-time visit to Settings > Dashboard cards reads as "prune what you don't want").
+// A household with no investments/property shouldn't have to look at permanent $0 cards.
+const DASHBOARD_CARDS = [
+  { key: "liquidCash", label: "Liquid cash" },
+  { key: "investments", label: "Investments" },
+  { key: "cpfCombined", label: "CPF combined" },
+  { key: "propertyEquity", label: "Property equity" },
+  { key: "otherLiabilities", label: "Other loans & cards" },
+  { key: "netCashflow", label: "Net cashflow (month)" }
+];
+const fullDashboardCardsConfig = () => Object.fromEntries(DASHBOARD_CARDS.map(c => [c.key, true]));
 const LABELS = {
   bankAccount1: "Bank Account 1",
   bankAccount2: "Bank Account 2",
@@ -4956,6 +4969,10 @@ function App({ user } = {}) {
   // shows a one-time empty-state CTA instead of ratio cards until they do,
   // rather than defaulting to any particular set of cards being pre-chosen.
   const [dashboardMetricsConfig, setDashboardMetricsConfig] = useState(null);
+  // Unlike dashboardMetricsConfig, null here means "show every card" (this row has
+  // always been fully shown) rather than an empty first-visit state — this is a
+  // pure declutter opt-out, not a new always-on-by-default surface.
+  const [dashboardCardsConfig, setDashboardCardsConfig] = useState(null);
   const [budgets, setBudgets] = useState({});
   const [policiesRaw, setPolicies] = useState([]);
   const policies = useMemo(() => reconcilePolicies(policiesRaw), [policiesRaw]);
@@ -5057,6 +5074,7 @@ function App({ user } = {}) {
             ...(p.financialPlanning || {})
           });
           if (p.dashboardMetricsConfig) setDashboardMetricsConfig(p.dashboardMetricsConfig);
+          if (p.dashboardCardsConfig) setDashboardCardsConfig(p.dashboardCardsConfig);
           setBudgets(p.budgets || {});
           setPolicies(p.policies || []);
           // One-time, idempotent fold of the old Contracts register into Recurring — matched
@@ -5158,6 +5176,7 @@ function App({ user } = {}) {
       assumptions: patch.assumptions ?? assumptions,
       financialPlanning: patch.financialPlanning ?? financialPlanning,
       dashboardMetricsConfig: patch.dashboardMetricsConfig ?? dashboardMetricsConfig,
+      dashboardCardsConfig: patch.dashboardCardsConfig ?? dashboardCardsConfig,
       budgets: patch.budgets ?? budgets,
       policies: patch.policies ?? policies,
       recurring: patch.recurring ?? recurring,
@@ -5176,6 +5195,7 @@ function App({ user } = {}) {
     if (patch.assumptions) setAssumptions(patch.assumptions);
     if (patch.financialPlanning) setFinancialPlanning(patch.financialPlanning);
     if (patch.dashboardMetricsConfig) setDashboardMetricsConfig(patch.dashboardMetricsConfig);
+    if (patch.dashboardCardsConfig) setDashboardCardsConfig(patch.dashboardCardsConfig);
     if (patch.budgets) setBudgets(patch.budgets);
     if (patch.policies) setPolicies(patch.policies);
     if (patch.recurring) setRecurring(patch.recurring);
@@ -6264,33 +6284,30 @@ function App({ user } = {}) {
         }
       })
     ),
-    /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 12,
-      flexWrap: "wrap",
-      marginTop: 14
-    }
-  }, /*#__PURE__*/React.createElement(KpiCard, {
-    label: "Liquid cash",
-    value: current.hasBalances ? fmt(current.totalLiquidCash) : DASH
-  }), /*#__PURE__*/React.createElement(KpiCard, {
-    label: "Investments",
-    value: current.hasBalances ? fmt(current.totalInvestments) : DASH
-  }), /*#__PURE__*/React.createElement(KpiCard, {
-    label: "CPF combined",
-    value: current.hasBalances ? fmt(current.combinedCpf) : DASH
-  }), /*#__PURE__*/React.createElement(KpiCard, {
-    label: "Property equity",
-    value: current.hasBalances ? fmt(current.propertyEquity) : DASH
-  }), /*#__PURE__*/React.createElement(KpiCard, {
-    label: "Other loans & cards",
-    value: current.hasBalances ? fmt(current.otherLiabilities) : DASH
-  }), /*#__PURE__*/React.createElement(KpiCard, {
-    label: "Net cashflow (month)",
-    value: fmt(current.netCashflow),
-    sub: `Income ${fmt(current.totalIncome)} less expenses ${fmt(current.totalExpenses)}`
-  })), !current.hasBalances && /*#__PURE__*/React.createElement("div", {
+    (() => {
+      const cardsCfg = dashboardCardsConfig || fullDashboardCardsConfig();
+      const cardValue = key => {
+        if (key === "liquidCash") return { value: current.hasBalances ? fmt(current.totalLiquidCash) : DASH };
+        if (key === "investments") return { value: current.hasBalances ? fmt(current.totalInvestments) : DASH };
+        if (key === "cpfCombined") return { value: current.hasBalances ? fmt(current.combinedCpf) : DASH };
+        if (key === "propertyEquity") return { value: current.hasBalances ? fmt(current.propertyEquity) : DASH };
+        if (key === "otherLiabilities") return { value: current.hasBalances ? fmt(current.otherLiabilities) : DASH };
+        return { value: fmt(current.netCashflow), sub: `Income ${fmt(current.totalIncome)} less expenses ${fmt(current.totalExpenses)}` };
+      };
+      const visibleCards = DASHBOARD_CARDS.filter(c => cardsCfg[c.key] !== false);
+      if (!visibleCards.length) {
+        return rc("div", {
+          onClick: () => { setTab("settings"); setSettingsView("dashboardCards"); },
+          style: {
+            marginTop: 14, background: "#fff", border: "1px dashed var(--hair-strong)",
+            borderRadius: 10, padding: "16px 18px", textAlign: "center", cursor: "pointer"
+          }
+        }, rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)" } },
+          "No summary cards shown — tap to choose which ones appear here."));
+      }
+      return rc("div", { style: { display: "flex", gap: 12, flexWrap: "wrap", marginTop: 14 } },
+        visibleCards.map(c => rc(KpiCard, { key: c.key, label: c.label, ...cardValue(c.key) })));
+    })(), !current.hasBalances && /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 16,
       fontFamily: "var(--sans)",
@@ -8681,8 +8698,7 @@ function App({ user } = {}) {
         style: {
           textAlign: "left",
           padding: 16,
-          minHeight: 96,
-          gridColumn: "1 / -1"
+          minHeight: 96
         },
         onClick: () => setSettingsView("household")
       }, /*#__PURE__*/React.createElement("div", {
@@ -8699,7 +8715,63 @@ function App({ user } = {}) {
           fontSize: 12,
           color: "var(--ink-3)"
         }
-      }, "Current household name, and switching to a different one."))));
+      }, "Current household name, and switching to a different one.")), /*#__PURE__*/React.createElement("button", {
+        className: "btn-secondary",
+        style: {
+          textAlign: "left",
+          padding: 16,
+          minHeight: 96,
+          gridColumn: "1 / -1"
+        },
+        onClick: () => setSettingsView("dashboardCards")
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontWeight: 600,
+          fontSize: 14,
+          color: "var(--ink-1)",
+          marginBottom: 4
+        }
+      }, "Dashboard cards"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontFamily: "var(--sans)",
+          fontSize: 12,
+          color: "var(--ink-3)"
+        }
+      }, "Choose which summary cards (Liquid cash, Investments, Property equity, etc.) show on the Dashboard."))));
+    }
+    if (settingsView === "dashboardCards") {
+      // Working state this screen edits: whatever's saved, or — the very first
+      // time — everything on, matching the Metrics screen's same "prune what
+      // you don't want" convention (see fullDashboardMetricsConfig above).
+      const editingConfig = dashboardCardsConfig || fullDashboardCardsConfig();
+      const toggleCard = (key, checked) => persistAll({
+        dashboardCardsConfig: { ...editingConfig, [key]: checked }
+      });
+      return /*#__PURE__*/React.createElement(Section, {
+        title: "Dashboard cards",
+        eyebrow: "Settings",
+        right: /*#__PURE__*/React.createElement(IconBtn, {
+          onClick: () => setSettingsView("menu")
+        }, "← Back to Settings")
+      }, /*#__PURE__*/React.createElement("div", {
+        style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 16, lineHeight: 1.5 }
+      }, "Choose which summary cards appear at the top of the Dashboard. If your household doesn't use investments or property, for example, hide those cards to keep things focused."),
+      rc(Card, null,
+        rc("div", {
+          style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: "4px 12px" }
+        }, DASHBOARD_CARDS.map(c => rc("label", {
+          key: c.key,
+          style: { display: "flex", alignItems: "center", gap: 8, fontFamily: "var(--sans)", fontSize: 13, color: "var(--ink-2)", cursor: "pointer", padding: "5px 0" }
+        },
+          rc("input", {
+            type: "checkbox",
+            checked: editingConfig[c.key] !== false,
+            onChange: e => toggleCard(c.key, e.target.checked)
+          }),
+          c.label
+        )))
+      ));
     }
     if (settingsView === "metrics") {
       // The working state this screen edits: whatever's saved, or — the very
