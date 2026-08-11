@@ -365,6 +365,10 @@ const DEFAULT_FINANCIAL_PLANNING = {
 // saved before the second profile existed can be merged up to this shape
 // on load instead of silently losing the new fields to `undefined`.
 const DEFAULT_CPF_SETTINGS = {
+  // Household of 1 (default) vs 2 — the primary member is always tracked; a second
+  // member is opt-in. Toggling this off never clears person2's own fields below, it
+  // just stops them feeding the CPF/Tax tabs and effectiveAssumptions' gross income.
+  person2Enabled: false,
   person1Age: 0,
   person1Salary: 0,
   person1BonusThisMonth: 0,
@@ -382,6 +386,45 @@ const DEFAULT_CPF_SETTINGS = {
   person2ManualSA: 0,
   person2ManualMA: 0
 };
+// Income tax estimate, split per member (Singapore has no joint filing — each person
+// has their own chargeable income, own reliefs, own tax). person1 is always computed;
+// person2's fields only feed the Tax tab when cpfSettings.person2Enabled is true.
+const DEFAULT_TAX_SETTINGS = {
+  person1AnnualEmploymentIncome: 0,
+  person1IncludeCpfRelief: true,
+  person1NsmanRelief: 0,
+  person1NumChildren: 0,
+  person1ChildReliefPerChild: 4000,
+  person1Age: 0,
+  person1Adhoc: [],
+  person2AnnualEmploymentIncome: 0,
+  person2IncludeCpfRelief: true,
+  person2NsmanRelief: 0,
+  person2NumChildren: 0,
+  person2ChildReliefPerChild: 4000,
+  person2Age: 0,
+  person2Adhoc: []
+};
+// Migrates the pre-restructure single-taxpayer shape (flat annualEmploymentIncome/
+// age/numChildren/childReliefPerChild/nsmanRelief/includeCpfRelief/adhoc, one estimate
+// for the whole household) onto the new per-member shape — folded into person1's
+// fields, since that flat shape only ever represented one taxpayer's return. Runs
+// unconditionally at load time (cheap, idempotent): a doc already on the new shape has
+// no top-level `annualEmploymentIncome` field, so the `??` fallbacks are no-ops.
+function migrateTaxSettings(raw) {
+  const r = raw || {};
+  return {
+    ...DEFAULT_TAX_SETTINGS,
+    ...r,
+    person1AnnualEmploymentIncome: r.person1AnnualEmploymentIncome ?? r.annualEmploymentIncome ?? 0,
+    person1IncludeCpfRelief: r.person1IncludeCpfRelief ?? r.includeCpfRelief ?? true,
+    person1NsmanRelief: r.person1NsmanRelief ?? r.nsmanRelief ?? 0,
+    person1NumChildren: r.person1NumChildren ?? r.numChildren ?? 0,
+    person1ChildReliefPerChild: r.person1ChildReliefPerChild ?? r.childReliefPerChild ?? 4000,
+    person1Age: r.person1Age ?? r.age ?? 0,
+    person1Adhoc: r.person1Adhoc ?? r.adhoc ?? []
+  };
+}
 const INITIAL_RECORDS = [];
 // primaryIncomeKey is the key of whichever income category the user has flagged as
 // primary/take-home (Settings > Categories — categories no longer seed a hardcoded
@@ -1400,6 +1443,44 @@ function computeTax(chargeableIncome) {
   return Math.round(tax * 100) / 100;
 }
 const earnedIncomeRelief = age => age >= 60 ? 8000 : age >= 55 ? 6000 : 1000;
+// IRAS "CPF Relief for employees" is capped by the compulsory employee CPF contributions
+// actually made on that employee's own Ordinary and Additional Wages — i.e. exactly the
+// owEmployee/awEmployee computeCpfContribution() already produces for that person, already
+// age-banded and already OW/AW-ceiling-capped by CPF Board mechanics. owEmployee is a
+// recurring monthly figure (annualised ×12); awEmployee is the one-off "bonus this month"
+// contribution as entered, added once rather than ×12'd.
+const cpfEmployeeAnnual = cpfResult => cpfResult.owEmployee * 12 + cpfResult.awEmployee;
+// One taxpayer's income tax estimate. Singapore has no joint filing — every input here
+// (income, age, children, NSman, ad-hoc items) belongs to exactly one person, and
+// cpfEmployeeContribution must come from that SAME person's own computeCpfContribution()
+// output, never a household-combined or a different member's figure. Called once per
+// active household member (always for person1, plus person2 when enabled) — never
+// hardcoded to a specific member itself.
+function computeIncomeTax(t, cpfEmployeeContribution) {
+  const cpfReliefAmt = t.includeCpfRelief ? cpfEmployeeContribution : 0;
+  const childRelief = t.numChildren * t.childReliefPerChild;
+  const eir = earnedIncomeRelief(t.age);
+  const adhocReliefs = t.adhoc.filter(a => a.type === "relief").reduce((a, r) => a + (Number(r.amount) || 0), 0);
+  const adhocRebates = t.adhoc.filter(a => a.type === "rebate").reduce((a, r) => a + (Number(r.amount) || 0), 0);
+  const totalReliefsUncapped = cpfReliefAmt + childRelief + eir + t.nsmanRelief + adhocReliefs;
+  const totalReliefs = Math.min(totalReliefsUncapped, 80000);
+  const chargeableIncome = Math.max(t.annualEmploymentIncome - totalReliefs, 0);
+  const taxBeforeRebate = computeTax(chargeableIncome);
+  const netTax = Math.max(taxBeforeRebate - adhocRebates, 0);
+  return {
+    cpfReliefAmt,
+    childRelief,
+    eir,
+    adhocReliefs,
+    totalReliefsUncapped,
+    totalReliefs,
+    chargeableIncome,
+    taxBeforeRebate,
+    adhocRebates,
+    netTax,
+    effectiveRate: t.annualEmploymentIncome ? netTax / t.annualEmploymentIncome : 0
+  };
+}
 // Extracted from the old flat formula — used both for the initial segment and after every
 // rateChange event below, which recomputes payment from whatever balance/rate/remaining-term
 // applies from that point on.
@@ -4907,6 +4988,95 @@ function HouseholdChooser({ onChoose }) {
   ]);
 }
 
+// One taxpayer's Tax tab card — renders whatever computeIncomeTax produced for a single
+// member. Rendered once for person1 (always) and again for person2 (only while
+// cpfSettings.person2Enabled), each with its own t/taxResult/callbacks — no member-count
+// branching inside this component itself.
+function TaxPersonCard({ memberLabel, t, taxResult, onFieldChange, onAddAdhoc, onUpdateAdhoc, onRemoveAdhoc, showPayrollSync, payrollAnnual, onUsePayroll, selectedMonth }) {
+  return rc(Card, { style: { marginBottom: 20 } },
+    rc("div", { style: { fontFamily: "var(--serif)", fontSize: 17, color: "var(--ink-1)", marginBottom: 12 } }, memberLabel),
+    rc("div", { style: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: 10, marginBottom: 10 } },
+      rc(NumberField, {
+        label: "Annual employment income",
+        value: t.annualEmploymentIncome,
+        onChange: v => onFieldChange("annualEmploymentIncome", v)
+      }),
+      rc(NumberField, {
+        label: "Age",
+        value: t.age,
+        onChange: v => onFieldChange("age", v),
+        hint: "Sets earned income relief"
+      }),
+      rc(NumberField, {
+        label: "Qualifying children",
+        value: t.numChildren,
+        onChange: v => onFieldChange("numChildren", v)
+      }),
+      rc(NumberField, {
+        label: "Child relief per child",
+        value: t.childReliefPerChild,
+        onChange: v => onFieldChange("childReliefPerChild", v)
+      }),
+      rc(NumberField, {
+        label: "NSman relief",
+        value: t.nsmanRelief,
+        onChange: v => onFieldChange("nsmanRelief", v)
+      })
+    ),
+    showPayrollSync && rc("div", {
+      style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap", background: "#F6F5F1", border: "1px solid var(--hair)", borderRadius: 8, padding: "8px 12px", marginBottom: 14 }
+    },
+      rc("div", { style: { fontFamily: "var(--sans)", fontSize: 11.5, color: "var(--ink-3)" } },
+        "Tax is calculated at the payroll level, not by sub-category. ", selectedMonth, " payroll × 12 ≈ ", fmt(payrollAnnual), "."),
+      rc(IconBtn, { onClick: onUsePayroll }, "Use this as annual income")
+    ),
+    rc(CheckField, {
+      label: "Include CPF relief, from this person's own CPF tab figures",
+      checked: t.includeCpfRelief,
+      onChange: v => onFieldChange("includeCpfRelief", v)
+    }),
+    rc("div", { style: { marginTop: 16, paddingTop: 14, borderTop: "1px solid var(--hair)" } },
+      rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 } },
+        rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13 } }, "Ad-hoc reliefs and rebates"),
+        rc("button", { className: "btn-secondary", onClick: onAddAdhoc, style: { padding: "5px 10px", fontSize: 12 } }, "Add item")
+      ),
+      t.adhoc.length === 0 && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)" } },
+        "For example an IPC donation at 250% deduction, course fees, SRS contribution, or Parenthood Tax Rebate."),
+      t.adhoc.map(a => rc("div", {
+        key: a.id,
+        style: { display: "grid", gridTemplateColumns: "2fr 1fr 1fr auto", gap: 10, alignItems: "end", marginBottom: 8 }
+      },
+        rc(TextField, { label: "Name", value: a.name, onChange: v => onUpdateAdhoc(a.id, { name: v }) }),
+        rc(SelectField, { label: "Type", value: a.type, onChange: v => onUpdateAdhoc(a.id, { type: v }), options: ["relief", "rebate"] }),
+        rc(NumberField, { label: "Amount", value: a.amount, onChange: v => onUpdateAdhoc(a.id, { amount: v }) }),
+        rc(IconBtn, { onClick: () => onRemoveAdhoc(a.id) }, "Remove")
+      ))
+    ),
+    rc("div", { style: { display: "flex", gap: 12, flexWrap: "wrap", marginTop: 16, marginBottom: 12 } },
+      rc(KpiCard, {
+        label: "Total reliefs",
+        value: fmt(taxResult.totalReliefs),
+        sub: taxResult.totalReliefsUncapped > 80000 ? `Capped from ${fmt(taxResult.totalReliefsUncapped)}` : undefined
+      }),
+      rc(KpiCard, { label: "Chargeable income", value: fmt(taxResult.chargeableIncome) }),
+      rc(KpiCard, { label: "Tax before rebates", value: fmt(taxResult.taxBeforeRebate, 2) }),
+      rc(KpiCard, {
+        label: "Net tax payable",
+        value: fmt(taxResult.netTax, 2),
+        sub: `Effective rate ${fmtPct(taxResult.effectiveRate, 2)}`
+      })
+    ),
+    rc(Card, { style: { background: "#F6F5F1" } },
+      rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13, marginBottom: 4 } }, "Relief breakdown"),
+      rc(Row, { label: "CPF relief", value: fmt(taxResult.cpfReliefAmt) }),
+      rc(Row, { label: "Qualifying child relief", value: fmt(taxResult.childRelief) }),
+      rc(Row, { label: "Earned income relief", value: fmt(taxResult.eir) }),
+      rc(Row, { label: "NSman relief", value: fmt(t.nsmanRelief) }),
+      rc(Row, { label: "Ad-hoc reliefs", value: fmt(taxResult.adhocReliefs) }),
+      rc(Row, { label: "Total", value: fmt(taxResult.totalReliefs), strong: true })
+    )
+  );
+}
 const PRIMARY_TABS = [["dashboard", "Dashboard"], ["daily", "Daily ledger"]];
 const OTHER_TABS = [["budgets", "Budgets"], ["insurance", "Insurance"], ["recurring", "Recurring"], ["loans", "Loans"], ["cpf", "CPF"], ["tax", "Tax"], ["forecast", "Forecast"], ["history", "History"], ["settings", "Settings"]];
 
@@ -5048,21 +5218,13 @@ function App({ user } = {}) {
   const householdLegacyCover = useMemo(() => policies.filter(p => p.type === "Death/TPD" && !isPolicyLapsed(p)).reduce((a, p) => a + (Number(p.coverage) || 0), 0), [policies]);
   const effectiveAssumptions = useMemo(() => ({
     ...assumptions,
-    monthlyGrossIncome: (cpfSettings.person1Salary || 0) + (cpfSettings.person2Salary || 0),
+    monthlyGrossIncome: (cpfSettings.person1Salary || 0) + (cpfSettings.person2Enabled ? (cpfSettings.person2Salary || 0) : 0),
     carLoanRepayment: carAmort.payment || 0,
     annualInsurancePremiums: annualInsurancePremiumsTotal,
     annualInsurancePremiumsExclEndowments: annualInsurancePremiumsExclEndowmentsTotal,
     person1LegacyCover: primaryEarnerLegacyCover
   }), [assumptions, cpfSettings, carAmort, annualInsurancePremiumsTotal, annualInsurancePremiumsExclEndowmentsTotal, primaryEarnerLegacyCover]);
-  const [taxSettings, setTaxSettings] = useState({
-    annualEmploymentIncome: 0,
-    includeCpfRelief: true,
-    nsmanRelief: 0,
-    numChildren: 0,
-    childReliefPerChild: 4000,
-    age: 0,
-    adhoc: []
-  });
+  const [taxSettings, setTaxSettings] = useState(DEFAULT_TAX_SETTINGS);
   const [tab, setTab] = useState("dashboard");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showLiveBalances, setShowLiveBalances] = useState(false);
@@ -5196,8 +5358,21 @@ function App({ user } = {}) {
           if (p.dismissedHints) setDismissedHints(p.dismissedHints);
           if (p.housingLoan) setHousingLoan({ ...blankLoan(), ...p.housingLoan });
           if (p.carLoan) setCarLoan({ ...blankLoan(), ...p.carLoan });
-          if (p.cpfSettings) setCpfSettings({ ...DEFAULT_CPF_SETTINGS, ...p.cpfSettings });
-          if (p.taxSettings) setTaxSettings(p.taxSettings);
+          if (p.cpfSettings) {
+            // person2Enabled didn't exist before this change — a household that already
+            // has real person2 CPF data (salary/age/manual override) keeps showing it
+            // rather than the toggle silently hiding data that was already in view.
+            // Brand-new/empty person2 fields default to the toggle's own false.
+            const hasPerson2Data = !!(p.cpfSettings.person2Salary || p.cpfSettings.person2Age ||
+              p.cpfSettings.person2ManualOverride || p.cpfSettings.person2ManualOA ||
+              p.cpfSettings.person2ManualSA || p.cpfSettings.person2ManualMA);
+            setCpfSettings({
+              ...DEFAULT_CPF_SETTINGS,
+              ...p.cpfSettings,
+              person2Enabled: p.cpfSettings.person2Enabled ?? hasPerson2Data
+            });
+          }
+          if (p.taxSettings) setTaxSettings(migrateTaxSettings(p.taxSettings));
           // Once the ledger is live the newest month is the current one, which
           // is derived rather than stored — opening on the last SAVED record
           // would land the dashboard on stale history.
@@ -5799,10 +5974,12 @@ function App({ user } = {}) {
       [key]: true
     }
   });
-  const addTaxAdhoc = () => persistAll({
+  // prefix is "person1" or "person2" — every Tax tab write goes through these three,
+  // parameterized by member, instead of duplicating them per person.
+  const addTaxAdhoc = prefix => persistAll({
     taxSettings: {
       ...taxSettings,
-      adhoc: [...taxSettings.adhoc, {
+      [`${prefix}Adhoc`]: [...taxSettings[`${prefix}Adhoc`], {
         id: uid(),
         name: "",
         type: "relief",
@@ -5810,19 +5987,28 @@ function App({ user } = {}) {
       }]
     }
   });
-  const updateTaxAdhoc = (id, patch) => persistAll({
+  const updateTaxAdhoc = (prefix, id, patch) => persistAll({
     taxSettings: {
       ...taxSettings,
-      adhoc: taxSettings.adhoc.map(a => a.id === id ? {
+      [`${prefix}Adhoc`]: taxSettings[`${prefix}Adhoc`].map(a => a.id === id ? {
         ...a,
         ...patch
       } : a)
     }
   });
-  const removeTaxAdhoc = id => persistAll({
+  const removeTaxAdhoc = (prefix, id) => persistAll({
     taxSettings: {
       ...taxSettings,
-      adhoc: taxSettings.adhoc.filter(a => a.id !== id)
+      [`${prefix}Adhoc`]: taxSettings[`${prefix}Adhoc`].filter(a => a.id !== id)
+    }
+  });
+  // field is the canonical computeIncomeTax input name (annualEmploymentIncome, age, ...);
+  // this maps it onto the prefixed taxSettings key so each TaxPersonCard's onChange stays
+  // identical regardless of which member it's editing.
+  const updateTaxField = (prefix, field, value) => persistAll({
+    taxSettings: {
+      ...taxSettings,
+      [`${prefix}${field[0].toUpperCase()}${field.slice(1)}`]: value
     }
   });
   const cpfResult = useMemo(() => computeCpfContribution(cpfSettings.person1Age, cpfSettings.person1Salary, cpfSettings.person1BonusThisMonth, cpfSettings.person1AnnualOwToDate), [cpfSettings]);
@@ -5845,31 +6031,27 @@ function App({ user } = {}) {
     saAmt: cpfResultPerson2.saAmt,
     maAmt: cpfResultPerson2.maAmt
   };
-  const taxResult = useMemo(() => {
-    const cpfReliefAmt = taxSettings.includeCpfRelief ? Math.min(0.20 * Math.min(cpfSettings.person1Salary, CPF_OW_CEILING) * 12, 37740) : 0;
-    const childRelief = taxSettings.numChildren * taxSettings.childReliefPerChild;
-    const eir = earnedIncomeRelief(taxSettings.age);
-    const adhocReliefs = taxSettings.adhoc.filter(a => a.type === "relief").reduce((a, r) => a + (Number(r.amount) || 0), 0);
-    const adhocRebates = taxSettings.adhoc.filter(a => a.type === "rebate").reduce((a, r) => a + (Number(r.amount) || 0), 0);
-    const totalReliefsUncapped = cpfReliefAmt + childRelief + eir + taxSettings.nsmanRelief + adhocReliefs;
-    const totalReliefs = Math.min(totalReliefsUncapped, 80000);
-    const chargeableIncome = Math.max(taxSettings.annualEmploymentIncome - totalReliefs, 0);
-    const taxBeforeRebate = computeTax(chargeableIncome);
-    const netTax = Math.max(taxBeforeRebate - adhocRebates, 0);
-    return {
-      cpfReliefAmt,
-      childRelief,
-      eir,
-      adhocReliefs,
-      totalReliefsUncapped,
-      totalReliefs,
-      chargeableIncome,
-      taxBeforeRebate,
-      adhocRebates,
-      netTax,
-      effectiveRate: taxSettings.annualEmploymentIncome ? netTax / taxSettings.annualEmploymentIncome : 0
-    };
-  }, [taxSettings, cpfSettings]);
+  // One income tax estimate per active member — always person1, plus person2 only while
+  // cpfSettings.person2Enabled. Each pulls its own CPF relief from that SAME person's own
+  // computeCpfContribution() output (cpfResult / cpfResultPerson2 above), never pooled.
+  const taxResultPerson1 = useMemo(() => computeIncomeTax({
+    annualEmploymentIncome: taxSettings.person1AnnualEmploymentIncome,
+    age: taxSettings.person1Age,
+    numChildren: taxSettings.person1NumChildren,
+    childReliefPerChild: taxSettings.person1ChildReliefPerChild,
+    nsmanRelief: taxSettings.person1NsmanRelief,
+    includeCpfRelief: taxSettings.person1IncludeCpfRelief,
+    adhoc: taxSettings.person1Adhoc
+  }, cpfEmployeeAnnual(cpfResult)), [taxSettings, cpfResult]);
+  const taxResultPerson2 = useMemo(() => cpfSettings.person2Enabled ? computeIncomeTax({
+    annualEmploymentIncome: taxSettings.person2AnnualEmploymentIncome,
+    age: taxSettings.person2Age,
+    numChildren: taxSettings.person2NumChildren,
+    childReliefPerChild: taxSettings.person2ChildReliefPerChild,
+    nsmanRelief: taxSettings.person2NsmanRelief,
+    includeCpfRelief: taxSettings.person2IncludeCpfRelief,
+    adhoc: taxSettings.person2Adhoc
+  }, cpfEmployeeAnnual(cpfResultPerson2)) : null, [taxSettings, cpfResultPerson2, cpfSettings.person2Enabled]);
   const housingAmort = useMemo(() => amortize(housingLoan), [housingLoan]);
   const activeLoan = loanSub === "housing" ? housingLoan : carLoan;
   const activeAmort = loanSub === "housing" ? housingAmort : carAmort;
@@ -6043,6 +6225,8 @@ function App({ user } = {}) {
   }, "Loading ledger\u2026");
   const current = derivedByMonth[selectedMonth];
   const currentRecord = records.find(r => r.month === selectedMonth);
+  const person1PayrollCat = categories.income.find(c => c.primaryIncome);
+  const person1PayrollAnnual = currentRecord && person1PayrollCat ? incomeCatVal(currentRecord, person1PayrollCat) * 12 : 0;
   const dashboardMetrics = current.hasBalances ? buildDashboardMetrics({
     current,
     currentRecord,
@@ -7945,7 +8129,15 @@ function App({ user } = {}) {
   }, fmt(y.balance)))))))), tab === "cpf" && /*#__PURE__*/React.createElement(Section, {
     title: "CPF contributions",
     eyebrow: "CPF Board rates effective 1 Jan 2026"
-  }, /*#__PURE__*/React.createElement("div", {
+  },
+    rc("div", { style: { marginBottom: 16 } },
+      rc(CheckField, {
+        label: `Also track ${familyMembers[1] || "a second household member"}'s CPF & tax`,
+        checked: cpfSettings.person2Enabled,
+        onChange: v => persistAll({ cpfSettings: { ...cpfSettings, person2Enabled: v } })
+      })
+    ),
+    /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 12,
@@ -8135,7 +8327,7 @@ function App({ user } = {}) {
         person1ManualMA: v
       }
     })
-  })))), /*#__PURE__*/React.createElement("div", {
+  })))), cpfSettings.person2Enabled && rc(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 12,
@@ -8292,220 +8484,59 @@ function App({ user } = {}) {
         person2ManualMA: v
       }
     })
-  }))))), tab === "tax" && /*#__PURE__*/React.createElement(Section, {
+  })))))), tab === "tax" && /*#__PURE__*/React.createElement(Section, {
     title: "Income tax estimate",
     eyebrow: "IRAS resident rates, YA2024 onwards"
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 12.5,
-      color: "var(--ink-3)",
-      marginBottom: 14
-    }
-  }, "Covers CPF relief, NSman, qualifying child and earned income relief, plus an ad-hoc box for anything else such as donations, course fees, SRS or Parenthood Tax Rebate. Total reliefs are capped at ", fmt(80000), " per IRAS rules. This is an estimate, not a filing."), /*#__PURE__*/React.createElement(Card, {
-    style: {
-      marginBottom: 16
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "repeat(3, minmax(0,1fr))",
-      gap: 10,
-      marginBottom: 10
-    }
-  }, /*#__PURE__*/React.createElement(NumberField, {
-    label: "Annual employment income",
-    value: taxSettings.annualEmploymentIncome,
-    onChange: v => persistAll({
-      taxSettings: {
-        ...taxSettings,
-        annualEmploymentIncome: v
-      }
-    })
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Age",
-    value: taxSettings.age,
-    onChange: v => persistAll({
-      taxSettings: {
-        ...taxSettings,
-        age: v
-      }
+  },
+    rc("div", {
+      style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 14 }
+    }, "Covers CPF relief, NSman, qualifying child and earned income relief, plus an ad-hoc box for anything else such as donations, course fees, SRS or Parenthood Tax Rebate. Total reliefs are capped at ", fmt(80000), " per IRAS rules \u2014 calculated separately for each tracked household member, since Singapore has no joint income tax filing. This is an estimate, not a filing."),
+    rc(TaxPersonCard, {
+      memberLabel: familyMembers[0] || "Person 1",
+      t: {
+        annualEmploymentIncome: taxSettings.person1AnnualEmploymentIncome,
+        age: taxSettings.person1Age,
+        numChildren: taxSettings.person1NumChildren,
+        childReliefPerChild: taxSettings.person1ChildReliefPerChild,
+        nsmanRelief: taxSettings.person1NsmanRelief,
+        includeCpfRelief: taxSettings.person1IncludeCpfRelief,
+        adhoc: taxSettings.person1Adhoc
+      },
+      taxResult: taxResultPerson1,
+      onFieldChange: (field, v) => updateTaxField("person1", field, v),
+      onAddAdhoc: () => addTaxAdhoc("person1"),
+      onUpdateAdhoc: (id, patch) => updateTaxAdhoc("person1", id, patch),
+      onRemoveAdhoc: id => removeTaxAdhoc("person1", id),
+      showPayrollSync: true,
+      payrollAnnual: person1PayrollAnnual,
+      onUsePayroll: () => updateTaxField("person1", "annualEmploymentIncome", person1PayrollAnnual),
+      selectedMonth: selectedMonth
     }),
-    hint: "Sets earned income relief"
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Qualifying children",
-    value: taxSettings.numChildren,
-    onChange: v => persistAll({
-      taxSettings: {
-        ...taxSettings,
-        numChildren: v
-      }
-    })
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Child relief per child",
-    value: taxSettings.childReliefPerChild,
-    onChange: v => persistAll({
-      taxSettings: {
-        ...taxSettings,
-        childReliefPerChild: v
-      }
-    })
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "NSman relief",
-    value: taxSettings.nsmanRelief,
-    onChange: v => persistAll({
-      taxSettings: {
-        ...taxSettings,
-        nsmanRelief: v
-      }
-    })
-  })), (() => {
-    const payrollCat = categories.income.find(c => c.primaryIncome);
-    const payrollAnnual = currentRecord && payrollCat ? incomeCatVal(currentRecord, payrollCat) * 12 : 0;
-    return /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: 10,
-        flexWrap: "wrap",
-        background: "#F6F5F1",
-        border: "1px solid var(--hair)",
-        borderRadius: 8,
-        padding: "8px 12px",
-        marginBottom: 14
-      }
-    }, /*#__PURE__*/React.createElement("div", {
-      style: {
-        fontFamily: "var(--sans)",
-        fontSize: 11.5,
-        color: "var(--ink-3)"
-      }
-    }, "Tax is calculated at the payroll level, not by sub-category. ", selectedMonth, " payroll \u00D7 12 \u2248 ", fmt(payrollAnnual), "."), /*#__PURE__*/React.createElement(IconBtn, {
-      onClick: () => persistAll({
-        taxSettings: {
-          ...taxSettings,
-          annualEmploymentIncome: payrollAnnual
-        }
-      })
-    }, "Use this as annual income"));
-  })(), /*#__PURE__*/React.createElement(CheckField, {
-    label: "Include CPF relief, using the monthly salary from the CPF tab",
-    checked: taxSettings.includeCpfRelief,
-    onChange: v => persistAll({
-      taxSettings: {
-        ...taxSettings,
-        includeCpfRelief: v
-      }
-    })
-  })), /*#__PURE__*/React.createElement(Card, {
-    style: {
-      marginBottom: 16
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center",
-      marginBottom: 10
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontWeight: 600,
-      fontSize: 13
-    }
-  }, "Ad-hoc reliefs and rebates"), /*#__PURE__*/React.createElement("button", {
-    className: "btn-secondary",
-    onClick: addTaxAdhoc,
-    style: {
-      padding: "5px 10px",
-      fontSize: 12
-    }
-  }, "Add item")), taxSettings.adhoc.length === 0 && /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontSize: 12.5,
-      color: "var(--ink-3)"
-    }
-  }, "For example an IPC donation at 250% deduction, course fees, SRS contribution, or Parenthood Tax Rebate."), taxSettings.adhoc.map(a => /*#__PURE__*/React.createElement("div", {
-    key: a.id,
-    style: {
-      display: "grid",
-      gridTemplateColumns: "2fr 1fr 1fr auto",
-      gap: 10,
-      alignItems: "end",
-      marginBottom: 8
-    }
-  }, /*#__PURE__*/React.createElement(TextField, {
-    label: "Name",
-    value: a.name,
-    onChange: v => updateTaxAdhoc(a.id, {
-      name: v
-    })
-  }), /*#__PURE__*/React.createElement(SelectField, {
-    label: "Type",
-    value: a.type,
-    onChange: v => updateTaxAdhoc(a.id, {
-      type: v
-    }),
-    options: ["relief", "rebate"]
-  }), /*#__PURE__*/React.createElement(NumberField, {
-    label: "Amount",
-    value: a.amount,
-    onChange: v => updateTaxAdhoc(a.id, {
-      amount: v
-    })
-  }), /*#__PURE__*/React.createElement(IconBtn, {
-    onClick: () => removeTaxAdhoc(a.id)
-  }, "Remove")))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 12,
-      flexWrap: "wrap",
-      marginBottom: 12
-    }
-  }, /*#__PURE__*/React.createElement(KpiCard, {
-    label: "Total reliefs",
-    value: fmt(taxResult.totalReliefs),
-    sub: taxResult.totalReliefsUncapped > 80000 ? `Capped from ${fmt(taxResult.totalReliefsUncapped)}` : undefined
-  }), /*#__PURE__*/React.createElement(KpiCard, {
-    label: "Chargeable income",
-    value: fmt(taxResult.chargeableIncome)
-  }), /*#__PURE__*/React.createElement(KpiCard, {
-    label: "Tax before rebates",
-    value: fmt(taxResult.taxBeforeRebate, 2)
-  }), /*#__PURE__*/React.createElement(KpiCard, {
-    label: "Net tax payable",
-    value: fmt(taxResult.netTax, 2),
-    sub: `Effective rate ${fmtPct(taxResult.effectiveRate, 2)}`
-  })), /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontFamily: "var(--sans)",
-      fontWeight: 600,
-      fontSize: 13,
-      marginBottom: 4
-    }
-  }, "Relief breakdown"), /*#__PURE__*/React.createElement(Row, {
-    label: "CPF relief",
-    value: fmt(taxResult.cpfReliefAmt)
-  }), /*#__PURE__*/React.createElement(Row, {
-    label: "Qualifying child relief",
-    value: fmt(taxResult.childRelief)
-  }), /*#__PURE__*/React.createElement(Row, {
-    label: "Earned income relief",
-    value: fmt(taxResult.eir)
-  }), /*#__PURE__*/React.createElement(Row, {
-    label: "NSman relief",
-    value: fmt(taxSettings.nsmanRelief)
-  }), /*#__PURE__*/React.createElement(Row, {
-    label: "Ad-hoc reliefs",
-    value: fmt(taxResult.adhocReliefs)
-  }), /*#__PURE__*/React.createElement(Row, {
-    label: "Total",
-    value: fmt(taxResult.totalReliefs),
-    strong: true
-  }))), tab === "forecast" && /*#__PURE__*/React.createElement(Section, {
+    cpfSettings.person2Enabled ? rc(TaxPersonCard, {
+      memberLabel: familyMembers[1] || "Person 2",
+      t: {
+        annualEmploymentIncome: taxSettings.person2AnnualEmploymentIncome,
+        age: taxSettings.person2Age,
+        numChildren: taxSettings.person2NumChildren,
+        childReliefPerChild: taxSettings.person2ChildReliefPerChild,
+        nsmanRelief: taxSettings.person2NsmanRelief,
+        includeCpfRelief: taxSettings.person2IncludeCpfRelief,
+        adhoc: taxSettings.person2Adhoc
+      },
+      taxResult: taxResultPerson2,
+      onFieldChange: (field, v) => updateTaxField("person2", field, v),
+      onAddAdhoc: () => addTaxAdhoc("person2"),
+      onUpdateAdhoc: (id, patch) => updateTaxAdhoc("person2", id, patch),
+      onRemoveAdhoc: id => removeTaxAdhoc("person2", id),
+      showPayrollSync: false,
+      selectedMonth: selectedMonth
+    }) : rc("div", {
+      style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap", border: "1px dashed var(--hair-strong)", borderRadius: 8, padding: "10px 12px" }
+    },
+      `Want ${familyMembers[1] || "a second household member"}'s tax tracked separately too?`,
+      rc(IconBtn, { onClick: () => setTab("cpf") }, "Turn on in CPF tab")
+    )
+  ), tab === "forecast" && /*#__PURE__*/React.createElement(Section, {
     title: "12-month forecast",
     eyebrow: "Projection"
   }, /*#__PURE__*/React.createElement("div", {
