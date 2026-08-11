@@ -1069,80 +1069,17 @@ const EXPENSE_GROUPS = [{
   key: "variable",
   label: "Variable expenses"
 }];
+// A new household starts with zero accounts in every group — not everyone has the same
+// mix of bank accounts, investment platforms, or property/loans to track, and pre-seeding
+// four bank accounts and a credit card just meant deleting what didn't apply. Users add
+// their own via Settings > Accounts (addAccount) or by importing (SetupWizard creates
+// them from the file's own account values) — both already existed independent of this
+// seed. LABELS.bankAccount1 etc. are kept (not dead code): existing households seeded
+// before this change still have accounts carrying those exact labels.
 const seedAccounts = () => ({
-  liquidCash: [{
-    key: "bankAccount1",
-    label: LABELS.bankAccount1,
-    owner: "Joint"
-  }, {
-    key: "bankAccount2",
-    label: LABELS.bankAccount2,
-    owner: "Joint"
-  }, {
-    key: "bankAccount3",
-    label: LABELS.bankAccount3,
-    owner: "Joint"
-  }, {
-    key: "bankAccount4",
-    label: LABELS.bankAccount4,
-    owner: "Joint"
-  }, {
-    key: "cash",
-    label: LABELS.cash,
-    owner: "Joint"
-  }],
-  investments: [{
-    key: "investmentAccount1",
-    label: LABELS.investmentAccount1,
-    owner: "Joint"
-  }, {
-    key: "investmentAccount2",
-    label: LABELS.investmentAccount2,
-    owner: "Joint"
-  }, {
-    key: "investmentAccount3",
-    label: LABELS.investmentAccount3,
-    owner: "Joint"
-  }, {
-    key: "investmentAccount4",
-    label: LABELS.investmentAccount4,
-    owner: "Joint"
-  }, {
-    key: "cdp",
-    label: LABELS.cdp,
-    owner: "Joint"
-  }, {
-    key: "other",
-    label: LABELS.other,
-    owner: "Joint"
-  }],
-  property: [{
-    key: "hdbValue",
-    label: LABELS.hdbValue,
-    type: "asset",
-    owner: "Joint"
-  }, {
-    key: "hdbLoan",
-    label: LABELS.hdbLoan,
-    type: "liability",
-    shortTermLiability: false,
-    mortgage: true,
-    owner: "Joint"
-  }, {
-    key: "carLoan",
-    label: LABELS.carLoan,
-    type: "liability",
-    shortTermLiability: false,
-    mortgage: false,
-    owner: "Joint"
-  }, {
-    key: "creditCard",
-    label: LABELS.creditCard,
-    type: "liability",
-    shortTermLiability: true,
-    mortgage: false,
-    owner: "Joint"
-  }]
+  liquidCash: [],
+  investments: [],
+  property: []
 });
 // Default shape for housingLoan/carLoan — used both for a fresh household and to backfill
 // fields onto a loan stored before the recurring-posting/loan-events work shipped, so an
@@ -3260,6 +3197,11 @@ function SetupWizard({
   const [importSummary, setImportSummary] = useState(null);
   const [balanceInputs, setBalanceInputs] = useState({});
   const [asOfDate, setAsOfDate] = useState(todayISO());
+  // Raw account-group key -> typed name for the Balances step's own "+ Add account" —
+  // households start with zero seeded accounts (see seedAccounts), so a "Start fresh, no
+  // import" run needs some way to actually create the first one instead of landing on an
+  // empty step with nothing to enter a balance for.
+  const [newAccountName, setNewAccountName] = useState({});
   const [busy, setBusy] = useState(false);
   // Count of transactions actually attempted so far during confirmImport — drives the
   // Preview step's progress bar so a large import doesn't look stuck.
@@ -4062,6 +4004,18 @@ function SetupWizard({
               `Confirm import (${plan.txnsToWrite.length})`)));
   } else if (step === "balances") {
     const groupDefs = [["liquidCash", "Liquid cash"], ["investments", "Investments"], ["property", "Property & loans"]];
+    // Mirrors App's own addAccount (Settings > Accounts) exactly — same default shape,
+    // same asset-until-edited default for a new property account — just callable from
+    // here too, via the same persistAll prop, so "Start fresh" isn't a dead end for a
+    // household with zero accounts yet.
+    const addAccountHere = group => {
+      const label = (newAccountName[group] || "").trim();
+      if (!label) return;
+      const item = { key: `acct_${uid()}`, label, owner: "Joint" };
+      if (group === "property") { item.type = "asset"; item.shortTermLiability = false; }
+      persistAll({ accounts: { ...accounts, [group]: [...accounts[group], item] } });
+      setNewAccountName(n => ({ ...n, [group]: "" }));
+    };
     body = rc("div", null,
       importSummary && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", marginBottom: 14 } },
         `Imported ${importSummary.importedCount} transactions.`),
@@ -4070,9 +4024,10 @@ function SetupWizard({
       fieldRow("As of", rc("input", { type: "date", value: asOfDate, onChange: e => setAsOfDate(e.target.value), style: { ...inputStyle, width: 160 } })),
       groupDefs.map(([group, label]) => {
         const items = registry.filter(a => a.group === group);
-        if (!items.length) return null;
         return rc("div", { key: group, style: { marginBottom: 16 } },
           rc("div", { style: { fontFamily: "var(--sans)", fontWeight: 600, fontSize: 13, marginBottom: 8 } }, label),
+          !items.length && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12, color: "var(--ink-3)", marginBottom: 8 } },
+            "No accounts yet."),
           items.map(a => rc("div", { key: a.key, style: { display: "flex", gap: 10, alignItems: "center", marginBottom: 6 } },
             rc("div", { style: { flex: "1 1 200px", fontFamily: "var(--sans)", fontSize: 12.5 } },
               a.label, a.kind === "liability" && rc("span", { style: { color: "var(--ink-3)" } }, " (liability)")),
@@ -4084,7 +4039,22 @@ function SetupWizard({
               style: { ...inputStyle, width: 120, fontFamily: "var(--mono)", textAlign: "right" }
             }),
             (liveBalances[a.key] || 0) !== 0 && rc("span", { style: { fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)" } },
-              `currently tracked: ${fmt(liveBalances[a.key] || 0)}`))));
+              `currently tracked: ${fmt(liveBalances[a.key] || 0)}`))),
+          rc("div", { style: { display: "flex", gap: 8, alignItems: "center", marginTop: 6 } },
+            rc("input", {
+              type: "text",
+              placeholder: `New ${label.toLowerCase()} account name`,
+              value: newAccountName[group] || "",
+              onChange: e => setNewAccountName(n => ({ ...n, [group]: e.target.value })),
+              onKeyDown: e => { if (e.key === "Enter") addAccountHere(group); },
+              style: { ...inputStyle, flex: "1 1 200px", fontSize: 12.5, padding: "5px 9px" }
+            }),
+            rc("button", {
+              className: "btn-secondary",
+              style: { padding: "5px 12px", fontSize: 12.5 },
+              disabled: !(newAccountName[group] || "").trim(),
+              onClick: () => addAccountHere(group)
+            }, "+ Add account")));
       }),
       rc("div", { style: { display: "flex", justifyContent: "space-between", marginTop: 8 } },
         rc("button", { className: "btn-secondary", disabled: busy, onClick: onFinish }, "Skip this step"),
