@@ -422,25 +422,39 @@ function computeDerived(record, assumptions, accounts) {
   }, {
     key: "hdbLoan",
     type: "liability",
-    shortTermLiability: false
+    shortTermLiability: false,
+    mortgage: true
   }, {
     key: "carLoan",
     type: "liability",
-    shortTermLiability: false
+    shortTermLiability: false,
+    mortgage: false
   }, {
     key: "creditCard",
     type: "liability",
-    shortTermLiability: true
+    shortTermLiability: true,
+    mortgage: false
   }];
   const totalPropertyAssets = propAccounts.filter(a => a.type === "asset").reduce((s, a) => s + (Number((b.property || {})[a.key]) || 0), 0);
   const totalLiabilities = propAccounts.filter(a => a.type === "liability").reduce((s, a) => s + (Number((b.property || {})[a.key]) || 0), 0);
   const totalShortTermLiabilities = propAccounts.filter(a => a.type === "liability" && a.shortTermLiability).reduce((s, a) => s + (Number((b.property || {})[a.key]) || 0), 0);
-  const propertyEquity = totalPropertyAssets - totalLiabilities;
+  // "Property equity" is scoped to actual mortgage debt only (the `mortgage` flag on a
+  // property-group liability account) — car loans, credit cards, and any other liability
+  // parked in the same "Property & loans" account group are real debt too, but netting them
+  // into a KPI literally named "Property equity" reads as if the home itself were underwater.
+  // They're broken out into otherLiabilities/otherLiabilitiesByOwner instead so nothing is
+  // silently dropped from the balance sheet — netWorth (below) still nets ALL of totalLiabilities,
+  // unaffected by this split.
+  const mortgageLiabilities = propAccounts.filter(a => a.type === "liability" && a.mortgage).reduce((s, a) => s + (Number((b.property || {})[a.key]) || 0), 0);
+  const otherLiabilitiesTotal = totalLiabilities - mortgageLiabilities;
+  const propertyEquity = totalPropertyAssets - mortgageLiabilities;
+  const otherLiabilities = -otherLiabilitiesTotal;
   const propertyEquityByOwner = (() => {
     const result = {
       Joint: 0
     };
     propAccounts.forEach(a => {
+      if (a.type === "liability" && !a.mortgage) return;
       const v = Number((b.property || {})[a.key]) || 0;
       const owner = a.owner || "Joint";
       const signed = a.type === "liability" ? -v : v;
@@ -448,7 +462,19 @@ function computeDerived(record, assumptions, accounts) {
     });
     return result;
   })();
-  const netWorth = totalLiquidCash + totalInvestments + combinedCpf + propertyEquity;
+  const otherLiabilitiesByOwner = (() => {
+    const result = {
+      Joint: 0
+    };
+    propAccounts.forEach(a => {
+      if (a.type !== "liability" || a.mortgage) return;
+      const v = Number((b.property || {})[a.key]) || 0;
+      const owner = a.owner || "Joint";
+      result[owner] = (result[owner] || 0) - v;
+    });
+    return result;
+  })();
+  const netWorth = totalLiquidCash + totalInvestments + combinedCpf + totalPropertyAssets - totalLiabilities;
   const totalAssets = totalLiquidCash + totalInvestments + combinedCpf + totalPropertyAssets;
   const currentLiquidCashNetCC = totalLiquidCash - totalShortTermLiabilities;
   const bufferProgress = safeDiv(currentLiquidCashNetCC, assumptions.emergencyBufferTarget);
@@ -477,6 +503,8 @@ function computeDerived(record, assumptions, accounts) {
     totalLiabilities,
     propertyEquity,
     propertyEquityByOwner,
+    otherLiabilities,
+    otherLiabilitiesByOwner,
     netWorth,
     totalAssets,
     currentLiquidCashNetCC,
@@ -1085,18 +1113,21 @@ const seedAccounts = () => ({
     label: LABELS.hdbLoan,
     type: "liability",
     shortTermLiability: false,
+    mortgage: true,
     owner: "Joint"
   }, {
     key: "carLoan",
     label: LABELS.carLoan,
     type: "liability",
     shortTermLiability: false,
+    mortgage: false,
     owner: "Joint"
   }, {
     key: "creditCard",
     label: LABELS.creditCard,
     type: "liability",
     shortTermLiability: true,
+    mortgage: false,
     owner: "Joint"
   }]
 });
@@ -1937,7 +1968,22 @@ function AccountSettingsList({
     onChange: e => onUpdate(a.key, {
       shortTermLiability: e.target.checked
     })
-  }), "Short-term (counts against buffer)"), /*#__PURE__*/React.createElement(IconBtn, {
+  }), "Short-term (counts against buffer)"), group === "property" && a.type === "liability" && /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 4,
+      fontFamily: "var(--sans)",
+      fontSize: 11,
+      color: "var(--ink-3)"
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: !!a.mortgage,
+    onChange: e => onUpdate(a.key, {
+      mortgage: e.target.checked
+    })
+  }), "Counts toward Property equity"), /*#__PURE__*/React.createElement(IconBtn, {
     onClick: () => onRemove(a.key)
   }, "Delete"))));
 }
@@ -3423,7 +3469,7 @@ function SetupWizard({
       // pointing at nothing once this new account is merged in and re-derived into registry.
       let resolvedKey;
       if (m.action === "createCreditCard") {
-        newAccountsByGroup.property.push({ key, label, type: "liability", shortTermLiability: true, owner: "Joint" });
+        newAccountsByGroup.property.push({ key, label, type: "liability", shortTermLiability: true, mortgage: false, owner: "Joint" });
         resolvedKey = `property.${key}`;
       } else {
         const group = m.action === "createInvest" ? "investments" : "liquidCash";
@@ -5059,11 +5105,19 @@ function App({ user } = {}) {
               owner: "Joint",
               ...a
             }));
+            // Accounts saved before the mortgage-vs-other-debt split shipped have no
+            // `mortgage` field at all — default only the original seeded HDB loan key to
+            // true so an existing household's car loan/credit cards/custom liabilities
+            // don't retroactively (and silently) start counting as property equity.
+            const withMortgageDefault = list => (list || []).map(a => ({
+              mortgage: a.key === "hdbLoan",
+              ...a
+            }));
             setAccounts({
               ...p.accounts,
               liquidCash: withOwnerDefault(p.accounts.liquidCash),
               investments: withOwnerDefault(p.accounts.investments),
-              property: withOwnerDefault(p.accounts.property)
+              property: withMortgageDefault(withOwnerDefault(p.accounts.property))
             });
           }
           if (p.openingBalances) setOpeningBalances(p.openingBalances);
@@ -5213,7 +5267,8 @@ function App({ user } = {}) {
         liquidCash: d.hasBalances ? Math.round(d.totalLiquidCash) : null,
         investments: d.hasBalances ? Math.round(d.totalInvestments) : null,
         cpf: d.hasBalances ? Math.round(d.combinedCpf) : null,
-        propertyEquity: d.hasBalances ? Math.round(d.propertyEquity) : null
+        propertyEquity: d.hasBalances ? Math.round(d.propertyEquity) : null,
+        otherLiabilities: d.hasBalances ? Math.round(d.otherLiabilities) : null
       };
     });
   }, [records, derivedByMonth]);
@@ -6229,6 +6284,9 @@ function App({ user } = {}) {
     label: "Property equity",
     value: current.hasBalances ? fmt(current.propertyEquity) : DASH
   }), /*#__PURE__*/React.createElement(KpiCard, {
+    label: "Other loans & cards",
+    value: current.hasBalances ? fmt(current.otherLiabilities) : DASH
+  }), /*#__PURE__*/React.createElement(KpiCard, {
     label: "Net cashflow (month)",
     value: fmt(current.netCashflow),
     sub: `Income ${fmt(current.totalIncome)} less expenses ${fmt(current.totalExpenses)}`
@@ -6513,6 +6571,15 @@ function App({ user } = {}) {
     name: "Property equity"
   }), /*#__PURE__*/React.createElement(Area, {
     type: "monotone",
+    dataKey: "otherLiabilities",
+    stackId: "nw",
+    stroke: "#A6402B",
+    fill: "#A6402B",
+    fillOpacity: 0.75,
+    strokeWidth: 1,
+    name: "Other loans & cards"
+  }), /*#__PURE__*/React.createElement(Area, {
+    type: "monotone",
     dataKey: "cpf",
     stackId: "nw",
     stroke: "#7F77DD",
@@ -6548,7 +6615,7 @@ function App({ user } = {}) {
   }, [["Liquid cash", "#0F5D52", current.totalLiquidCash, current.liquidCashByOwner], ["Investments", "#378ADD", current.totalInvestments, current.investmentsByOwner], ["CPF combined", "#7F77DD", current.combinedCpf, {
     [familyMembers[0] || "Person 1"]: current.person1CpfTotal,
     [familyMembers[1] || "Person 2"]: current.person2CpfTotal
-  }], ["Property equity", "#35577A", current.propertyEquity, current.propertyEquityByOwner]].map(([label, color, value, splitData]) => /*#__PURE__*/React.createElement("div", {
+  }], ["Property equity", "#35577A", current.propertyEquity, current.propertyEquityByOwner], ["Other loans & cards", "#A6402B", current.otherLiabilities, current.otherLiabilitiesByOwner]].map(([label, color, value, splitData]) => /*#__PURE__*/React.createElement("div", {
     key: label,
     style: {
       display: "flex",
@@ -6610,6 +6677,7 @@ function App({ user } = {}) {
     if (ownerSplitOpen === "Liquid cash") return current.liquidCashByOwner;
     if (ownerSplitOpen === "Investments") return current.investmentsByOwner;
     if (ownerSplitOpen === "Property equity") return current.propertyEquityByOwner;
+    if (ownerSplitOpen === "Other loans & cards") return current.otherLiabilitiesByOwner;
     if (ownerSplitOpen === "CPF combined") return {
       [familyMembers[0] || "Person 1"]: current.person1CpfTotal,
       [familyMembers[1] || "Person 2"]: current.person2CpfTotal
