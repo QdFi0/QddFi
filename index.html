@@ -677,7 +677,14 @@ function discretionarySpendTrend(monthlyDiscretionarySpend, windowMonths) {
   const value = (recentAvg - priorAvg) / priorAvg;
   return { value, status: value <= 0.05 ? "stable" : value <= 0.15 ? "rising" : "high_growth", inputs_used: { recentAvg, priorAvg, windowMonths }, warnings: [] };
 }
-function yearsToFI(currentInvestableNetWorth, annualSavingsAmount, annualEssentialExpenses, expectedRealReturn, withdrawalRate) {
+function yearsToFI(currentInvestableNetWorth, annualSavingsAmount, annualEssentialExpenses, expectedRealReturn, withdrawalRate, monthsOfHistory) {
+  // Same minimum as emergencyFundRatio's rolling-window gate — annualEssentialExpenses is
+  // averaged over the same last12Records this count comes from, so a projection built on
+  // fewer than 3 months is extrapolating from an unrepresentative partial-month figure the
+  // same way a too-short expense window would be.
+  if (monthsOfHistory < 3) {
+    return { value: null, status: "insufficient_data", inputs_used: { monthsOfHistory }, warnings: ["Need at least 3 months of transaction history"] };
+  }
   expectedRealReturn = expectedRealReturn ?? 0.04;
   withdrawalRate = withdrawalRate ?? 0.04;
   const fiTarget = safeDiv(annualEssentialExpenses, withdrawalRate);
@@ -758,7 +765,8 @@ function buildDashboardMetrics({
       (current.totalIncome - current.totalExpenses) * 12,
       annualEssentialExpenses,
       financialPlanning.expectedRealReturn,
-      financialPlanning.withdrawalRate
+      financialPlanning.withdrawalRate,
+      records.length
     ),
     debtToAsset: debtToAssetRatio(current.totalLiabilities, current.totalAssets),
     housingDTI: { ...dti.housingDTI, warnings: dti.warnings },
