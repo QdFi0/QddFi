@@ -267,6 +267,15 @@ const incomeCatVal = (record, cat) => {
   const v = (record.income || {})[cat.key];
   return v && typeof v === "object" ? sum(v) : Number(v) || 0;
 };
+// Trailing N-month average of valueFor(record), deliberately excluding the
+// current/in-progress month at selectedIdx — an unfinished month would drag a "what's
+// typical" baseline toward whatever fraction of it has been logged so far. Shared by the
+// Dashboard's expense-breakdown variance and the Budgets tab's "N-mo avg for reference"
+// figure so the two can't compute different things under the same "trailing average" label.
+const trailingAverage = (records, selectedIdx, months, valueFor) => {
+  const window = records.slice(Math.max(0, selectedIdx - months), selectedIdx);
+  return window.length ? window.reduce((a, r) => a + valueFor(r), 0) / window.length : null;
+};
 const normalizeBudget = b => {
   if (!b) return {
     amount: 0,
@@ -1142,6 +1151,19 @@ const seedAccounts = () => ({
   liquidCash: [],
   investments: [],
   property: []
+});
+// Baseline shape for a newly-created property-group account, shared by every place
+// that can create one (Settings > Accounts' "+Add account", the Setup Wizard's
+// Balances-step "+Add account", and its dedicated "+Create new (Credit card)" path)
+// so they can't independently drift on fields none of them has a real reason to
+// disagree about. `type` must be "asset" or "liability" — the caller is responsible
+// for getting an explicit choice from the user rather than guessing one; a property
+// account's asset/liability status directly flips its sign in net worth, so there is
+// no safe default. shortTermLiability defaults false — only the credit-card-specific
+// wizard path actually knows it's building a credit card and overrides it to true.
+const blankPropertyAccount = (key, label, type) => ({
+  key, label, owner: "Joint",
+  ...(type === "liability" ? { type: "liability", shortTermLiability: false, mortgage: false } : { type: "asset" })
 });
 // Default shape for housingLoan/carLoan — used both for a fresh household and to backfill
 // fields onto a loan stored before the recurring-posting/loan-events work shipped, so an
@@ -3264,7 +3286,7 @@ function ReconcileDialog({ account, computed, onCancel, onConfirm, categories })
       }
     }, Math.abs(diff) < 0.005
       ? "No difference — nothing will be recorded."
-      : `A ${diff > 0 ? "increase" : "decrease"} of ${fmt(Math.abs(diff), 2)} will be written to the ledger as a balance adjustment entry.`),
+      : `${diff > 0 ? "An increase" : "A decrease"} of ${fmt(Math.abs(diff), 2)} will be written to the ledger as a balance adjustment entry.`),
     rc("div", { style: { display: "flex", gap: 8, justifyContent: "flex-end" } },
       rc("button", { className: "btn-secondary", onClick: onCancel }, "Cancel"),
       rc("button", {
@@ -3338,6 +3360,9 @@ function SetupWizard({
   // import" run needs some way to actually create the first one instead of landing on an
   // empty step with nothing to enter a balance for.
   const [newAccountName, setNewAccountName] = useState({});
+  // Property-group "+Add account" here needs the same explicit Asset/Liability choice
+  // as Settings > Accounts' own add-account row — see blankPropertyAccount.
+  const [newAccountType, setNewAccountType] = useState({});
   const [busy, setBusy] = useState(false);
   // Count of transactions actually attempted so far during confirmImport — drives the
   // Preview step's progress bar so a large import doesn't look stuck.
@@ -3560,7 +3585,7 @@ function SetupWizard({
       // pointing at nothing once this new account is merged in and re-derived into registry.
       let resolvedKey;
       if (m.action === "createCreditCard") {
-        newAccountsByGroup.property.push({ key, label, type: "liability", shortTermLiability: true, mortgage: false, owner: "Joint" });
+        newAccountsByGroup.property.push({ ...blankPropertyAccount(key, label, "liability"), shortTermLiability: true });
         resolvedKey = `property.${key}`;
       } else {
         const group = m.action === "createInvest" ? "investments" : "liquidCash";
@@ -4147,10 +4172,14 @@ function SetupWizard({
     const addAccountHere = group => {
       const label = (newAccountName[group] || "").trim();
       if (!label) return;
-      const item = { key: `acct_${uid()}`, label, owner: "Joint" };
-      if (group === "property") { item.type = "asset"; item.shortTermLiability = false; }
+      const type = newAccountType[group];
+      if (group === "property" && type !== "asset" && type !== "liability") return;
+      const item = group === "property"
+        ? blankPropertyAccount(`acct_${uid()}`, label, type)
+        : { key: `acct_${uid()}`, label, owner: "Joint" };
       persistAll({ accounts: { ...accounts, [group]: [...accounts[group], item] } });
       setNewAccountName(n => ({ ...n, [group]: "" }));
+      setNewAccountType(t => ({ ...t, [group]: "" }));
     };
     body = rc("div", null,
       importSummary && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", marginBottom: 14 } },
@@ -4185,10 +4214,18 @@ function SetupWizard({
               onKeyDown: e => { if (e.key === "Enter") addAccountHere(group); },
               style: { ...inputStyle, flex: "1 1 200px", fontSize: 12.5, padding: "5px 9px" }
             }),
+            group === "property" && rc("select", {
+              value: newAccountType[group] || "",
+              onChange: e => setNewAccountType(t => ({ ...t, [group]: e.target.value })),
+              style: { ...inputStyle, fontSize: 12.5, padding: "5px 9px" }
+            },
+              rc("option", { value: "" }, "Asset or liability…"),
+              rc("option", { value: "asset" }, "Asset"),
+              rc("option", { value: "liability" }, "Liability")),
             rc("button", {
               className: "btn-secondary",
               style: { padding: "5px 12px", fontSize: 12.5 },
-              disabled: !(newAccountName[group] || "").trim(),
+              disabled: !(newAccountName[group] || "").trim() || (group === "property" && !newAccountType[group]),
               onClick: () => addAccountHere(group)
             }, "+ Add account")));
       }),
@@ -5272,6 +5309,9 @@ function App({ user } = {}) {
   const [newSubLabel, setNewSubLabel] = useState({});
   const [accounts, setAccounts] = useState(seedAccounts());
   const [newAccountLabel, setNewAccountLabel] = useState({});
+  // Property-group "+Add account" needs an explicit Asset/Liability choice before it
+  // can be saved — see addAccount()'s matching guard.
+  const [newAccountType, setNewAccountType] = useState({});
   const [settingsView, setSettingsView] = useState("menu");
   const [dismissedHints, setDismissedHints] = useState({});
   const [confirmRemovePolicyId, setConfirmRemovePolicyId] = useState(null);
@@ -5930,20 +5970,15 @@ function App({ user } = {}) {
       subcats: (cat.subcats || []).filter(s => s.key !== subKey)
     });
   };
-  const addAccount = (group, label) => {
+  const addAccount = (group, label, type) => {
     if (!label || !label.trim()) return;
-    const item = {
-      key: `acct_${uid()}`,
-      label: label.trim()
-    };
-    if (group === "property") {
-      item.type = "asset";
-      item.shortTermLiability = false;
-      item.owner = "Joint";
-    }
-    if (group === "liquidCash" || group === "investments") {
-      item.owner = "Joint";
-    }
+    // A property account's asset/liability status flips its sign in net worth — the
+    // caller must supply an explicit choice (from a real UI selection) rather than
+    // this function guessing one.
+    if (group === "property" && type !== "asset" && type !== "liability") return;
+    const item = group === "property"
+      ? blankPropertyAccount(`acct_${uid()}`, label.trim(), type)
+      : { key: `acct_${uid()}`, label: label.trim(), owner: "Joint" };
     const next = {
       ...accounts,
       [group]: [...accounts[group], item]
@@ -6076,7 +6111,8 @@ function App({ user } = {}) {
     const today = todayISO();
     [["housing", housingLoan, setHousingLoan, housingAmort],
      ["car", carLoan, setCarLoan, carAmort]].forEach(([key, loan, setLoan, amort]) => {
-      if (!loan.trackAsRecurring || !loan.account || !loan.category) return;
+      const categoryValid = (categories.expense || []).some(c => c.key === loan.category && !c.archived);
+      if (!loan.trackAsRecurring || !loan.account || !categoryValid) return;
       // amortize()'s payment figure is computed from principal/rate/tenure alone — it
       // does NOT require startDate, so a loan can already be "complete" (trackAsRecurring
       // + account + category + a real payment amount) while both nextDueDate and startDate
@@ -6252,14 +6288,13 @@ function App({ user } = {}) {
   }) : null;
   const selectedIdx = records.findIndex(r => r.month === selectedMonth);
   const ytdRecords = records.slice(0, selectedIdx + 1);
-  const trailingBaselineRecords = records.slice(Math.max(0, selectedIdx - 3), selectedIdx);
   const expenseRowsFull = (() => {
     const source = expenseView === "ytd" ? ytdRecords : currentRecord ? [currentRecord] : [];
     const monthCount = expenseView === "ytd" ? ytdRecords.length : 1;
     return categories.expense.filter(c => !c.archived).map(c => {
       const value = source.reduce((a, r) => a + catVal(r, c), 0);
       const currentMonthlyAvg = safeDiv(value, monthCount);
-      const baselineMonthlyAvg = trailingBaselineRecords.length ? trailingBaselineRecords.reduce((a, r) => a + catVal(r, c), 0) / trailingBaselineRecords.length : null;
+      const baselineMonthlyAvg = trailingAverage(records, selectedIdx, 3, r => catVal(r, c));
       const variance = baselineMonthlyAvg !== null && baselineMonthlyAvg > 0 ? (currentMonthlyAvg - baselineMonthlyAvg) / baselineMonthlyAvg : null;
       return {
         ...c,
@@ -7292,8 +7327,7 @@ function App({ user } = {}) {
     const statsFor = key => {
       const cat = categories.expense.find(c => c.key === key);
       if (!cat) return null;
-      const last3 = records.slice(-3);
-      const avg3 = last3.length ? last3.reduce((a, r) => a + catVal(r, cat), 0) / last3.length : 0;
+      const avg3 = trailingAverage(records, selectedIdx, 3, r => catVal(r, cat)) || 0;
       const monthActual = currentRecord ? catVal(currentRecord, cat) : 0;
       const ytdActual = ytdRecords.reduce((a, r) => a + catVal(r, cat), 0);
       const monthsElapsed = ytdRecords.length || 1;
@@ -7975,8 +8009,7 @@ function App({ user } = {}) {
       onChange: v => persistAll({
         [activeLoanKey]: {
           ...activeLoan,
-          trackAsRecurring: v,
-          category: activeLoan.category || (loanSub === "housing" ? "housingUtilities" : "vehicle")
+          trackAsRecurring: v
         }
       })
     }),
@@ -7991,7 +8024,7 @@ function App({ user } = {}) {
       rc("div", {
         style: { fontFamily: "var(--sans)", fontSize: 12, color: "var(--ink-3)" }
       }, (() => {
-        const canPost = !!activeLoan.account && !!activeLoan.category && activeAmort.payment > 0;
+        const canPost = !!activeLoan.account && (categories.expense || []).some(c => c.key === activeLoan.category && !c.archived) && activeAmort.payment > 0;
         const paidOff = activeAmort.payoffDate && activeAmort.payoffDate < todayISO();
         if (paidOff) return "Loan fully repaid — no more postings.";
         if (!canPost) return "Missing account/category — won't post yet.";
@@ -9203,13 +9236,33 @@ function App({ user } = {}) {
         border: "1px solid var(--hair-strong)",
         flex: "1 1 220px"
       }
-    }), /*#__PURE__*/React.createElement("button", {
+    }), group === "property" && /*#__PURE__*/React.createElement("select", {
+      value: newAccountType[group] || "",
+      onChange: e => setNewAccountType({
+        ...newAccountType,
+        [group]: e.target.value
+      }),
+      style: {
+        fontFamily: "var(--sans)",
+        fontSize: 13,
+        padding: "6px 9px",
+        borderRadius: 6,
+        border: "1px solid var(--hair-strong)"
+      }
+    }, /*#__PURE__*/React.createElement("option", { value: "" }, "Asset or liability…"),
+       /*#__PURE__*/React.createElement("option", { value: "asset" }, "Asset"),
+       /*#__PURE__*/React.createElement("option", { value: "liability" }, "Liability")),
+    /*#__PURE__*/React.createElement("button", {
       className: "btn-primary",
-      disabled: !(newAccountLabel[group] || "").trim(),
+      disabled: !(newAccountLabel[group] || "").trim() || (group === "property" && !newAccountType[group]),
       onClick: () => {
-        addAccount(group, newAccountLabel[group]);
+        addAccount(group, newAccountLabel[group], newAccountType[group]);
         setNewAccountLabel({
           ...newAccountLabel,
+          [group]: ""
+        });
+        setNewAccountType({
+          ...newAccountType,
           [group]: ""
         });
       }
