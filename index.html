@@ -1530,7 +1530,7 @@ function loanPayment(principal, ratePct, months) {
 // after a refinance changes it mid-schedule.
 function amortize(loan) {
   const events = [...((loan || {}).events || [])]
-    .filter(e => e.kind === "extraPayment" || e.kind === "rateChange")
+    .filter(e => e.kind === "extraPayment" || e.kind === "rateChange" || e.kind === "balanceCorrection")
     .sort((a, b) => a.date.localeCompare(b.date));
   let balance = Number((loan || {}).principal) || 0;
   const originalPrincipal = balance;
@@ -1551,6 +1551,13 @@ function amortize(loan) {
       const ev = events[eventIdx++];
       if (ev.kind === "extraPayment") {
         balance = Math.max(0, balance - (Number(ev.amount) || 0));
+      } else if (ev.kind === "balanceCorrection") {
+        // A pure "the bank's real statement says X" nudge — sets the balance
+        // directly (can move it up OR down, unlike extraPayment) but, like
+        // extraPayment, leaves rate/remaining-term/payment untouched. A small
+        // correction just means the existing flat payment pays it off a little
+        // sooner or later than the original schedule, same as extraPayment does.
+        if (ev.balance !== "" && ev.balance != null) balance = Math.max(0, Number(ev.balance) || 0);
       } else {
         if (ev.principal !== "" && ev.principal != null) balance = Number(ev.principal) || balance;
         ratePct = Number(ev.ratePct) || ratePct;
@@ -1979,100 +1986,95 @@ function AccountSettingsList({
   onUpdate,
   onRemove
 }) {
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 8
-    }
-  }, list.map(a => /*#__PURE__*/React.createElement("div", {
+  // Every field here writes straight to the shared household doc — a mistyped
+  // rename or an accidental Asset/Liability flip used to apply immediately with
+  // no way to review it first. Text edits stage on blur (not per keystroke,
+  // which would pop a dialog after every character); selects/checkboxes stage
+  // on change. Nothing calls onUpdate/onRemove until the user confirms.
+  const [labelDrafts, setLabelDrafts] = React.useState({});
+  const [pendingChange, setPendingChange] = React.useState(null);
+  const stage = (message, action, confirmLabel) => setPendingChange({ message, action, confirmLabel });
+  const commitLabel = a => {
+    const draft = labelDrafts[a.key];
+    if (draft === undefined) return;
+    setLabelDrafts(d => { const next = { ...d }; delete next[a.key]; return next; });
+    const trimmed = draft.trim();
+    if (!trimmed || trimmed === a.label) return;
+    stage(`Rename "${a.label}" to "${trimmed}"?`, () => onUpdate(a.key, { label: trimmed }));
+  };
+  return rc(React.Fragment, null, rc("div", {
+    style: { display: "flex", flexDirection: "column", gap: 8 }
+  }, list.map(a => rc("div", {
     key: a.key,
     style: {
-      display: "flex",
-      gap: 8,
-      alignItems: "center",
-      flexWrap: "wrap",
-      border: "1px solid var(--hair)",
-      borderRadius: 8,
-      padding: 8
+      display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap",
+      border: "1px solid var(--hair)", borderRadius: 8, padding: 8
     }
-  }, /*#__PURE__*/React.createElement("input", {
+  }, rc("input", {
     type: "text",
-    value: a.label,
-    onChange: e => onUpdate(a.key, {
-      label: e.target.value
-    }),
+    value: labelDrafts[a.key] !== undefined ? labelDrafts[a.key] : a.label,
+    onChange: e => setLabelDrafts(d => ({ ...d, [a.key]: e.target.value })),
+    onBlur: () => commitLabel(a),
+    onKeyDown: e => { if (e.key === "Enter") e.target.blur(); },
     style: {
-      fontFamily: "var(--sans)",
-      fontSize: 13,
-      padding: "4px 7px",
-      borderRadius: 6,
-      border: "1px solid var(--hair-strong)",
-      flex: "1 1 160px"
+      fontFamily: "var(--sans)", fontSize: 13, padding: "4px 7px",
+      borderRadius: 6, border: "1px solid var(--hair-strong)", flex: "1 1 160px"
     }
-  }), (group === "liquidCash" || group === "investments" || group === "property") && /*#__PURE__*/React.createElement("select", {
+  }), (group === "liquidCash" || group === "investments" || group === "property") && rc("select", {
     value: a.owner || "Joint",
-    onChange: e => onUpdate(a.key, {
-      owner: e.target.value
-    }),
+    onChange: e => {
+      const next = e.target.value;
+      if (next === (a.owner || "Joint")) return;
+      stage(`Change the owner of "${a.label}" to ${next}?`, () => onUpdate(a.key, { owner: next }));
+    },
     style: {
-      fontSize: 11.5,
-      padding: "3px 6px",
-      fontFamily: "var(--sans)",
-      borderRadius: 6,
-      border: "1px solid var(--hair-strong)"
+      fontSize: 11.5, padding: "3px 6px", fontFamily: "var(--sans)",
+      borderRadius: 6, border: "1px solid var(--hair-strong)"
     }
-  }, (familyMembers || ["Person 1", "Person 2"]).map(m => /*#__PURE__*/React.createElement("option", {
-    key: m,
-    value: m
-  }, m)), /*#__PURE__*/React.createElement("option", {
-    value: "Joint"
-  }, "Joint")), group === "property" && /*#__PURE__*/React.createElement("select", {
+  }, (familyMembers || ["Person 1", "Person 2"]).map(m => rc("option", { key: m, value: m }, m)),
+     rc("option", { value: "Joint" }, "Joint")),
+  group === "property" && rc("select", {
     value: a.type,
-    onChange: e => onUpdate(a.key, {
-      type: e.target.value
-    }),
-    style: {
-      fontSize: 11.5,
-      padding: "3px 6px"
-    }
-  }, /*#__PURE__*/React.createElement("option", {
-    value: "asset"
-  }, "Asset"), /*#__PURE__*/React.createElement("option", {
-    value: "liability"
-  }, "Liability")), group === "property" && a.type === "liability" && /*#__PURE__*/React.createElement("label", {
-    style: {
-      display: "flex",
-      alignItems: "center",
-      gap: 4,
-      fontFamily: "var(--sans)",
-      fontSize: 11,
-      color: "var(--ink-3)"
-    }
-  }, /*#__PURE__*/React.createElement("input", {
+    onChange: e => {
+      const next = e.target.value;
+      if (next === a.type) return;
+      stage(`Change "${a.label}" from ${a.type === "liability" ? "a liability" : "an asset"} to ${next === "liability" ? "a liability" : "an asset"}? This affects net worth calculations.`,
+        () => onUpdate(a.key, { type: next }));
+    },
+    style: { fontSize: 11.5, padding: "3px 6px" }
+  }, rc("option", { value: "asset" }, "Asset"), rc("option", { value: "liability" }, "Liability")),
+  group === "property" && a.type === "liability" && rc("label", {
+    style: { display: "flex", alignItems: "center", gap: 4, fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)" }
+  }, rc("input", {
     type: "checkbox",
     checked: !!a.shortTermLiability,
-    onChange: e => onUpdate(a.key, {
-      shortTermLiability: e.target.checked
-    })
-  }), "Short-term (counts against buffer)"), group === "property" && a.type === "liability" && /*#__PURE__*/React.createElement("label", {
-    style: {
-      display: "flex",
-      alignItems: "center",
-      gap: 4,
-      fontFamily: "var(--sans)",
-      fontSize: 11,
-      color: "var(--ink-3)"
+    onChange: e => {
+      const next = e.target.checked;
+      stage(`${next ? "Mark" : "Unmark"} "${a.label}" as a short-term liability? This affects your emergency buffer.`,
+        () => onUpdate(a.key, { shortTermLiability: next }));
     }
-  }, /*#__PURE__*/React.createElement("input", {
+  }), "Short-term (counts against buffer)"),
+  group === "property" && a.type === "liability" && rc("label", {
+    style: { display: "flex", alignItems: "center", gap: 4, fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)" }
+  }, rc("input", {
     type: "checkbox",
     checked: !!a.mortgage,
-    onChange: e => onUpdate(a.key, {
-      mortgage: e.target.checked
-    })
-  }), "Counts toward Property equity"), /*#__PURE__*/React.createElement(IconBtn, {
-    onClick: () => onRemove(a.key)
-  }, "Delete"))));
+    onChange: e => {
+      const next = e.target.checked;
+      stage(`${next ? "Count" : "Stop counting"} "${a.label}" toward Property equity?`,
+        () => onUpdate(a.key, { mortgage: next }));
+    }
+  }), "Counts toward Property equity"),
+  rc(IconBtn, {
+    onClick: () => stage(`Delete account "${a.label}"? This can't be undone.`, () => onRemove(a.key), "Delete account")
+  }, "Delete")))),
+  pendingChange && rc(ConfirmDialog, {
+    title: "Confirm change",
+    message: pendingChange.message,
+    confirmLabel: pendingChange.confirmLabel || "Apply",
+    onCancel: () => setPendingChange(null),
+    onConfirm: () => { pendingChange.action(); setPendingChange(null); }
+  }));
 }
 function CategorySettingsList({
   type,
@@ -2089,6 +2091,19 @@ function CategorySettingsList({
   const [pendingHint, setPendingHint] = React.useState(null);
   const [dontShowAgain, setDontShowAgain] = React.useState(false);
   const [openMenuKey, setOpenMenuKey] = React.useState(null);
+  // Renaming used to write on every keystroke with no review step. Staged locally
+  // and confirmed on blur instead — a plain confirm, not the richer CATEGORY_HINTS
+  // popup below (a rename needs no explanation, just a chance to catch a typo).
+  const [labelDrafts, setLabelDrafts] = React.useState({});
+  const [pendingRename, setPendingRename] = React.useState(null);
+  const commitLabel = c => {
+    const draft = labelDrafts[c.key];
+    if (draft === undefined) return;
+    setLabelDrafts(d => { const next = { ...d }; delete next[c.key]; return next; });
+    const trimmed = draft.trim();
+    if (!trimmed || trimmed === c.label) return;
+    setPendingRename({ message: `Rename "${c.label}" to "${trimmed}"?`, action: () => onUpdate(c.key, { label: trimmed }) });
+  };
   const isFixedCat = c => type === "income" ? !!c.primaryIncome : !!c.core;
   const sortedList = [...list].sort((a, b) => {
     const af = isFixedCat(a),
@@ -2171,10 +2186,10 @@ function CategorySettingsList({
     }
   }, /*#__PURE__*/React.createElement("input", {
     type: "text",
-    value: c.label,
-    onChange: e => onUpdate(c.key, {
-      label: e.target.value
-    }),
+    value: labelDrafts[c.key] !== undefined ? labelDrafts[c.key] : c.label,
+    onChange: e => setLabelDrafts(d => ({ ...d, [c.key]: e.target.value })),
+    onBlur: () => commitLabel(c),
+    onKeyDown: e => { if (e.key === "Enter") e.target.blur(); },
     style: {
       fontFamily: "var(--sans)",
       fontSize: 13.5,
@@ -2452,7 +2467,13 @@ function CategorySettingsList({
       if (dontShowAgain) onDismissHint(pendingHint.key);
       setPendingHint(null);
     }
-  }, "Continue")))));
+  }, "Continue")))), pendingRename && rc(ConfirmDialog, {
+    title: "Confirm change",
+    message: pendingRename.message,
+    confirmLabel: "Apply",
+    onCancel: () => setPendingRename(null),
+    onConfirm: () => { pendingRename.action(); setPendingRename(null); }
+  }));
 }
 function Card({
   children,
@@ -4185,7 +4206,7 @@ function SetupWizard({
       importSummary && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-2)", marginBottom: 14 } },
         `Imported ${importSummary.importedCount} transactions.`),
       rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)", marginBottom: 14, lineHeight: 1.5 } },
-        "Enter what each account actually holds. Leave any blank to skip it — you can always adjust it later. For a liability (like a credit card), enter the amount currently owed as a positive number."),
+        "Enter what each account actually holds. Leave any blank to skip it — you can always adjust it later. For a liability (like a credit card), enter the amount currently owed as a positive number — or a negative number if it's in credit. An overdrawn cash account can also be entered as negative."),
       fieldRow("As of", rc("input", { type: "date", value: asOfDate, onChange: e => setAsOfDate(e.target.value), style: { ...inputStyle, width: 160 } })),
       groupDefs.map(([group, label]) => {
         const items = registry.filter(a => a.group === group);
@@ -4200,7 +4221,14 @@ function SetupWizard({
               type: "text", inputMode: "decimal", placeholder: "0.00",
               value: balanceInputs[a.key] || "",
               onFocus: e => e.target.select(),
-              onChange: e => setBalanceInputs(bi => ({ ...bi, [a.key]: e.target.value.replace(/[^0-9.]/g, "") })),
+              onChange: e => {
+                // Keeps a leading "-" (overdrawn cash, or a credit-balance liability)
+                // instead of stripping every minus sign — previously made it
+                // impossible to type a negative starting balance at all.
+                const v = e.target.value;
+                const neg = v.trim().startsWith("-") ? "-" : "";
+                setBalanceInputs(bi => ({ ...bi, [a.key]: neg + v.replace(/[^0-9.]/g, "") }));
+              },
               style: { ...inputStyle, width: 120, fontFamily: "var(--mono)", textAlign: "right" }
             }),
             (liveBalances[a.key] || 0) !== 0 && rc("span", { style: { fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)" } },
@@ -4247,13 +4275,15 @@ function SetupWizard({
 
   return rc(React.Fragment, null,
     rc("div", {
-      onClick: onClose,
+      // Deliberately no onClick here — a stray click outside the modal (easy to do
+      // on a step with a wide table/preview) used to call onClose and silently
+      // discard the whole in-progress import. Closing is now only ever explicit,
+      // via the "Close" button below or a step's own Cancel/Skip action.
       style: {
         position: "fixed", inset: 0, background: "rgba(27,36,48,0.45)",
         display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1300, padding: 20
       }
     }, rc("div", {
-      onClick: e => e.stopPropagation(),
       style: { background: "#fff", borderRadius: 12, padding: 24, width: 760, maxWidth: "95vw", maxHeight: "85vh", overflowY: "auto" }
     },
       rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 4 } },
@@ -5745,12 +5775,16 @@ function App({ user } = {}) {
       policies: next
     });
   };
-  // Early repayment, refinancing, and bank repricing are all, mechanically, "the schedule's
-  // terms reset as of this date" — one events list on the loan covers all three (see
-  // amortize(), which walks them in date order). `kind: "extraPayment"` just knocks money off
-  // the balance; `kind: "rateChange"` covers refinance/repricing identically by recomputing
-  // the payment. Pre-filling ratePct/tenureYears from the loan's current values means leaving
-  // them untouched is a no-op change, not a jump to zero.
+  // Early repayment, refinancing, bank repricing, and a plain balance correction are all,
+  // mechanically, "the schedule's terms reset as of this date" — one events list on the loan
+  // covers all four (see amortize(), which walks them in date order). `kind: "extraPayment"`
+  // just knocks money off the balance; `kind: "rateChange"` covers refinance/repricing
+  // identically by recomputing the payment; `kind: "balanceCorrection"` is the same "override
+  // the balance" idea as rateChange's optional principal field, but on its own — for when a
+  // real loan statement shows a slightly different number than the pure amortisation formula
+  // produces (rounding, day-count conventions, fees) and there's no actual refinance to record.
+  // Pre-filling ratePct/tenureYears from the loan's current values means leaving them
+  // untouched is a no-op change, not a jump to zero.
   const loanDocKey = loanKey => loanKey === "housing" ? "housingLoan" : "carLoan";
   const addLoanEvent = (loanKey, kind) => {
     const loan = loanKey === "housing" ? housingLoan : carLoan;
@@ -5759,7 +5793,7 @@ function App({ user } = {}) {
       ...loan,
       events: [...(loan.events || []), {
         id: uid(), date: todayISO(), kind,
-        amount: 0, ratePct: loan.ratePct, tenureYears: loan.tenureYears, principal: "",
+        amount: 0, ratePct: loan.ratePct, tenureYears: loan.tenureYears, principal: "", balance: "",
         notes: "", posted: false
       }]
     };
@@ -6113,19 +6147,21 @@ function App({ user } = {}) {
      ["car", carLoan, setCarLoan, carAmort]].forEach(([key, loan, setLoan, amort]) => {
       const categoryValid = (categories.expense || []).some(c => c.key === loan.category && !c.archived);
       if (!loan.trackAsRecurring || !loan.account || !categoryValid) return;
-      // amortize()'s payment figure is computed from principal/rate/tenure alone — it
-      // does NOT require startDate, so a loan can already be "complete" (trackAsRecurring
-      // + account + category + a real payment amount) while both nextDueDate and startDate
-      // are still blank. Without this guard, postDueCadence's own `item.nextDueDate || today`
-      // fallback would silently anchor the very first payment to today the moment the
-      // account field completes the trio — same class of bug as Recurring/Insurance's
-      // hasExplicitNextDueDate gate, just reached via a different missing field.
-      if (!loan.nextDueDate && !loan.startDate) return;
+      // amortize()'s payment figure is computed from principal/rate/tenure alone — it does
+      // NOT require startDate, so a loan can already be "complete" (trackAsRecurring +
+      // account + category + a real payment amount) while nextDueDate is still blank.
+      // Deliberately never falls back to loan.startDate: for an existing loan that's
+      // usually years in the past, and postDueCadence would walk every monthly occurrence
+      // from there up to today, re-posting payments the user already logged some other way
+      // (reported as duplicate entries). Same hasExplicitNextDueDate gate Recurring/
+      // Insurance already use — nextDueDate must be a real, user-chosen value ("Start
+      // posting from" in the Loans tab) before anything posts.
+      if (!loan.nextDueDate) return;
       let nextLoan = loan;
       let changed = false;
       if (amort.payment > 0) {
         const cappedToday = amort.payoffDate && amort.payoffDate < today ? amort.payoffDate : today;
-        const asItem = { amount: amort.payment, nextDueDate: loan.nextDueDate || loan.startDate, interval: 1, unit: "month" };
+        const asItem = { amount: amort.payment, nextDueDate: loan.nextDueDate, interval: 1, unit: "month" };
         const posted = postDueCadence(asItem, cappedToday, saveTxn, (it, cursor) => ({
           id: `loan_${key}_${cursor}`,
           date: cursor,
@@ -6225,10 +6261,13 @@ function App({ user } = {}) {
     // an array) — a loan not opted into recurring tracking, or one already past payoffDate,
     // simply contributes nothing.
     const loanByMonth = bucketDueAmounts(
+      // Same explicit-nextDueDate gate as the posting effect above (never falls back to
+      // loan.startDate) — otherwise the Forecast would show payments starting today for a
+      // loan that isn't actually due to post anything yet, disagreeing with reality.
       [["housing", housingLoan, housingAmort], ["car", carLoan, carAmort]]
-        .filter(([, loan, amort]) => loan.trackAsRecurring && loan.account && loan.category && amort.payment > 0)
+        .filter(([, loan, amort]) => loan.trackAsRecurring && loan.account && loan.category && loan.nextDueDate && amort.payment > 0)
         .map(([, loan, amort]) => ({
-          active: true, amount: amort.payment, nextDueDate: loan.nextDueDate || loan.startDate,
+          active: true, amount: amort.payment, nextDueDate: loan.nextDueDate,
           interval: 1, unit: "month", lapseDate: amort.payoffDate
         })),
       startKey
@@ -8021,6 +8060,16 @@ function App({ user } = {}) {
         rc("div", { style: { flex: "1 1 220px" } },
           rc(LedgerLabel, null, "Category"),
           rc(LedgerCategorySelect, { cats: categories.expense, value: activeLoan.category, subValue: activeLoan.subcat, onChange: (c, s) => persistAll({ [activeLoanKey]: { ...activeLoan, category: c, subcat: s } }) }))),
+      rc("div", { style: { marginBottom: 8 } },
+        rc("div", { style: { flex: "1 1 220px", maxWidth: 220 } },
+          rc(LedgerLabel, null, "Start posting from"),
+          rc("input", {
+            type: "date", value: activeLoan.nextDueDate || "",
+            onChange: e => persistAll({ [activeLoanKey]: { ...activeLoan, nextDueDate: e.target.value } }),
+            style: inputStyle
+          })),
+        rc("div", { style: { fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)", marginTop: 4, lineHeight: 1.4 } },
+          "For a loan you're already repaying, pick your next upcoming payment date here — not the loan's start date above. This is deliberately separate from Start date (which only feeds the interest calculation) so an existing loan doesn't re-post years of payments you've already logged.")),
       rc("div", {
         style: { fontFamily: "var(--sans)", fontSize: 12, color: "var(--ink-3)" }
       }, (() => {
@@ -8028,10 +8077,11 @@ function App({ user } = {}) {
         const paidOff = activeAmort.payoffDate && activeAmort.payoffDate < todayISO();
         if (paidOff) return "Loan fully repaid — no more postings.";
         if (!canPost) return "Missing account/category — won't post yet.";
-        // Mirrors the posting effect's own hasNextDueDate-or-startDate guard — payment is
-        // computable without a start date, but there's nothing real to anchor postings to yet.
-        if (!activeLoan.nextDueDate && !activeLoan.startDate) return "Missing start date — won't post yet.";
-        return `Next: ${isoToDayLabel(activeLoan.nextDueDate || activeLoan.startDate)}`;
+        // Mirrors Recurring/Insurance's hasExplicitNextDueDate gate — deliberately never
+        // falls back to Start date, which for an existing loan is almost always in the
+        // past and would silently backpost every payment since inception.
+        if (!activeLoan.nextDueDate) return "Set \"Start posting from\" above to activate — won't post until then.";
+        return `Next: ${isoToDayLabel(activeLoan.nextDueDate)}`;
       })())))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
@@ -8055,16 +8105,17 @@ function App({ user } = {}) {
       rc("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
         rc("div", { style: { fontFamily: "var(--sans)", fontSize: 13, fontWeight: 600, color: "var(--ink-1)" } }, "Loan events"),
         rc("span", { style: { fontFamily: "var(--sans)", fontSize: 11, color: "var(--ink-3)" } },
-          (activeLoan.events || []).length > 0 ? `${activeLoan.events.length} recorded` : "early repayment / refinancing — ad hoc, none recorded")),
+          (activeLoan.events || []).length > 0 ? `${activeLoan.events.length} recorded` : "early repayment / refinancing / balance corrections — ad hoc, none recorded")),
       rc("button", {
         className: "btn-secondary", style: { padding: "5px 10px", fontSize: 12 },
         onClick: () => setShowLoanEvents(s => !s)
       }, showLoanEvents ? "Hide" : "Show")),
     showLoanEvents && rc("div", { style: { marginTop: 12 } },
-      rc("div", { style: { display: "flex", gap: 6, marginBottom: 10 } },
+      rc("div", { style: { display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" } },
         rc("button", { className: "btn-secondary", style: { padding: "5px 10px", fontSize: 12 }, onClick: () => addLoanEvent(loanSub, "extraPayment") }, "Add extra repayment"),
-        rc("button", { className: "btn-secondary", style: { padding: "5px 10px", fontSize: 12 }, onClick: () => addLoanEvent(loanSub, "rateChange") }, "Add refinance / rate change")),
-      (activeLoan.events || []).length === 0 && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)" } }, "No early repayments or refinancing recorded."),
+        rc("button", { className: "btn-secondary", style: { padding: "5px 10px", fontSize: 12 }, onClick: () => addLoanEvent(loanSub, "rateChange") }, "Add refinance / rate change"),
+        rc("button", { className: "btn-secondary", style: { padding: "5px 10px", fontSize: 12 }, onClick: () => addLoanEvent(loanSub, "balanceCorrection") }, "Correct balance")),
+      (activeLoan.events || []).length === 0 && rc("div", { style: { fontFamily: "var(--sans)", fontSize: 12.5, color: "var(--ink-3)" } }, "No early repayments, refinancing, or balance corrections recorded."),
       rc("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
         (activeLoan.events || []).slice().sort((a, b) => a.date.localeCompare(b.date)).map(ev => rc("div", {
           key: ev.id,
@@ -8073,7 +8124,7 @@ function App({ user } = {}) {
           rc("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 8, flexWrap: "wrap" } },
             rc("span", {
               style: { fontFamily: "var(--sans)", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.04em", color: "var(--ink-3)" }
-            }, ev.kind === "extraPayment" ? "Extra repayment" : "Refinance / rate change"),
+            }, ev.kind === "extraPayment" ? "Extra repayment" : ev.kind === "balanceCorrection" ? "Balance correction" : "Refinance / rate change"),
             rc(IconBtn, { onClick: () => removeLoanEvent(loanSub, ev.id) }, "Remove")),
           rc("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 8 } },
             rc("div", null, rc(LedgerLabel, null, "Date"),
@@ -8081,6 +8132,9 @@ function App({ user } = {}) {
             ev.kind === "extraPayment"
               ? rc("div", null, rc(LedgerLabel, null, "Amount"),
                   rc("input", { type: "number", value: ev.amount, onFocus: e => e.target.select(), onChange: e => updateLoanEvent(loanSub, ev.id, { amount: Number(e.target.value) || 0 }), style: inputStyle }))
+              : ev.kind === "balanceCorrection"
+              ? rc("div", null, rc(LedgerLabel, null, "Actual balance as of this date"),
+                  rc("input", { type: "number", value: ev.balance, placeholder: "e.g. from your loan statement", onFocus: e => e.target.select(), onChange: e => updateLoanEvent(loanSub, ev.id, { balance: e.target.value === "" ? "" : Number(e.target.value) || 0 }), style: inputStyle }))
               : [
                   rc("div", { key: "rate" }, rc(LedgerLabel, null, "New rate (% p.a.)"),
                     rc("input", { type: "number", value: ev.ratePct, onFocus: e => e.target.select(), onChange: e => updateLoanEvent(loanSub, ev.id, { ratePct: Number(e.target.value) || 0 }), style: inputStyle })),
