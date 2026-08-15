@@ -130,7 +130,7 @@ const {
 
 /* ───────────────────────── helpers ───────────────────────── */
 
-const fmt = (n, d = 0) => (n < 0 ? "-$" : "$") + Math.abs(n || 0).toLocaleString("en-SG", {
+const fmt = (n, d = 2) => (n < 0 ? "-$" : "$") + Math.abs(n || 0).toLocaleString("en-SG", {
   minimumFractionDigits: d,
   maximumFractionDigits: d
 });
@@ -7010,7 +7010,7 @@ function App({ user } = {}) {
       fontWeight: 600,
       color: "var(--ink-1)"
     }
-  }, fmt(value, 0)), label === "Investments" && investmentsTrend && /*#__PURE__*/React.createElement("span", {
+  }, fmt(value)), label === "Investments" && investmentsTrend && /*#__PURE__*/React.createElement("span", {
     title: `vs. ${investmentsTrend.sinceMonth}`,
     style: {
       fontFamily: "var(--sans)",
@@ -7058,7 +7058,7 @@ function App({ user } = {}) {
       fontWeight: 600,
       color: "var(--ink-1)"
     }
-  }, fmt(v, 0))))))), showBufferDetail && current.hasBalances && /*#__PURE__*/React.createElement(Card, {
+  }, fmt(v))))))), showBufferDetail && current.hasBalances && /*#__PURE__*/React.createElement(Card, {
     style: {
       marginTop: 18
     }
